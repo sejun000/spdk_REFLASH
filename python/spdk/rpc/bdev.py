@@ -1407,6 +1407,47 @@ def bdev_split_delete(client, base_bdev):
 
 
 @deprecated_method
+def bdev_icache_create(client, name, cache_bdev_name, backend_bdev_name, max_pending_io,
+                       cache_type=None, waf_log_path=None, stat_log_path=None, valid_rate_threshold=None):
+    """Create an icache vbdev composed of cache/backing bdevs.
+    Args:
+        name: icache vbdev name
+        cache_bdev_name: cache-tier bdev name
+        backend_bdev_name: backend-tier bdev name
+        max_pending_io: queue depth hint for cache IO submission
+        cache_type: cache policy to instantiate (currently only LOG_GREEDY)
+        waf_log_path: output path for WAF statistics
+        stat_log_path: output path for cache statistics (optional)
+        valid_rate_threshold: target valid block ratio for cache GC heuristics
+    """
+    params = dict()
+    params['name'] = name
+    params['cache_bdev_name'] = cache_bdev_name
+    params['backend_bdev_name'] = backend_bdev_name
+    params['max_pending_io'] = max_pending_io
+    if cache_type is not None:
+        params['cache_type'] = cache_type
+    if waf_log_path is not None:
+        params['waf_log_path'] = waf_log_path
+    if stat_log_path is not None:
+        params['stat_log_path'] = stat_log_path
+    if valid_rate_threshold is not None:
+        params['valid_rate_threshold'] = str(valid_rate_threshold)
+    return client.call('bdev_icache_create', params)
+
+
+@deprecated_method
+def bdev_icache_delete(client, name):
+    """Delete an icache vbdev.
+    Args:
+        name: icache vbdev name
+    """
+    params = dict()
+    params['name'] = name
+    return client.call('bdev_icache_delete', params)
+
+
+@deprecated_method
 def bdev_ftl_create(client, name, base_bdev, cache, **kwargs):
     """Construct FTL bdev
     Args:

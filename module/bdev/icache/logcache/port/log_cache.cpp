@@ -1,0 +1,1253 @@
+#include "log_cache.h"
+
+#include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+#include <list>
+#include <memory>
+
+extern uint64_t interval;
+/* ------------------------------------------------------------------ */
+/* ctor / dtor                                                        */
+/* ------------------------------------------------------------------ */
+LogCache::LogCache(uint64_t              cold_capacity,
+             uint64_t              cache_block_count,
+             int                   blk_sz,
+             bool                  cache_trace,
+             const std::string&    trace_file,
+             const std::string&    cold_trace,
+             std::string&    waf_log_file,
+             std::unique_ptr<EvictPolicy> ev,
+             const Config*         cfg, 
+             IStream *input_stream_policy,
+             double input_target_valid_blk_rate,
+             std::unique_ptr<EvictPolicy> cp,
+             double input_additional_free_blks_ratio_by_gc,
+             bool input_ghost_cache,
+             std::string stat_log_file,
+             CacheDeviceInterface *device_io
+             )
+    : ICache(cold_capacity, waf_log_file, stat_log_file),
+      cache_block_size(blk_sz),
+      cfg_(cfg ? *cfg : Config{}),
+      evictor(std::move(ev)),
+      cache_trace_(cache_trace),
+      target_valid_blk_rate(input_target_valid_blk_rate),
+      valid_blk_rate_hard_limit(0.93),
+      compactor(std::move(cp)),
+      additional_free_blks_ratio_by_gc(input_additional_free_blks_ratio_by_gc),
+      evicted_ages_histogram(std::make_unique<Histogram>("evicted_ages", interval, HISTOGRAM_BUCKETS * 2, fp_stats)),
+      evicted_blocks_histogram(std::make_unique<Histogram>("evicted_blocks", 400, HISTOGRAM_BUCKETS, fp_stats)),
+      compacted_blocks_histogram(std::make_unique<Histogram>("compacted_blocks", 400, HISTOGRAM_BUCKETS, fp_stats)),
+      evicted_ages_with_segment_histogram(std::make_unique<Histogram>("evicted_ages_with_segment", interval, HISTOGRAM_BUCKETS * 2, fp_stats)),
+      compacted_ages_with_segment_histogram(std::make_unique<Histogram>("compacted_ages_with_segment", interval, HISTOGRAM_BUCKETS * 2, fp_stats)),
+      evicted_cache_blocks_per_evict(std::make_unique<Histogram>("evicted_cache_blocks_per_evict", 1, 100, fp_stats)),
+      is_ghost_cache(input_ghost_cache),
+      compaction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      eviction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      eviction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      ghost_cache(cache_block_count * 0.1),
+      device_io_(device_io)
+{
+    segment_size_blocks = cfg_.segment_bytes / blk_sz;
+    // For ZNS: use zone_size to calculate number of segments (zones)
+    std::size_t zone_stride = cfg_.zone_size_bytes > 0 ? cfg_.zone_size_bytes : cfg_.segment_bytes;
+    total_segments = cache_block_count * blk_sz / zone_stride;
+    total_cache_block_count = cache_block_count;
+    total_capacity_bytes = cache_block_count * blk_sz;
+    assert(segment_size_blocks > 0 && "segment_bytes too small");
+    assert(total_segments      > 0 && "device_bytes too small");
+    log_cache_timestamp = 0;
+
+    evictor->init(&log_cache_timestamp, cfg_.segment_bytes / blk_sz, total_segments);
+
+
+    if (compactor) {
+        compactor->init(&log_cache_timestamp, cfg_.segment_bytes / blk_sz, total_segments);
+    }
+
+    stream_policy = input_stream_policy;
+    global_valid_blocks = 0;
+    // For ZNS: use zone_size_bytes for physical_base alignment (zone boundaries)
+    // segment_bytes is the actual writable capacity per zone
+    std::size_t base_stride = cfg_.zone_size_bytes > 0 ? cfg_.zone_size_bytes : cfg_.segment_bytes;
+
+    /* 세그먼트 전부 미리 생성 → free_pool */
+    for (std::size_t i = 0; i < total_segments; ++i)
+    {
+        auto seg = std::make_unique<LogCacheSegment>(segment_size_blocks, log_cache_timestamp);
+        seg->physical_base = i * base_stride;
+        free_pool.push_back(seg.get());
+        all_segments.push_back(std::move(seg));
+    }
+
+    if (cache_trace_)
+    {
+        if (!trace_file.empty())
+            trace_fp_ = fopen(trace_file.c_str(), "w");
+        if (!cold_trace.empty())
+            cold_trace_fp_ = fopen(cold_trace.c_str(), "w");
+    }
+}
+
+LogCache::~LogCache()
+{
+    if (trace_fp_)      std::fclose(trace_fp_);
+    if (cold_trace_fp_) std::fclose(cold_trace_fp_);
+}
+
+uint64_t LogCache::block_offset(const LogCacheSegment *seg, std::size_t idx) const
+{
+    return seg->physical_base + static_cast<uint64_t>(idx) * cache_block_size;
+}
+
+int LogCache::write_cache_data(uint64_t offset, const void *buf, size_t len)
+{
+    if (!device_io_ || buf == nullptr || len == 0) {
+        return 0;
+    }
+    return device_io_->write_cache(offset, buf, len);
+}
+
+int LogCache::read_cache_data(uint64_t offset, void *buf, size_t len)
+{
+    if (!device_io_ || buf == nullptr || len == 0) {
+        return 0;
+    }
+    return device_io_->read_cache(offset, buf, len);
+}
+
+int LogCache::write_backend_data(uint64_t offset, const void *buf, size_t len)
+{
+    if (!device_io_ || buf == nullptr || len == 0) {
+        return 0;
+    }
+    return device_io_->write_backend(offset, buf, len);
+}
+
+int LogCache::read_backend_data(uint64_t offset, void *buf, size_t len)
+{
+    if (!device_io_ || buf == nullptr || len == 0) {
+        return 0;
+    }
+    return device_io_->read_backend(offset, buf, len);
+}
+
+void LogCache::reset_cache_region(LogCacheSegment *seg)
+{
+    if (!device_io_ || seg == nullptr) {
+        return;
+    }
+    device_io_->reset_cache_region(seg->physical_base, cfg_.segment_bytes);
+}
+
+void LogCache::ensure_staging_buffer(size_t len)
+{
+    if (staging_buffer_.size() < len) {
+        staging_buffer_.resize(len);
+    }
+}
+
+void LogCache::copy_block(LogCacheSegment *src_seg,
+                          std::size_t src_idx,
+                          LogCacheSegment *target_seg)
+{
+    if (!target_seg) {
+        return;
+    }
+    auto &src_blk = src_seg->blocks[src_idx];
+    auto &dst_blk = target_seg->blocks[target_seg->write_ptr];
+    if (device_io_) {
+        ensure_staging_buffer(cache_block_size);
+        read_cache_data(block_offset(src_seg, src_idx),
+                        staging_buffer_.data(),
+                        cache_block_size);
+        write_cache_data(block_offset(target_seg, target_seg->write_ptr),
+                         staging_buffer_.data(),
+                         cache_block_size);
+    }
+    dst_blk.key = src_blk.key;
+    dst_blk.valid = true;
+    dst_blk.create_timestamp = src_blk.create_timestamp;
+    mapping[src_blk.key] = { target_seg, target_seg->write_ptr };
+    ++target_seg->write_ptr;
+    ++target_seg->valid_cnt;
+    ++compacted_blocks;
+    src_blk.valid = false;
+}
+
+void LogCache::flush_block_to_backend(LogCacheSegment *seg, std::size_t idx)
+{
+    if (!device_io_) {
+        return;
+    }
+    auto &blk = seg->blocks[idx];
+    if (!blk.valid) {
+        return;
+    }
+    ensure_staging_buffer(cache_block_size);
+    read_cache_data(block_offset(seg, idx), staging_buffer_.data(), cache_block_size);
+    uint64_t backend_offset = static_cast<uint64_t>(blk.key) * cache_block_size;
+    write_backend_data(backend_offset, staging_buffer_.data(), cache_block_size);
+}
+
+/* ------------------------------------------------------------------ */
+/* public API                                                         */
+/* ------------------------------------------------------------------ */
+bool LogCache::exists(long key)
+{
+    return mapping.find(key) != mapping.end();
+}
+
+
+void LogCache::invalidate(long key, int lba_sz) {
+    if (exists(key))
+    {
+        auto loc = mapping[key];
+        if (loc.seg->blocks[loc.idx].valid)
+        {
+            print_objects("invalidate", log_cache_timestamp - loc.seg->blocks[loc.idx].create_timestamp);
+            invalidate_blocks += 1;
+            loc.seg->blocks[loc.idx].valid = false;
+            --loc.seg->valid_cnt;
+            global_valid_blocks -= 1;
+            if (loc.seg->full()){
+                evict_policy_update(loc.seg);
+            }
+        }
+       // else{
+        //    assert(false);
+       // }
+        mapping.erase(key);
+    }
+    else
+    {
+        if (evicted_timestamp.find(key) != evicted_timestamp.end()) {
+            reinsert_blocks++;
+            print_objects("reinsert", log_cache_timestamp - evicted_timestamp[key]);
+            evicted_timestamp.erase(key);
+        }
+        if (device_io_) {
+            device_io_->trim_backend(static_cast<uint64_t>(key) * cache_block_size, lba_sz);
+        } else {
+            _invalidate_cold_block(key * cache_block_size,
+                                    lba_sz,
+                                    OP_TYPE::TRIM);
+        }
+    }
+}
+
+void LogCache::evict_policy_add(LogCacheSegment *s) {
+    evictor->add(s, log_cache_timestamp);
+    if (compactor) {
+        compactor->add(s, log_cache_timestamp);
+    }
+}
+
+void LogCache::evict_policy_remove(LogCacheSegment *s) {
+    evictor->remove(s);
+    if (compactor) {
+        compactor->remove(s);
+    }
+}
+
+void LogCache::evict_policy_update(LogCacheSegment *s) {
+    evictor->update(s);
+    if (compactor) {
+        compactor->update(s);
+    }
+}
+
+void LogCache::periodic() {
+    if (is_ghost_cache){
+        if (log_cache_timestamp % segment_size_blocks == 0) {
+            compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
+            eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
+            uint64_t evicted_in_ghost = ghost_cache.evictCount();
+            eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
+        }
+        if (log_cache_timestamp % (segment_size_blocks * 64) == 0) {
+            if (compaction_ratio.has_value() &&
+                eviction_ratio.has_value() && 
+                eviction_ratio_in_ghost_cache.has_value()){
+                if (6.73 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()) > compaction_ratio.value()) {
+                    target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + 0.02);
+                    /*printf("rise cache !!!!!!!! %.2f\n", target_valid_blk_rate);
+                    printf ("eviction value : %.6f\n", 2.34 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()));
+                    printf ("compaction value : %.6f\n", compaction_ratio.value());
+                    printf ("eviction_ratio : %.6f\n", eviction_ratio.value());
+                    printf ("eviction_ratio_in_ghost_cache : %.6f\n", eviction_ratio_in_ghost_cache.value());*/
+                }
+                else {
+                    target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.02);
+                    /*printf("lower cache !!!!!!!! %.2f\n", target_valid_blk_rate);
+                    printf ("eviction value : %.6f\n", 2.34 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()));
+                    printf ("compaction value : %.6f\n", compaction_ratio.value());
+                    printf ("eviction_ratio : %.6f\n", eviction_ratio.value());
+                    printf ("eviction_ratio_in_ghost_cache : %.6f\n", eviction_ratio_in_ghost_cache.value());*/
+                }
+            }
+        }
+    }
+}
+
+void LogCache::batch_insert(int stream_id,
+                            const std::map<long,int>& newBlocks,
+                            OP_TYPE                   op_type)
+{
+    if (op_type == OP_TYPE::READ || newBlocks.empty())
+        return;                          // 요구사항 ③ – read 무시
+    
+    for (std::map<long, int>::const_iterator it = newBlocks.begin();
+         it != newBlocks.end(); ++it) {
+        append_block(stream_id, it->first, it->second, nullptr);
+    }
+    check_and_evict_if_needed();   
+    /* 3) free pool 부족 시 세그먼트 eviction */
+    
+}
+
+void LogCache::append_block(int stream_id, long key, int lba_sz, const void *payload)
+{
+    periodic();
+    ghost_cache.access(key);
+    LogCacheSegment* seg = nullptr;
+    if (stream_policy) {
+        seg = get_segment_with_stream_policy(false, key);
+    } else {
+        seg = get_segment_to_active_stream(false, stream_id);
+    }
+
+    if (seg->full()) {
+        evict_policy_add(seg);
+        int assigned_class_num = seg->get_class_num();
+        active_seg.erase(seg->get_class_num());
+        seg = get_segment_to_active_stream(false, assigned_class_num);
+    }
+
+    invalidate(key, lba_sz);
+
+    auto &blk = seg->blocks[seg->write_ptr];
+    uint64_t dst_offset = block_offset(seg, seg->write_ptr);
+    blk.key = key;
+    blk.valid = true;
+    blk.create_timestamp = log_cache_timestamp;
+    mapping[key] = { seg, seg->write_ptr };
+
+    ++seg->write_ptr;
+    ++seg->valid_cnt;
+    ++global_valid_blocks;
+    ++log_cache_timestamp;
+    if (stream_policy) {
+        stream_policy->Append(key, log_cache_timestamp, reinterpret_cast<void*>(seg->valid_cnt));
+    }
+    write_size_to_cache += lba_sz;
+
+    if (payload) {
+        write_cache_data(dst_offset, payload, lba_sz);
+    }
+}
+
+bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64_t *cache_offset)
+{
+    periodic();
+    ghost_cache.access(key);
+    LogCacheSegment* seg = nullptr;
+    if (stream_policy) {
+        seg = get_segment_with_stream_policy(false, key);
+    } else {
+        seg = get_segment_to_active_stream(false, stream_id);
+    }
+
+    if (!seg) {
+        return false;
+    }
+
+    if (seg->full()) {
+        evict_policy_add(seg);
+        int assigned_class_num = seg->get_class_num();
+        active_seg.erase(seg->get_class_num());
+        seg = get_segment_to_active_stream(false, assigned_class_num);
+        if (!seg) {
+            return false;
+        }
+    }
+
+    invalidate(key, lba_sz);
+
+    auto &blk = seg->blocks[seg->write_ptr];
+    uint64_t dst_offset = block_offset(seg, seg->write_ptr);
+    blk.key = key;
+    blk.valid = true;
+    blk.create_timestamp = log_cache_timestamp;
+    mapping[key] = { seg, seg->write_ptr };
+
+    ++seg->write_ptr;
+    ++seg->valid_cnt;
+    ++global_valid_blocks;
+    ++log_cache_timestamp;
+    if (stream_policy) {
+        stream_policy->Append(key, log_cache_timestamp, reinterpret_cast<void*>(seg->valid_cnt));
+    }
+    write_size_to_cache += lba_sz;
+
+    *cache_offset = dst_offset;
+    return true;
+}
+
+void LogCache::ingest_payload(int stream_id, const std::vector<BlockPayload>& payloads)
+{
+    if (payloads.empty()) {
+        return;
+    }
+    for (const auto &entry : payloads) {
+        append_block(stream_id, entry.key, entry.lba_size, entry.data);
+    }
+    check_and_evict_if_needed();
+}
+
+int LogCache::read_block(long key, void *buf, size_t len)
+{
+    if (!buf || len == 0) {
+        return -1;
+    }
+    auto it = mapping.find(key);
+    if (it != mapping.end()) {
+        auto &blk = it->second.seg->blocks[it->second.idx];
+        if (!blk.valid) {
+            return -1;
+        }
+        return read_cache_data(block_offset(it->second.seg, it->second.idx), buf, len);
+    }
+    return read_backend_data(static_cast<uint64_t>(key) * cache_block_size, buf, len);
+}
+
+int LogCache::read_blocks(const std::vector<BlockReadRequest>& reqs)
+{
+    for (const auto &req : reqs) {
+        int rc = read_block(req.key, req.data, req.len);
+        if (rc) {
+            return rc;
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* helpers                                                            */
+/* ------------------------------------------------------------------ */
+LogCacheSegment* LogCache::alloc_segment(bool shrink)
+{
+
+    if (shrink == true) {
+        check_and_evict_if_needed();     // proactive (no-op in async mode)
+    }
+
+    // In async mode, keep 3 segments as buffer for GC/Evict to have room to work
+    constexpr size_t ASYNC_RESERVE_SEGMENTS = 3;
+    if (async_mode_ && free_pool.size() <= ASYNC_RESERVE_SEGMENTS) {
+        return nullptr;  // Caller should trigger async GC/Evict
+    }
+
+    if (free_pool.empty()) {
+        throw std::runtime_error("LogCache: no free segment");
+    }
+
+    LogCacheSegment* s = free_pool.front();
+    free_pool.pop_front();
+    s->reset();
+    return s;
+}
+
+
+LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key, bool check_only)
+{
+    LogCacheSegment *seg = nullptr;
+    uint64_t previous_blk_create_timestamp = UINT64_MAX;
+    if (exists(key))
+    {
+        auto loc = mapping[key];
+        assert(loc.seg != nullptr);
+        assert(loc.idx < loc.seg->blocks.size());
+        if (loc.seg->blocks[loc.idx].valid)
+        {
+            previous_blk_create_timestamp = loc.seg->blocks[loc.idx].create_timestamp;
+        }
+    }
+    int stream_id = stream_policy->Classify(key, gc, log_cache_timestamp, previous_blk_create_timestamp);
+    assert (!gc || (gc && stream_id >= Segment::GC_STREAM_START));
+    std::unordered_map<int, LogCacheSegment*>*  active_table = &active_seg;
+    if (gc) {
+        active_table = &gc_active_seg;
+    }
+    auto it_stream = active_table->find(stream_id);
+    if (it_stream == active_table->end())
+    {
+        if(check_only) {
+            return nullptr;
+        }
+        seg = alloc_segment(!gc);
+        if (!seg) {
+            return nullptr;  // No free segment (async mode needs GC/Evict)
+        }
+        seg->class_num = stream_id; // stream id로 class num 설정
+        seg->create_timestamp = log_cache_timestamp; // 초기화
+        (*active_table)[stream_id] = seg;
+    }
+    else
+    {
+        seg = it_stream->second;
+        assert (!gc || (gc && stream_id >= Segment::GC_STREAM_START));
+        assert (!gc || (gc && seg->get_class_num() >= Segment::GC_STREAM_START));
+    }
+    return seg;
+}
+
+LogCacheSegment* LogCache::get_segment_to_active_stream(bool gc, int stream_id, bool check_only)
+{
+    LogCacheSegment *seg = nullptr;
+    std::unordered_map<int, LogCacheSegment*>*  active_table = &active_seg;
+    if (gc) {
+        active_table = &gc_active_seg;
+        if (stream_id < Segment::GC_STREAM_START) {
+            stream_id += Segment::GC_STREAM_START; 
+        }
+    }
+    auto it_stream = active_table->find(stream_id);
+    if (it_stream == active_table->end())
+    {
+        if (check_only) {
+            return nullptr;
+        }
+        seg = alloc_segment(!gc);
+        if (!seg) {
+            return nullptr;  // No free segment (async mode needs GC/Evict)
+        }
+        seg->class_num = stream_id; // stream id로 class num 설정
+        seg->create_timestamp = log_cache_timestamp; // 초기화
+        (*active_table)[stream_id] = seg;
+    }
+    else
+    {
+        seg = it_stream->second;
+    }
+    return seg;
+}
+
+extern uint64_t g_threshold;
+extern uint64_t g_timestamp;
+void LogCache::check_and_evict_if_needed()
+{
+    // In async mode, GC/Evict is handled by async wrapper
+    // Sync eviction here would cause re-entrancy issues with SPDK pollers
+    if (async_mode_) {
+        return;
+    }
+
+    const std::size_t low_water =
+        static_cast<std::size_t>(std::ceil(total_segments *
+                                           cfg_.free_ratio_low));
+    LogCacheSegment* last_target_seg = nullptr;
+    //bool first_compact = true;
+    std::list<Segment *> segment_list;
+    g_timestamp = log_cache_timestamp;
+    static uint64_t threshold = (cfg_.segment_bytes / cache_block_size) *static_cast<std::size_t>(std::ceil(total_segments *
+                                           (1 - cfg_.free_ratio_low) * (1 + additional_free_blks_ratio_by_gc)));
+    g_threshold = threshold;
+    while (free_pool.size() < low_water)
+    {
+        /* eviction 후보 수집 */
+        bool compact = false;
+        if (target_valid_blk_rate >= 0.1) {
+            if (compactor && (double)target_valid_blk_rate * total_cache_block_count  > global_valid_blocks) {
+                compact = true;
+            }
+        }
+
+        LogCacheSegment* victim = nullptr; 
+        if (compact == true){
+            victim = (LogCacheSegment *)evictor->choose_segment();
+            threshold = log_cache_timestamp - victim->create_timestamp + 1;
+            g_threshold = threshold; 
+            
+            if (additional_free_blks_ratio_by_gc < 0.01 ||
+                log_cache_timestamp - victim->create_timestamp < threshold) {
+                evictor->add(victim, log_cache_timestamp);
+                victim = (LogCacheSegment *)compactor->choose_segment();
+            }
+            else {
+                // addtional_free_blks_ratio_by_gc is on 
+                // and threshold < log_cache_timestamp - victim->create_timestamp
+                // exception path
+                compact = false; 
+            }
+        }
+        else {
+            victim = (LogCacheSegment *)evictor->choose_segment();
+            threshold = log_cache_timestamp - victim->create_timestamp;
+            g_threshold = threshold;    
+        }
+
+        //printf("compact %d\n", compact);
+        assert (victim != nullptr);
+        if (victim->valid_cnt == 0) {
+            reset_segment(victim);
+        }
+        else if (compact == true) {
+            int stream_id = victim->get_class_num();
+            compacted_ages_with_segment_histogram->inc(log_cache_timestamp - victim->create_timestamp);
+            last_target_seg = (LogCacheSegment *)evict_and_compaction(victim, threshold, stream_id);
+            if (last_target_seg) {
+                segment_list.push_back(last_target_seg);
+            }
+        }
+        else {
+            evicted_segment_age = victim->get_create_time();
+            evicted_ages_with_segment_histogram->inc(log_cache_timestamp - victim->create_timestamp);
+            evict_segment(victim);
+        }
+
+        if (stream_policy && compact == true) {
+            stream_policy->CollectSegment(victim, log_cache_timestamp);
+        }
+        if (stream_policy) {
+            int victim_stream_id = stream_policy->GetVictimStreamId(log_cache_timestamp, threshold);
+            while (stream_policy && victim_stream_id >= Segment::GC_STREAM_START) {
+                LogCacheSegment* seg = get_segment_to_active_stream(true, victim_stream_id, true);
+                if (seg){
+                   // printf("Evict GC stream %d, write_ptr %d\n", victim_stream_id, seg->write_ptr);
+                    dummy_fill_segment(seg);
+                    //evict_segment(seg);
+                    gc_active_seg.erase(victim_stream_id);
+                }
+                else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+int LogCache::get_block_size()
+{
+    return cache_block_size;
+}
+
+bool LogCache::is_cache_filled() {
+    const std::size_t low_water =
+        static_cast<std::size_t>(std::ceil(total_segments *
+                                           cfg_.free_ratio_low));
+    return free_pool.size() < low_water;
+}
+
+
+void LogCache::reset_segment(LogCacheSegment* s)
+{
+       // erase old segment
+    s->valid_cnt = 0;
+    s->write_ptr = 0;
+    reset_cache_region(s);
+    free_pool.push_back(s);
+    evict_policy_remove(s);
+}
+
+// Async context for reset_segment_async
+struct ResetSegmentAsyncCtx {
+    LogCache *cache;
+    LogCacheSegment *seg;
+    cache_device_io_cb user_cb;
+    void *user_cb_arg;
+};
+
+static void reset_segment_async_cb(void *cb_arg, int status) {
+    auto *ctx = static_cast<ResetSegmentAsyncCtx *>(cb_arg);
+    // Add segment to free pool after zone reset completes
+    ctx->cache->complete_segment_reset(ctx->seg);
+    if (ctx->user_cb) {
+        ctx->user_cb(ctx->user_cb_arg, status);
+    }
+    delete ctx;
+}
+
+void LogCache::reset_segment_async(LogCacheSegment* s, cache_device_io_cb cb, void *cb_arg)
+{
+    if (!s) {
+        if (cb) cb(cb_arg, 0);
+        return;
+    }
+
+    // Clear segment state first
+    s->valid_cnt = 0;
+    s->write_ptr = 0;
+    evict_policy_remove(s);
+
+    if (!device_io_) {
+        // No device, just add to free pool directly
+        free_pool.push_back(s);
+        if (cb) cb(cb_arg, 0);
+        return;
+    }
+
+    // Create async context
+    auto *ctx = new ResetSegmentAsyncCtx{this, s, cb, cb_arg};
+    device_io_->reset_cache_region_async(s->physical_base, cfg_.segment_bytes,
+                                          reset_segment_async_cb, ctx);
+}
+
+void LogCache::complete_segment_reset(LogCacheSegment* s)
+{
+    if (s) {
+        free_pool.push_back(s);
+    }
+}
+
+void LogCache::dummy_fill_segment(LogCacheSegment* s)
+{
+    if (s) {
+        for (std::size_t i = s->write_ptr; i < s->blocks.size(); ++i) {
+            s->blocks[i].key = 0;
+            s->blocks[i].valid = false;
+            s->blocks[i].create_timestamp = UINT64_MAX;
+        }
+        s->write_ptr = s->blocks.size();
+        evict_policy_add(s);
+    }
+}
+
+
+
+Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, int gc_stream_id)
+{
+    LogCacheSegment* target_seg = nullptr;
+    int evicted_blocks_for_victim = 0, compacted_blocks_for_victim = 0;
+    if (!stream_policy) {
+        target_seg = get_segment_to_active_stream(true, gc_stream_id);
+    }
+    for (std::size_t i = 0; i < s->blocks.size(); ++i)
+    {
+        auto &blk = s->blocks[i];
+        if (!blk.valid) continue;
+        if (threshold > 0 && log_cache_timestamp - blk.create_timestamp >= threshold) { 
+            if (is_ghost_cache) {
+                ghost_cache.push(blk.key);
+            }
+            print_objects("evict", log_cache_timestamp - blk.create_timestamp);
+            evicted_blocks += cfg_.evicted_blk_size;
+            evicted_ages_histogram->inc(log_cache_timestamp - blk.create_timestamp);
+            evicted_timestamp[blk.key] = log_cache_timestamp;
+            evicted_blocks_for_victim += 1;
+            // map erase and blk valid false is done in this function
+            evict(s, i);
+            continue;
+        }
+        if (stream_policy) {
+            target_seg = get_segment_with_stream_policy(true, blk.key);
+        }
+        assert(target_seg->class_num >= Segment::GC_STREAM_START || !stream_policy);
+        if (target_seg->full())                 // segment 소진 -> 새 seg
+        {
+            // add previous segment count 
+            evict_policy_add(target_seg);
+            int assigned_class_num = target_seg->get_class_num();
+            assert(assigned_class_num >= 0);
+            gc_active_seg.erase(target_seg->get_class_num());
+            target_seg = get_segment_to_active_stream(true, assigned_class_num);
+        }
+        assert(target_seg != s);
+        // get p2L index
+        if (target_seg->create_timestamp > blk.create_timestamp) {
+            target_seg->create_timestamp = blk.create_timestamp;
+        }
+
+        print_objects("compact", log_cache_timestamp - blk.create_timestamp);
+        copy_block(s, i, target_seg);
+        compacted_blocks_for_victim += 1;
+
+    }
+    assert((target_seg == nullptr && compacted_blocks_for_victim == 0) || target_seg);
+    /*if (target_seg) {
+        printf("Compaction and Evict: %lu blocks moved from segment %p to segment %p, free_pool_size %ld, valid ratio %.4f age %lu target_seg_write_ptr %lu target_create_timestamp %lu threshold %lu stream_id %d\n", 
+        s->valid_cnt, s, target_seg, free_pool.size(), global_valid_blocks / (float)total_cache_block_count, log_cache_timestamp - s->create_timestamp, target_seg->write_ptr, s->create_timestamp, threshold, target_seg->get_class_num());
+    }
+    else {
+        printf("Evict: %lu blocks free_pool_size %ld, valid ratio %.4f age %lu, create_time %lu \n", 
+        s->valid_cnt, free_pool.size(), global_valid_blocks / (float)total_cache_block_count, log_cache_timestamp - s->create_timestamp, s->create_timestamp);
+    }*/
+    reset_segment(s);
+    evicted_blocks_histogram->inc(evicted_blocks_for_victim);
+    compacted_blocks_histogram->inc(compacted_blocks_for_victim);
+    return target_seg;
+}
+
+
+void LogCache::evict_segment(LogCacheSegment* s)
+{
+    int evicted_blocks_for_victim = 0;
+    /* 모든 valid page flush */
+    if (s->valid_cnt == 0) {
+        printf("%ld\n", s->valid_cnt);
+        printf("No valid blocks to evict.\n");
+    }
+    
+    for (std::size_t i = 0; i < s->blocks.size(); ++i)
+    {
+        auto &blk = s->blocks[i];
+        if (!blk.valid) {
+            continue;
+        }
+        if (is_ghost_cache) {
+            ghost_cache.push(blk.key);
+        }
+        print_objects("evict", log_cache_timestamp - blk.create_timestamp);
+        evicted_ages_histogram->inc(log_cache_timestamp - blk.create_timestamp);
+        evicted_blocks += cfg_.evicted_blk_size;
+        evicted_blocks_for_victim += 1;
+        evicted_timestamp[blk.key] = log_cache_timestamp;
+
+        evict(s, i);
+        
+    }
+  //  printf("Evict: %lu blocks free_pool_size %ld, valid ratio %.4f age %lu, create_time %lu \n",
+  //      s->valid_cnt, free_pool.size(), global_valid_blocks / (float)total_cache_block_count, log_cache_timestamp - s->create_timestamp, s->create_timestamp);
+    reset_segment(s);
+    evicted_blocks_histogram->inc(evicted_blocks_for_victim);
+}
+
+
+void LogCache::evict_one_block() {
+}
+
+void LogCache::evict(LogCacheSegment *seg, std::size_t idx) {
+    
+    //const uint64_t DUMMY_VALUE = 0;
+    auto &blk = seg->blocks[idx];
+    uint64_t old_key = blk.key;
+    int EVICTED_BLOCK_SIZE = cfg_.evicted_blk_size; // 16 blocks, 64k
+    int evicted_blocks_per_evict = 0;
+    struct ChunkBlock {
+        LogCacheSegment* seg;
+        std::size_t idx;
+        bool valid;
+        ChunkBlock() : seg(nullptr), idx(0), valid(false) {}
+        ChunkBlock(LogCacheSegment* s, std::size_t i, bool v)
+            : seg(s), idx(i), valid(v) {}
+    };
+    std::vector<ChunkBlock> chunk_blocks;
+    chunk_blocks.reserve(EVICTED_BLOCK_SIZE);
+
+    uint64_t start_index_64k = old_key / EVICTED_BLOCK_SIZE * EVICTED_BLOCK_SIZE;
+    for (uint64_t index_64k = start_index_64k; index_64k < start_index_64k + EVICTED_BLOCK_SIZE; index_64k++) {
+        if (index_64k == old_key) {
+            chunk_blocks.push_back(ChunkBlock(seg, idx, true));
+            continue;
+        }
+        auto it = mapping.find(index_64k);
+
+        if (it != mapping.end()) {
+            auto loc = it->second;
+            chunk_blocks.push_back(ChunkBlock(loc.seg, loc.idx, true));
+            mapping.erase(index_64k);
+            auto &other_blk = loc.seg->blocks[loc.idx];
+            other_blk.valid = false;
+            global_valid_blocks -= 1;
+            evicted_blocks_per_evict += 1;
+        }
+        else {
+            chunk_blocks.push_back(ChunkBlock(nullptr, 0, false));
+            read_blocks_in_partial_write += 1;
+        }
+    }
+
+    mapping.erase(blk.key);
+    blk.valid = false;
+    global_valid_blocks -= 1;
+
+    if (device_io_) {
+        ensure_staging_buffer(cache_block_size * EVICTED_BLOCK_SIZE);
+        for (int i = 0; i < EVICTED_BLOCK_SIZE; ++i) {
+            uint8_t *dst = staging_buffer_.data() + static_cast<size_t>(i) * cache_block_size;
+            auto &block_ref = chunk_blocks[i];
+            if (block_ref.valid) {
+                read_cache_data(block_offset(block_ref.seg, block_ref.idx), dst, cache_block_size);
+            } else {
+                read_backend_data((start_index_64k + i) * cache_block_size, dst, cache_block_size);
+            }
+        }
+        write_backend_data(start_index_64k * cache_block_size,
+                           staging_buffer_.data(),
+                           static_cast<size_t>(cache_block_size) * EVICTED_BLOCK_SIZE);
+    } else {
+        _evict_one_block(start_index_64k  * cache_block_size /* 64k aligend */, cache_block_size * EVICTED_BLOCK_SIZE /* 64k */, OP_TYPE::WRITE);
+    }
+
+    evicted_cache_blocks_per_evict->inc(evicted_blocks_per_evict);
+}
+
+void LogCache::print_objects(std::string prefix, uint64_t value) {
+    //fprintf(fp_object, "%s: %lu\n", prefix.c_str(), value);
+}
+
+void LogCache::print_stats() {
+    static uint64_t written_window_bytes = cfg_.print_stats_interval;
+    static uint64_t next_written_bytes = cfg_.segment_bytes;
+    if ((uint64_t)write_size_to_cache >= next_written_bytes) {
+        const std::string& prefix = stats_prefix();
+        const char* prefix_cstr = prefix.empty() ? "LOG_CACHE" : prefix.c_str();
+        fprintf (fp_stats, "%s invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu read_blocks_in_partial_write %lu\n",
+                prefix_cstr, invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes, reinsert_blocks, read_blocks_in_partial_write);
+        fflush(fp_stats);
+        next_written_bytes += written_window_bytes;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Async GC/Evict helpers                                              */
+/* ------------------------------------------------------------------ */
+bool LogCache::need_gc_or_evict() const
+{
+    const std::size_t low_water =
+        static_cast<std::size_t>(std::ceil(total_segments * cfg_.free_ratio_low));
+    return free_pool.size() < low_water;
+}
+
+bool LogCache::get_cache_location(long key, uint64_t *offset)
+{
+    auto it = mapping.find(key);
+    if (it == mapping.end()) {
+        return false;
+    }
+    if (!it->second.seg->blocks[it->second.idx].valid) {
+        return false;
+    }
+    *offset = block_offset(it->second.seg, it->second.idx);
+    return true;
+}
+
+bool LogCache::prepare_gc(GcPrepareResult &result)
+{
+    if (!need_gc_or_evict()) {
+        return false;
+    }
+
+    // Determine if we should compact or just evict
+    bool compact = false;
+    if (target_valid_blk_rate >= 0.1) {
+        if (compactor && (double)target_valid_blk_rate * total_cache_block_count > global_valid_blocks) {
+            compact = true;
+        }
+    }
+
+    LogCacheSegment* victim = nullptr;
+    uint64_t threshold = 0;
+
+    if (compact) {
+        victim = (LogCacheSegment *)evictor->choose_segment();
+        threshold = log_cache_timestamp - victim->create_timestamp + 1;
+
+        if (additional_free_blks_ratio_by_gc < 0.01 ||
+            log_cache_timestamp - victim->create_timestamp < threshold) {
+            evictor->add(victim, log_cache_timestamp);
+            victim = (LogCacheSegment *)compactor->choose_segment();
+        } else {
+            compact = false;
+        }
+    }
+
+    if (!compact) {
+        victim = (LogCacheSegment *)evictor->choose_segment();
+        threshold = log_cache_timestamp - victim->create_timestamp;
+    }
+
+    if (!victim) {
+        return false;
+    }
+
+    result.victim_seg = victim;
+    result.threshold = threshold;
+    result.gc_stream_id = victim->get_class_num();
+    result.do_evict_only = !compact;
+
+    if (victim->valid_cnt == 0) {
+        // No valid blocks, just reset
+        result.blocks_to_copy.clear();
+        result.target_seg = nullptr;
+        return true;
+    }
+
+    if (compact) {
+        // Prepare GC - collect valid blocks to copy
+        result.target_seg = get_segment_to_active_stream(true, result.gc_stream_id);
+
+        for (std::size_t i = 0; i < victim->blocks.size(); ++i) {
+            auto &blk = victim->blocks[i];
+            if (!blk.valid) continue;
+
+            // Check if should evict or copy based on threshold
+            if (threshold > 0 && log_cache_timestamp - blk.create_timestamp >= threshold) {
+                // Will be evicted, not copied
+                continue;
+            }
+
+            // Check if target segment is full
+            if (result.target_seg->full()) {
+                evict_policy_add(result.target_seg);
+                int assigned_class_num = result.target_seg->get_class_num();
+                gc_active_seg.erase(result.target_seg->get_class_num());
+                result.target_seg = get_segment_to_active_stream(true, assigned_class_num);
+            }
+
+            GcBlockInfo info;
+            info.src_offset = block_offset(victim, i);
+            info.dst_offset = block_offset(result.target_seg, result.target_seg->write_ptr);
+            info.key = blk.key;
+            info.src_idx = i;
+            info.create_timestamp = blk.create_timestamp;
+            result.blocks_to_copy.push_back(info);
+
+            // Reserve slot in target segment
+            result.target_seg->write_ptr++;
+        }
+    } else {
+        result.target_seg = nullptr;
+        result.blocks_to_copy.clear();
+    }
+
+    return true;
+}
+
+bool LogCache::prepare_evict(EvictPrepareResult &result)
+{
+    if (!need_gc_or_evict()) {
+        return false;
+    }
+
+    LogCacheSegment* victim = (LogCacheSegment *)evictor->choose_segment();
+    if (!victim) {
+        return false;
+    }
+
+    result.victim_seg = victim;
+    result.chunks.clear();
+
+    if (victim->valid_cnt == 0) {
+        return true;
+    }
+
+    // Group blocks by 64k chunks (based on evicted_blk_size)
+    const int EVICTED_BLOCK_SIZE = cfg_.evicted_blk_size;
+    std::map<uint64_t, EvictBlockInfo> chunk_map;
+
+    for (std::size_t i = 0; i < victim->blocks.size(); ++i) {
+        auto &blk = victim->blocks[i];
+        if (!blk.valid) continue;
+
+        uint64_t chunk_start = (blk.key / EVICTED_BLOCK_SIZE) * EVICTED_BLOCK_SIZE;
+
+        auto it = chunk_map.find(chunk_start);
+        if (it == chunk_map.end()) {
+            EvictBlockInfo info;
+            info.start_key = chunk_start;
+            info.valid_mask.resize(EVICTED_BLOCK_SIZE, false);
+            info.cache_locations.resize(EVICTED_BLOCK_SIZE, {nullptr, 0});
+            chunk_map[chunk_start] = std::move(info);
+            it = chunk_map.find(chunk_start);
+        }
+
+        size_t offset_in_chunk = blk.key - chunk_start;
+        it->second.valid_mask[offset_in_chunk] = true;
+        it->second.cache_locations[offset_in_chunk] = {victim, i};
+    }
+
+    for (auto &pair : chunk_map) {
+        result.chunks.push_back(std::move(pair.second));
+    }
+
+    return true;
+}
+
+void LogCache::finalize_gc(GcPrepareResult &result)
+{
+    LogCacheSegment *victim = result.victim_seg;
+    LogCacheSegment *target = result.target_seg;
+
+    // Update mapping for copied blocks
+    for (auto &info : result.blocks_to_copy) {
+        auto &src_blk = victim->blocks[info.src_idx];
+
+        // Find the destination index from the offset
+        size_t dst_idx = (info.dst_offset - target->physical_base) / cache_block_size;
+
+        // Update target block metadata
+        auto &dst_blk = target->blocks[dst_idx];
+        dst_blk.key = info.key;
+        dst_blk.valid = true;
+        dst_blk.create_timestamp = info.create_timestamp;
+
+        // Update mapping
+        mapping[info.key] = {target, dst_idx};
+
+        // Update target segment
+        target->valid_cnt++;
+        compacted_blocks++;
+
+        // Invalidate source
+        src_blk.valid = false;
+
+        // Update target segment create_timestamp
+        if (target->create_timestamp > info.create_timestamp) {
+            target->create_timestamp = info.create_timestamp;
+        }
+    }
+
+    // Handle blocks that should be evicted (not copied)
+    for (std::size_t i = 0; i < victim->blocks.size(); ++i) {
+        auto &blk = victim->blocks[i];
+        if (!blk.valid) continue;
+
+        // This block was not copied, so it should be evicted
+        if (is_ghost_cache) {
+            ghost_cache.push(blk.key);
+        }
+        evicted_blocks += cfg_.evicted_blk_size;
+        evicted_timestamp[blk.key] = log_cache_timestamp;
+        mapping.erase(blk.key);
+        blk.valid = false;
+        global_valid_blocks--;
+    }
+
+    // Add target to evict policy if it has blocks
+    if (target && target->valid_cnt > 0 && !result.blocks_to_copy.empty()) {
+        // Don't add to evict policy here - it will be added when full
+    }
+
+    // Reset victim segment
+    reset_segment(victim);
+
+    // Handle stream policy
+    if (stream_policy) {
+        stream_policy->CollectSegment(victim, log_cache_timestamp);
+    }
+}
+
+void LogCache::finalize_evict(EvictPrepareResult &result)
+{
+    LogCacheSegment *victim = result.victim_seg;
+
+    // Invalidate all blocks and update mapping
+    for (auto &chunk : result.chunks) {
+        for (size_t i = 0; i < chunk.valid_mask.size(); ++i) {
+            if (!chunk.valid_mask[i]) continue;
+
+            long key = chunk.start_key + i;
+            auto it = mapping.find(key);
+            if (it != mapping.end()) {
+                auto &blk = it->second.seg->blocks[it->second.idx];
+                if (blk.valid) {
+                    if (is_ghost_cache) {
+                        ghost_cache.push(key);
+                    }
+                    evicted_blocks += cfg_.evicted_blk_size;
+                    evicted_timestamp[key] = log_cache_timestamp;
+                    blk.valid = false;
+                    global_valid_blocks--;
+                }
+                mapping.erase(it);
+            }
+        }
+    }
+
+    // Reset victim segment
+    reset_segment(victim);
+}
+
+void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb, void *cb_arg)
+{
+    LogCacheSegment *victim = result.victim_seg;
+    LogCacheSegment *target = result.target_seg;
+
+    // Update mapping for copied blocks
+    for (auto &info : result.blocks_to_copy) {
+        auto &src_blk = victim->blocks[info.src_idx];
+
+        // Find the destination index from the offset
+        size_t dst_idx = (info.dst_offset - target->physical_base) / cache_block_size;
+
+        // Update target block metadata
+        auto &dst_blk = target->blocks[dst_idx];
+        dst_blk.key = info.key;
+        dst_blk.valid = true;
+        dst_blk.create_timestamp = info.create_timestamp;
+
+        // Update mapping
+        mapping[info.key] = {target, dst_idx};
+
+        // Update target segment
+        target->valid_cnt++;
+        compacted_blocks++;
+
+        // Invalidate source
+        src_blk.valid = false;
+
+        // Update target segment create_timestamp
+        if (target->create_timestamp > info.create_timestamp) {
+            target->create_timestamp = info.create_timestamp;
+        }
+    }
+
+    // Handle blocks that should be evicted (not copied)
+    for (std::size_t i = 0; i < victim->blocks.size(); ++i) {
+        auto &blk = victim->blocks[i];
+        if (!blk.valid) continue;
+
+        // This block was not copied, so it should be evicted
+        if (is_ghost_cache) {
+            ghost_cache.push(blk.key);
+        }
+        evicted_blocks += cfg_.evicted_blk_size;
+        evicted_timestamp[blk.key] = log_cache_timestamp;
+        mapping.erase(blk.key);
+        blk.valid = false;
+        global_valid_blocks--;
+    }
+
+    // Handle stream policy before async reset
+    if (stream_policy) {
+        stream_policy->CollectSegment(victim, log_cache_timestamp);
+    }
+
+    // Reset victim segment asynchronously
+    reset_segment_async(victim, cb, cb_arg);
+}
+
+void LogCache::finalize_evict_async(EvictPrepareResult &result, cache_device_io_cb cb, void *cb_arg)
+{
+    LogCacheSegment *victim = result.victim_seg;
+
+    // Invalidate all blocks and update mapping
+    for (auto &chunk : result.chunks) {
+        for (size_t i = 0; i < chunk.valid_mask.size(); ++i) {
+            if (!chunk.valid_mask[i]) continue;
+
+            long key = chunk.start_key + i;
+            auto it = mapping.find(key);
+            if (it != mapping.end()) {
+                auto &blk = it->second.seg->blocks[it->second.idx];
+                if (blk.valid) {
+                    if (is_ghost_cache) {
+                        ghost_cache.push(key);
+                    }
+                    evicted_blocks += cfg_.evicted_blk_size;
+                    evicted_timestamp[key] = log_cache_timestamp;
+                    blk.valid = false;
+                    global_valid_blocks--;
+                }
+                mapping.erase(it);
+            }
+        }
+    }
+
+    // Reset victim segment asynchronously
+    reset_segment_async(victim, cb, cb_arg);
+}

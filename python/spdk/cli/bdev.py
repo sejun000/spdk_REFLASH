@@ -807,6 +807,36 @@ def add_parser(subparsers):
     p.add_argument('name', help='Virtual zone bdev name')
     p.set_defaults(func=bdev_zone_block_delete)
 
+    def bdev_icache_create(args):
+        print_json(args.client.bdev_icache_create(
+                                                   name=args.name,
+                                                   cache_bdev_name=args.cache_bdev,
+                                                   backend_bdev_name=args.backend_bdev,
+                                                   max_pending_io=args.max_pending_io,
+                                                   cache_type=args.cache_type,
+                                                   waf_log_path=args.waf_log_path,
+                                                   stat_log_path=args.stat_log_path,
+                                                   valid_rate_threshold=args.valid_rate_threshold))
+
+    p = subparsers.add_parser('bdev_icache_create',
+                              help='Create icache vbdev on top of cache/backend devices')
+    p.add_argument('-b', '--name', help='Name of the icache vbdev', required=True)
+    p.add_argument('-c', '--cache-bdev', help='Cache-tier bdev name', required=True)
+    p.add_argument('-k', '--backend-bdev', help='Backend-tier bdev name', required=True)
+    p.add_argument('-q', '--max-pending-io', help='Queue depth hint for cache device', type=int, required=True)
+    p.add_argument('--cache-type', help='Cache algorithm (default: LOG_GREEDY)')
+    p.add_argument('--waf-log-path', help='Path for WAF log output')
+    p.add_argument('--stat-log-path', help='Path for cache stats output')
+    p.add_argument('--valid-rate-threshold', help='Target valid block ratio', type=float)
+    p.set_defaults(func=bdev_icache_create)
+
+    def bdev_icache_delete(args):
+        args.client.bdev_icache_delete(name=args.name)
+
+    p = subparsers.add_parser('bdev_icache_delete', help='Delete icache vbdev')
+    p.add_argument('name', help='icache vbdev name')
+    p.set_defaults(func=bdev_icache_delete)
+
     def bdev_rbd_register_cluster(args):
         config_param = None
         if args.config_param:

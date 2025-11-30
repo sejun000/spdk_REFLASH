@@ -1,0 +1,1 @@
+./a.out /mnt/nvme2n1/alibaba_block_traces_2020/device_size.csv /mnt/nvme2n1/alibaba_block_traces_2020/io_traces.csv | sudo tee /mnt/nvme2n1/alibaba_block_traces_2020/io_traces_modified.csv > /dev/null

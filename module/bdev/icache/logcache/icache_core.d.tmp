@@ -1,0 +1,13 @@
+logcache/icache_core.o: logcache/icache_core.cpp \
+ /home/sejun000/spdk_25/ssd_waf/icache.h \
+ /home/sejun000/spdk_25/ssd_waf/ftl.h \
+ /home/sejun000/spdk_25/ssd_waf/segment.h \
+ /home/sejun000/spdk_25/ssd_waf/evict_policy.h \
+ /home/sejun000/spdk_25/ssd_waf/common.h \
+ /home/sejun000/spdk_25/ssd_waf/evict_policy_greedy.h
+/home/sejun000/spdk_25/ssd_waf/icache.h:
+/home/sejun000/spdk_25/ssd_waf/ftl.h:
+/home/sejun000/spdk_25/ssd_waf/segment.h:
+/home/sejun000/spdk_25/ssd_waf/evict_policy.h:
+/home/sejun000/spdk_25/ssd_waf/common.h:
+/home/sejun000/spdk_25/ssd_waf/evict_policy_greedy.h:

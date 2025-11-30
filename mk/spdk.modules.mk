@@ -5,7 +5,7 @@
 #
 
 BLOCKDEV_MODULES_LIST = bdev_malloc bdev_null bdev_nvme bdev_passthru bdev_lvol
-BLOCKDEV_MODULES_LIST += bdev_raid bdev_error bdev_gpt bdev_split bdev_delay
+BLOCKDEV_MODULES_LIST += bdev_raid bdev_error bdev_gpt bdev_split bdev_delay bdev_icache
 BLOCKDEV_MODULES_LIST += bdev_zone_block
 BLOCKDEV_MODULES_LIST += blob_bdev blob lvol vmd nvme
 
@@ -13,6 +13,9 @@ BLOCKDEV_MODULES_LIST += blob_bdev blob lvol vmd nvme
 INTR_BLOCKDEV_MODULES_LIST = bdev_malloc bdev_passthru bdev_error bdev_gpt bdev_split bdev_raid
 # Logical volume and blobstore can directly run in both interrupt mode and poll mode.
 INTR_BLOCKDEV_MODULES_LIST += bdev_lvol blob_bdev blob lvol
+
+# icache vbdev pulls in C++ dependencies; make sure libstdc++ is linked with block device modules.
+BLOCKDEV_MODULES_PRIVATE_LIBS += -lstdc++
 
 ifeq ($(CONFIG_XNVME),y)
 BLOCKDEV_MODULES_LIST += bdev_xnvme
