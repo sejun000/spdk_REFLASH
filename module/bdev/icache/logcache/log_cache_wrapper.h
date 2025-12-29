@@ -26,6 +26,14 @@ struct log_cache_ctx *log_cache_ctx_create(struct spdk_bdev_desc *cache_desc,
 
 void log_cache_ctx_destroy(struct log_cache_ctx *ctx);
 
+/* Move timeout poller to current thread (call from worker thread) */
+void log_cache_ctx_move_poller_to_current_thread(struct log_cache_ctx *ctx);
+
+/* Set io_channels for cache device (call once during worker init) */
+void log_cache_ctx_set_channels(struct log_cache_ctx *ctx,
+				struct spdk_io_channel *cache_ch,
+				struct spdk_io_channel *backend_ch);
+
 int log_cache_ctx_write_async(struct log_cache_ctx *ctx,
 			      struct spdk_io_channel *cache_ch,
 			      struct spdk_io_channel *backend_ch,

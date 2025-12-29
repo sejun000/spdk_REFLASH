@@ -45,9 +45,24 @@ struct icache_bdev_io {
 	struct spdk_io_channel *submit_ch;
 	struct icache_io_channel *ic_ch;
 	struct vbdev_icache *icache;
+	struct spdk_thread *orig_thread;  /* Thread that submitted the IO */
 };
 
 #define ICACHE_MAX_RW_BYTES	(2 * 1024 * 1024)
+#define ICACHE_WORKER_CORE	1  /* Dedicated core for log_wrapper */
+
+/* Dedicated log_wrapper thread (single-threaded, no ublk_poll) */
+static struct spdk_thread *g_log_worker_thread = NULL;
+static struct spdk_io_channel *g_worker_cache_ch = NULL;
+static struct spdk_io_channel *g_worker_backend_ch = NULL;
+static bool g_worker_initialized = false;
+
+/* Message for forwarding IO to worker thread */
+struct icache_worker_msg {
+	struct vbdev_icache *icache;
+	struct spdk_bdev_io *bdev_io;
+	struct spdk_thread *orig_thread;
+};
 
 static TAILQ_HEAD(, vbdev_icache) g_icache_nodes = TAILQ_HEAD_INITIALIZER(g_icache_nodes);
 
@@ -66,6 +81,7 @@ static struct spdk_bdev_module icache_if = {
 };
 
 SPDK_BDEV_MODULE_REGISTER(icache, &icache_if)
+SPDK_LOG_REGISTER_COMPONENT(icache)
 
 static struct vbdev_icache *
 vbdev_icache_find_by_name(const char *name)
@@ -134,6 +150,104 @@ icache_complete_io(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	spdk_bdev_io_complete(orig, success ? SPDK_BDEV_IO_STATUS_SUCCESS : SPDK_BDEV_IO_STATUS_FAILED);
 }
 
+/* Worker thread initialization context */
+struct worker_init_ctx {
+	struct spdk_bdev_desc *cache_desc;
+	struct spdk_bdev_desc *backend_desc;
+	struct log_cache_ctx *log_ctx;
+	int result;
+	struct spdk_thread *caller_thread;
+};
+
+/* Called on worker thread to get io_channels */
+static void
+icache_worker_init_on_thread(void *arg)
+{
+	struct worker_init_ctx *ctx = arg;
+
+	g_worker_cache_ch = spdk_bdev_get_io_channel(ctx->cache_desc);
+	if (!g_worker_cache_ch) {
+		SPDK_ERRLOG("Failed to get worker cache io_channel\n");
+		ctx->result = -ENOMEM;
+		goto done;
+	}
+
+	g_worker_backend_ch = spdk_bdev_get_io_channel(ctx->backend_desc);
+	if (!g_worker_backend_ch) {
+		SPDK_ERRLOG("Failed to get worker backend io_channel\n");
+		spdk_put_io_channel(g_worker_cache_ch);
+		g_worker_cache_ch = NULL;
+		ctx->result = -ENOMEM;
+		goto done;
+	}
+
+	/* Move timeout poller to this worker thread */
+	if (ctx->log_ctx) {
+		log_cache_ctx_move_poller_to_current_thread(ctx->log_ctx);
+		/* Set channels once during init (not per-IO) */
+		log_cache_ctx_set_channels(ctx->log_ctx, g_worker_cache_ch, g_worker_backend_ch);
+	}
+
+	g_worker_initialized = true;
+	ctx->result = 0;
+	SPDK_NOTICELOG("Log worker thread initialized on core %d\n", spdk_env_get_current_core());
+
+done:
+	/* Signal completion - caller will poll for result */
+	__sync_synchronize();
+}
+
+/* Create dedicated worker thread for log_wrapper */
+static int
+icache_create_worker_thread(struct spdk_bdev_desc *cache_desc,
+			    struct spdk_bdev_desc *backend_desc,
+			    struct log_cache_ctx *log_ctx)
+{
+	struct spdk_cpuset cpuset;
+	struct worker_init_ctx ctx = {0};
+	int timeout_us = 5000000;  /* 5 second timeout */
+
+	if (g_log_worker_thread) {
+		/* Already created */
+		return 0;
+	}
+
+	/* Create thread pinned to dedicated core */
+	spdk_cpuset_zero(&cpuset);
+	spdk_cpuset_set_cpu(&cpuset, ICACHE_WORKER_CORE, true);
+
+	g_log_worker_thread = spdk_thread_create("log_worker", &cpuset);
+	if (!g_log_worker_thread) {
+		SPDK_ERRLOG("Failed to create log worker thread\n");
+		return -ENOMEM;
+	}
+
+	SPDK_NOTICELOG("Created log worker thread on core %d\n", ICACHE_WORKER_CORE);
+
+	/* Initialize io_channels on the worker thread */
+	ctx.cache_desc = cache_desc;
+	ctx.backend_desc = backend_desc;
+	ctx.log_ctx = log_ctx;
+	ctx.result = -EINPROGRESS;
+	ctx.caller_thread = spdk_get_thread();
+
+	spdk_thread_send_msg(g_log_worker_thread, icache_worker_init_on_thread, &ctx);
+
+	/* Wait for initialization (simple busy wait with timeout) */
+	while (ctx.result == -EINPROGRESS && timeout_us > 0) {
+		spdk_thread_poll(spdk_get_thread(), 0, 0);
+		usleep(1000);
+		timeout_us -= 1000;
+	}
+
+	if (ctx.result != 0) {
+		SPDK_ERRLOG("Worker thread initialization failed: %d\n", ctx.result);
+		return ctx.result;
+	}
+
+	return 0;
+}
+
 static inline size_t
 icache_io_num_bytes(struct spdk_bdev_io *bdev_io)
 {
@@ -176,6 +290,179 @@ icache_queue_io(struct vbdev_icache *icache,
 		SPDK_ERRLOG("queue io failed rc=%d\n", rc);
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
+}
+
+/* Completion result sent back to original thread */
+struct icache_completion_msg {
+	struct spdk_bdev_io *bdev_io;
+	int status;
+};
+
+/* Called on original thread to complete IO */
+static void
+icache_complete_on_orig_thread(void *arg)
+{
+	struct icache_completion_msg *msg = arg;
+	struct spdk_bdev_io *bdev_io = msg->bdev_io;
+	int status = msg->status;
+
+	free(msg);
+
+	if (status) {
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+	} else {
+		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+	}
+}
+
+/* Called on worker thread when IO completes */
+static void
+icache_worker_io_done(void *cb_arg, int status)
+{
+	struct spdk_bdev_io *bdev_io = cb_arg;
+	struct icache_bdev_io *io_ctx = (struct icache_bdev_io *)bdev_io->driver_ctx;
+	struct icache_completion_msg *msg;
+
+	/* Send completion back to original thread */
+	msg = calloc(1, sizeof(*msg));
+	if (!msg) {
+		SPDK_ERRLOG("Failed to allocate completion msg\n");
+		/* Can't do much here, just log the error */
+		return;
+	}
+	msg->bdev_io = bdev_io;
+	msg->status = status;
+
+	spdk_thread_send_msg(io_ctx->orig_thread, icache_complete_on_orig_thread, msg);
+}
+
+/* Process WRITE IO on worker thread */
+static void
+icache_worker_process_write(void *arg)
+{
+	struct icache_worker_msg *msg = arg;
+	struct vbdev_icache *icache = msg->icache;
+	struct spdk_bdev_io *bdev_io = msg->bdev_io;
+	struct icache_bdev_io *io_ctx = (struct icache_bdev_io *)bdev_io->driver_ctx;
+	int rc;
+
+	io_ctx->orig_thread = msg->orig_thread;
+	free(msg);
+
+	if (!g_worker_initialized) {
+		SPDK_ERRLOG("Worker not initialized\n");
+		icache_worker_io_done(bdev_io, -EINVAL);
+		return;
+	}
+
+	rc = log_cache_ctx_write_async(icache->log_ctx,
+				       g_worker_cache_ch,
+				       g_worker_backend_ch,
+				       bdev_io->u.bdev.offset_blocks,
+				       bdev_io->u.bdev.iovs,
+				       bdev_io->u.bdev.iovcnt,
+				       bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen,
+				       icache_worker_io_done, bdev_io);
+	if (rc != 0) {
+		SPDK_ERRLOG("Worker write submit failed rc=%d\n", rc);
+		icache_worker_io_done(bdev_io, rc);
+	}
+}
+
+/* Forward WRITE IO to worker thread */
+static int
+icache_forward_to_worker(struct vbdev_icache *icache, struct spdk_bdev_io *bdev_io)
+{
+	struct icache_worker_msg *msg;
+
+	if (!g_log_worker_thread || !g_worker_initialized) {
+		return -EAGAIN;  /* Fall back to direct processing */
+	}
+
+	/* Debug: verify iovs are valid before forwarding */
+	if (!bdev_io->u.bdev.iovs || bdev_io->u.bdev.iovcnt <= 0) {
+		SPDK_ERRLOG("Invalid iovs before forward: iovs=%p iovcnt=%d\n",
+			    bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt);
+		return -EAGAIN;
+	}
+	if (!bdev_io->u.bdev.iovs[0].iov_base) {
+		SPDK_ERRLOG("NULL iov_base before forward\n");
+		return -EAGAIN;
+	}
+
+	msg = calloc(1, sizeof(*msg));
+	if (!msg) {
+		return -ENOMEM;
+	}
+
+	msg->icache = icache;
+	msg->bdev_io = bdev_io;
+	msg->orig_thread = spdk_get_thread();
+
+	spdk_thread_send_msg(g_log_worker_thread, icache_worker_process_write, msg);
+	return 0;
+}
+
+/* Process READ IO on worker thread */
+static void
+icache_worker_process_read(void *arg)
+{
+	struct icache_worker_msg *msg = arg;
+	struct vbdev_icache *icache = msg->icache;
+	struct spdk_bdev_io *bdev_io = msg->bdev_io;
+	struct icache_bdev_io *io_ctx = (struct icache_bdev_io *)bdev_io->driver_ctx;
+	int rc;
+
+	io_ctx->orig_thread = msg->orig_thread;
+	free(msg);
+
+	if (!g_worker_initialized) {
+		SPDK_ERRLOG("Worker not initialized\n");
+		icache_worker_io_done(bdev_io, -EINVAL);
+		return;
+	}
+
+	rc = log_cache_ctx_read_async(icache->log_ctx,
+				      g_worker_cache_ch,
+				      g_worker_backend_ch,
+				      bdev_io->u.bdev.offset_blocks,
+				      bdev_io->u.bdev.iovs,
+				      bdev_io->u.bdev.iovcnt,
+				      bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen,
+				      icache_worker_io_done, bdev_io);
+	if (rc != 0) {
+		SPDK_ERRLOG("Worker read submit failed rc=%d\n", rc);
+		icache_worker_io_done(bdev_io, rc);
+	}
+}
+
+/* Forward READ IO to worker thread */
+static int
+icache_forward_read_to_worker(struct vbdev_icache *icache, struct spdk_bdev_io *bdev_io)
+{
+	struct icache_worker_msg *msg;
+
+	if (!g_log_worker_thread || !g_worker_initialized) {
+		return -EAGAIN;  /* Fall back to direct processing */
+	}
+
+	if (!bdev_io->u.bdev.iovs || bdev_io->u.bdev.iovcnt <= 0) {
+		SPDK_ERRLOG("Invalid iovs before forward read: iovs=%p iovcnt=%d\n",
+			    bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt);
+		return -EAGAIN;
+	}
+
+	msg = calloc(1, sizeof(*msg));
+	if (!msg) {
+		return -ENOMEM;
+	}
+
+	msg->icache = icache;
+	msg->bdev_io = bdev_io;
+	msg->orig_thread = spdk_get_thread();
+
+	spdk_thread_send_msg(g_log_worker_thread, icache_worker_process_read, msg);
+	return 0;
 }
 
 static void
@@ -221,15 +508,28 @@ icache_read_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io,
 	io_ctx->ic_ch = ic_ch;
 	io_ctx->icache = icache;
 
-	rc = log_cache_ctx_read_async(icache->log_ctx, ic_ch->cache_ch, ic_ch->backend_ch,
-				      bdev_io->u.bdev.offset_blocks,
-				      bdev_io->u.bdev.iovs,
-				      bdev_io->u.bdev.iovcnt,
-				      icache_io_num_bytes(bdev_io),
-				      icache_host_io_done, bdev_io);
+	/* Forward READ to dedicated worker thread */
+	rc = icache_forward_read_to_worker(icache, bdev_io);
+	if (rc == 0) {
+		return;  /* Successfully forwarded */
+	}
+
+	/* Fallback: process on host thread if worker not available */
+	if (rc == -EAGAIN) {
+		rc = log_cache_ctx_read_async(icache->log_ctx, ic_ch->cache_ch, ic_ch->backend_ch,
+					      bdev_io->u.bdev.offset_blocks,
+					      bdev_io->u.bdev.iovs,
+					      bdev_io->u.bdev.iovcnt,
+					      icache_io_num_bytes(bdev_io),
+					      icache_host_io_done, bdev_io);
+		if (rc == 0) {
+			return;
+		}
+	}
+
 	if (rc == -ENOMEM) {
 		icache_queue_io(icache, ic_ch, bdev_io, ch);
-	} else if (rc) {
+	} else {
 		SPDK_ERRLOG("cache read submit failed rc=%d\n", rc);
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 	}
@@ -261,13 +561,21 @@ vbdev_icache_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bde
 				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
 		return;
 	case SPDK_BDEV_IO_TYPE_WRITE:
-		rc = log_cache_ctx_write_async(icache->log_ctx, ic_ch->cache_ch, ic_ch->backend_ch,
-					       bdev_io->u.bdev.offset_blocks,
-					       bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt,
-					       icache_io_num_bytes(bdev_io),
-					       icache_host_io_done, bdev_io);
+		/* Forward WRITE to dedicated worker thread */
+		rc = icache_forward_to_worker(icache, bdev_io);
 		if (rc == 0) {
-			return;
+			return;  /* Successfully forwarded */
+		}
+		/* Fall back to direct processing if worker not available */
+		if (rc == -EAGAIN) {
+			rc = log_cache_ctx_write_async(icache->log_ctx, ic_ch->cache_ch, ic_ch->backend_ch,
+						       bdev_io->u.bdev.offset_blocks,
+						       bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt,
+						       icache_io_num_bytes(bdev_io),
+						       icache_host_io_done, bdev_io);
+			if (rc == 0) {
+				return;
+			}
 		}
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
@@ -595,6 +903,13 @@ vbdev_icache_create(const char *name, const char *cache_bdev_name,
 		SPDK_ERRLOG("claim cache failed rc=%d\n", rc);
 		spdk_bdev_module_release_bdev(icache->backend_bdev);
 		goto err_alloc;
+	}
+
+	/* Create dedicated worker thread for log_wrapper (if not already created) */
+	rc = icache_create_worker_thread(icache->cache_desc, icache->backend_desc, icache->log_ctx);
+	if (rc) {
+		SPDK_WARNLOG("Failed to create worker thread, falling back to direct IO path\n");
+		/* Continue without worker thread - will use direct path */
 	}
 
 	spdk_io_device_register(icache, icache_ch_create_cb, icache_ch_destroy_cb,

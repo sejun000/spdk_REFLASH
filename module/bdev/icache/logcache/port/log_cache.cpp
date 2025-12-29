@@ -639,6 +639,13 @@ bool LogCache::is_cache_filled() {
     const std::size_t low_water =
         static_cast<std::size_t>(std::ceil(total_segments *
                                            cfg_.free_ratio_low));
+
+    // In async mode, also consider reserve threshold
+    constexpr size_t ASYNC_RESERVE_SEGMENTS = 3;
+    if (async_mode_ && free_pool.size() <= ASYNC_RESERVE_SEGMENTS + 1) {
+        return true;
+    }
+
     return free_pool.size() < low_water;
 }
 
@@ -909,6 +916,13 @@ bool LogCache::need_gc_or_evict() const
 {
     const std::size_t low_water =
         static_cast<std::size_t>(std::ceil(total_segments * cfg_.free_ratio_low));
+
+    // In async mode, also trigger GC/Evict when approaching reserve threshold
+    constexpr size_t ASYNC_RESERVE_SEGMENTS = 3;
+    if (async_mode_ && free_pool.size() <= ASYNC_RESERVE_SEGMENTS + 1) {
+        return true;
+    }
+
     return free_pool.size() < low_water;
 }
 
