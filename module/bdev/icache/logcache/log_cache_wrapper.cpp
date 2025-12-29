@@ -26,8 +26,6 @@ extern "C" {
 #include "spdk/log.h"
 #include "spdk/thread.h"
 #include "spdk/nvme_spec.h"
-
-extern struct spdk_log_flag SPDK_LOG_icache;
 }
 
 #include "port/cache_device.h"
@@ -71,8 +69,6 @@ public:
 		}
 		allocated_count_ = 0;
 		initialized_ = true;
-		SPDK_DEBUGLOG(icache, "DMA buffer pool initialized: %zu MB (%zu x 256KB chunks), base=%p\n",
-			       POOL_SIZE / (1024 * 1024), NUM_CHUNKS, pool_base_);
 		return true;
 	}
 
@@ -416,11 +412,8 @@ public:
 			// Fallback: force ZNS mode with hardcoded zone size
 			m_cache_zoned = true;
 			m_cache_zone_blocks = 0x80000;  // 524288 blocks = 2GB zone size
-			SPDK_DEBUGLOG(icache, "ZNS not detected, forcing ZNS mode\n");
 		}
 
-		SPDK_DEBUGLOG(icache, "SpdkCacheDevice init: cache_bdev=%s, is_zoned=%d, zone_blocks=%lu\n",
-			       spdk_bdev_get_name(m_cache_bdev), m_cache_zoned, m_cache_zone_blocks);
 	}
 
 	void set_channels(struct spdk_io_channel *cache_ch, struct spdk_io_channel *backend_ch)
@@ -621,7 +614,6 @@ public:
 	int write_cache_async(uint64_t offset, const void *buf, size_t len,
 			      cache_device_io_cb cb, void *cb_arg) override
 	{
-		SPDK_DEBUGLOG(icache,  "write_cache_async: offset=%lu, len=%zu, buf=%p\n", offset, len, buf);
 
 		if (len == 0) {
 			if (cb) cb(cb_arg, 0);
@@ -631,12 +623,9 @@ public:
 		// Get zone ID for this write
 		uint64_t zone_id = get_zone_id(offset);
 		ZoneQueue &zq = zone_queues_[zone_id];
-		SPDK_DEBUGLOG(icache,  "write_cache_async: zone_id=%lu, zone_opened=%d, open_in_progress=%d, pending=%zu\n",
-			       zone_id, zq.zone_opened, zq.open_in_progress, zq.pending.size());
 
 		// Check if zone needs to be opened with ZRWA first
 		if (zq.needs_zone_open()) {
-			SPDK_DEBUGLOG(icache,  "write_cache_async: zone needs open, queuing and triggering open\n");
 			// Queue this write first
 			ZoneQueueEntry entry;
 			entry.offset = offset;
@@ -661,7 +650,6 @@ public:
 		// Non-aligned: can only submit if offset == WP
 		// pending이 있으면 순서 보장을 위해 queue에 넣음
 		if (!zq.pending.empty() || !zq.can_submit(offset, len)) {
-			SPDK_DEBUGLOG(icache,  "write_cache_async: queuing (pending=%zu, WP=%lu)\n", zq.pending.size(), zq.write_pointer);
 			ZoneQueueEntry entry;
 			entry.offset = offset;
 			entry.buf = buf;
@@ -675,7 +663,6 @@ public:
 			return 0;  // Queued successfully
 		}
 
-		SPDK_DEBUGLOG(icache,  "write_cache_async: submitting directly\n");
 		// Can submit, add to inflight and send
 		zq.add_inflight(offset, len);
 		return submit_zone_io_direct(zone_id, offset, buf, len, true, cb, cb_arg);
@@ -686,8 +673,6 @@ public:
 	int writev_cache_async(uint64_t offset, struct iovec *iovs, int iovcnt, size_t total_len,
 			       cache_device_io_cb cb, void *cb_arg)
 	{
-		SPDK_DEBUGLOG(icache,  "writev_cache_async: offset=%lu, iovcnt=%d, total_len=%zu\n",
-			       offset, iovcnt, total_len);
 
 		if (!m_cache_ch || total_len == 0) {
 			if (cb) cb(cb_arg, 0);
@@ -696,12 +681,9 @@ public:
 
 		uint64_t zone_id = get_zone_id(offset);
 		ZoneQueue &zq = zone_queues_[zone_id];
-		SPDK_DEBUGLOG(icache,  "writev_cache_async: zone_id=%lu, zone_opened=%d, open_in_progress=%d, pending=%zu\n",
-			       zone_id, zq.zone_opened, zq.open_in_progress, zq.pending.size());
 
 		// Check if zone needs to be opened with ZRWA first
 		if (zq.needs_zone_open()) {
-			SPDK_DEBUGLOG(icache,  "writev_cache_async: zone needs open, queuing and triggering open\n");
 			// Queue this write first
 			ZoneQueueEntry entry;
 			entry.offset = offset;
@@ -723,7 +705,6 @@ public:
 
 		// pending이 있으면 순서 보장을 위해 queue에 넣음 (ZRWA에서도 WP 관리를 위해)
 		if (!zq.pending.empty() || !zq.can_submit(offset, total_len)) {
-			SPDK_DEBUGLOG(icache,  "writev_cache_async: queuing (pending=%zu, WP=%lu)\n", zq.pending.size(), zq.write_pointer);
 			// Queue it for later - store iovec info
 			ZoneQueueEntry entry;
 			entry.offset = offset;
@@ -738,7 +719,6 @@ public:
 			return 0;
 		}
 
-		SPDK_DEBUGLOG(icache,  "writev_cache_async: submitting directly\n");
 		return submit_writev_direct(zone_id, offset, iovs, iovcnt, total_len, cb, cb_arg);
 	}
 
@@ -969,7 +949,6 @@ private:
 	// Static callback for zone-aware async IO completion
 	static void zone_async_io_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	{
-		SPDK_DEBUGLOG(icache,  "zone_async_io_completion: success=%d, cb_arg=%p\n", success, cb_arg);
 
 		auto *ctx = static_cast<ZoneAsyncIoCtx *>(cb_arg);
 
@@ -993,7 +972,6 @@ private:
 		cache_device_io_cb user_cb = ctx->user_cb;
 		void *user_cb_arg = ctx->user_cb_arg;
 
-		SPDK_DEBUGLOG(icache,  "zone_async_io_completion: zone_id=%lu, io_offset=%lu\n", zone_id, io_offset);
 
 		spdk_bdev_free_io(bdev_io);
 
@@ -1017,8 +995,6 @@ private:
 		bool wp_advanced = device->zone_queues_[zone_id].complete_io(io_offset);
 		uint64_t new_wp = device->zone_queues_[zone_id].write_pointer;
 		if (wp_advanced) {
-			SPDK_DEBUGLOG(icache, "Zone %lu WP: %lu -> %lu (advanced by %lu bytes)\n",
-				       zone_id, old_wp, new_wp, new_wp - old_wp);
 		}
 		device->process_zone_pending(zone_id);
 
@@ -1032,21 +1008,15 @@ private:
 	void process_zone_pending(uint64_t zone_id)
 	{
 		ZoneQueue &zq = zone_queues_[zone_id];
-		SPDK_DEBUGLOG(icache,  "process_zone_pending: zone_id=%lu, pending=%zu, zone_opened=%d, WP=%lu\n",
-			       zone_id, zq.pending.size(), zq.zone_opened, zq.write_pointer);
 
 		while (!zq.pending.empty()) {
 			const ZoneQueueEntry &entry = zq.pending.front();
 
 			// Check if we can submit based on WP and alignment
 			if (!zq.can_submit(entry.offset, entry.len)) {
-				SPDK_DEBUGLOG(icache,  "process_zone_pending: can't submit offset=%lu, len=%zu (opened=%d, flush_prog=%d, WP=%lu, flushed=%lu)\n",
-					       entry.offset, entry.len, zq.zone_opened, zq.flush_in_progress, zq.write_pointer, zq.flushed_wp);
 				break;
 			}
 
-			SPDK_DEBUGLOG(icache,  "process_zone_pending: submitting entry offset=%lu, len=%zu\n",
-				       entry.offset, entry.len);
 
 			// Can submit, pop and send
 			ZoneQueueEntry submit_entry = zq.pending.front();
@@ -1066,7 +1036,6 @@ private:
 							   submit_entry.cb, submit_entry.cb_arg);
 			}
 			if (rc != 0) {
-				SPDK_DEBUGLOG(icache,  "process_zone_pending: submit failed rc=%d\n", rc);
 				// Submit failed, call user callback with error
 				if (submit_entry.cb) {
 					submit_entry.cb(submit_entry.cb_arg, rc);
@@ -1100,8 +1069,6 @@ private:
 		if (success) {
 			// Update flushed WP (device WP now advanced)
 			zq.flushed_wp = flush_wp;
-			SPDK_DEBUGLOG(icache, "ZRWA flush success: zone=%lu flushed_wp=%lu\n",
-				       zone_id, flush_wp);
 		} else {
 			SPDK_ERRLOG("ZRWA flush failed: zone=%lu\n", zone_id);
 			assert(false && "ZRWA flush failed");
@@ -1159,8 +1126,6 @@ public:
 		// Update flush_wp to match aligned end (for flushed_wp update on completion)
 		flush_wp = (end_lba + 1) * m_block_size;
 
-		SPDK_DEBUGLOG(icache, "ZRWA Flush: zone=%lu, device_wp=%lu, end_lba=%lu, aligned_count=%lu\n",
-			       zone_id, device_wp_blocks, end_lba, aligned_count);
 
 		// Build NVMe Zone Management Send command (Flush Explicit = 0x11)
 		struct spdk_nvme_cmd cmd = {};
@@ -1209,7 +1174,6 @@ public:
 
 	static void zone_open_zrwa_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	{
-		SPDK_DEBUGLOG(icache,  "zone_open_zrwa_completion: success=%d, cb_arg=%p\n", success, cb_arg);
 
 		auto *ctx = static_cast<ZoneOpenCtx *>(cb_arg);
 		SpdkCacheDevice *device = ctx->device;
@@ -1217,7 +1181,6 @@ public:
 		void *user_cb_arg = ctx->user_cb_arg;
 		uint64_t zone_id = ctx->zone_id;
 
-		SPDK_DEBUGLOG(icache,  "zone_open_zrwa_completion: zone_id=%lu\n", zone_id);
 
 		spdk_bdev_free_io(bdev_io);
 
@@ -1232,7 +1195,6 @@ public:
 			uint64_t zone_start_offset = zone_id * device->m_cache_zone_blocks * device->m_block_size;
 			zq.write_pointer = zone_start_offset;
 			zq.flushed_wp = zone_start_offset;
-			SPDK_DEBUGLOG(icache,  "Zone %lu opened with ZRWA successfully, WP initialized to %lu\n", zone_id, zone_start_offset);
 		} else {
 			SPDK_ERRLOG("Failed to open zone %lu with ZRWA\n", zone_id);
 			assert(false && "Zone open with ZRWA failed");
@@ -1247,7 +1209,6 @@ public:
 
 		// Process pending writes now that zone is open
 		if (success) {
-			SPDK_DEBUGLOG(icache,  "zone_open_zrwa_completion: processing pending queue for zone %lu\n", zone_id);
 			device->process_zone_pending(zone_id);
 		}
 	}
@@ -1257,12 +1218,9 @@ public:
 	// zone_slba: Starting LBA of the zone (in blocks)
 	int open_zone_zrwa_async(uint64_t zone_slba, cache_device_io_cb cb, void *cb_arg)
 	{
-		SPDK_DEBUGLOG(icache,  "open_zone_zrwa_async called: zone_slba=%lu, m_cache_zoned=%d\n",
-			       zone_slba, m_cache_zoned);
 
 		if (!m_cache_zoned) {
 			// Not a ZNS device, no zone open needed - mark zone as opened and process pending
-			SPDK_DEBUGLOG(icache,  "Not a ZNS device, marking zone as opened\n");
 			uint64_t zone_id = zone_slba / (m_cache_zone_blocks > 0 ? m_cache_zone_blocks : 1);
 			ZoneQueue &zq = zone_queues_[zone_id];
 			zq.zone_opened = true;
@@ -1279,8 +1237,6 @@ public:
 		}
 
 		uint64_t zone_id = zone_slba / m_cache_zone_blocks;
-		SPDK_DEBUGLOG(icache,  "Opening zone_id=%lu (zone_slba=%lu, zone_blocks=%lu)\n",
-			       zone_id, zone_slba, m_cache_zone_blocks);
 
 		auto *ctx = new (std::nothrow) ZoneOpenCtx{this, zone_id, cb, cb_arg};
 		if (!ctx) {
@@ -1299,15 +1255,12 @@ public:
 		int rc = spdk_bdev_nvme_io_passthru(m_cache_desc, m_cache_ch,
 						    &cmd, nullptr, 0,
 						    zone_open_zrwa_completion, ctx);
-		SPDK_DEBUGLOG(icache, "Zone Open with ZRWA (passthru) returned rc=%d\n", rc);
 
 		if (rc == -ENOTSUP || rc == -EOPNOTSUPP) {
 			// Passthru not supported, fallback to zone_management (no ZRWA)
-			SPDK_DEBUGLOG(icache, "Passthru not supported, falling back to zone_management\n");
 			rc = spdk_bdev_zone_management(m_cache_desc, m_cache_ch,
 						       zone_slba, SPDK_BDEV_ZONE_OPEN,
 						       zone_open_zrwa_completion, ctx);
-			SPDK_DEBUGLOG(icache, "Zone Open (zone_management) returned rc=%d\n", rc);
 		}
 
 		if (rc != 0) {
@@ -1556,6 +1509,15 @@ public:
 	{
 		std::string waf_path = waf_log_path;
 
+		// Open WAF log file
+		if (!waf_path.empty()) {
+			waf_fp_ = fopen(waf_path.c_str(), "w");
+			if (waf_fp_) {
+				fprintf(waf_fp_, "# host_write_bytes gc_write_bytes waf\n");
+				fflush(waf_fp_);
+			}
+		}
+
 		// Hardcoded ZNS values for the test device
 		static constexpr uint64_t ZNS_ZONE_SIZE_BLOCKS = 0x80000;      // 524288 blocks
 		static constexpr uint64_t ZNS_ZONE_CAPACITY_BLOCKS = 0x43500;  // 275712 blocks
@@ -1567,8 +1529,6 @@ public:
 		Config cfg;
 		cfg.segment_bytes = zns_zone_capacity;
 		cfg.zone_size_bytes = zns_zone_size;
-		SPDK_DEBUGLOG(icache, "icache: ZNS zone_size=%lu, zone_capacity=%lu bytes\n",
-			       zns_zone_size, zns_zone_capacity);
 
 		cache_ = std::make_unique<LogCache>(
 			cold_capacity,
@@ -1658,7 +1618,39 @@ public:
 	void set_flush_pending(bool pending) { flush_pending_ = pending; }
 	bool flush_pending() const { return flush_pending_; }
 
+	// WAF statistics
+	void add_host_write_bytes(uint64_t bytes) {
+		host_write_bytes_ += bytes;
+		maybe_log_waf();
+	}
+
+	void add_gc_write_bytes(uint64_t bytes) {
+		gc_write_bytes_ += bytes;
+	}
+
+	double get_waf() const {
+		if (host_write_bytes_ == 0) return 1.0;
+		return static_cast<double>(host_write_bytes_ + gc_write_bytes_) / host_write_bytes_;
+	}
+
+	uint64_t host_write_bytes() const { return host_write_bytes_; }
+	uint64_t gc_write_bytes() const { return gc_write_bytes_; }
+
 private:
+	static constexpr uint64_t WAF_LOG_INTERVAL = 10ULL * 1024 * 1024 * 1024;  // 10GB
+
+	void maybe_log_waf() {
+		if (host_write_bytes_ >= next_waf_log_threshold_) {
+			next_waf_log_threshold_ += WAF_LOG_INTERVAL;
+			if (waf_fp_) {
+				// Format: host_write_bytes gc_write_bytes waf
+				fprintf(waf_fp_, "%lu %lu %.4f\n",
+					host_write_bytes_, gc_write_bytes_, get_waf());
+				fflush(waf_fp_);
+			}
+		}
+	}
+
 	int block_size_;
 	icache::SpdkCacheDevice *device_;
 	std::unique_ptr<LogCache> cache_;
@@ -1671,6 +1663,12 @@ private:
 	std::vector<BufferedBlock> write_buffer_;
 	bool buffer_timer_active_ = false;
 	bool flush_pending_ = false;  // Set when flush needs retry after GC/Evict
+
+	// WAF statistics
+	FILE *waf_fp_ = nullptr;
+	uint64_t host_write_bytes_ = 0;
+	uint64_t gc_write_bytes_ = 0;
+	uint64_t next_waf_log_threshold_ = WAF_LOG_INTERVAL;
 };
 
 //==============================================================================
@@ -1711,8 +1709,6 @@ static void zone_write_done(void *cb_arg, int status)
 	auto *zctx = static_cast<ZoneWriteCtx*>(cb_arg);
 	auto *flush_ctx = zctx->parent;
 
-	SPDK_DEBUGLOG(icache, "ZONE_WRITE_DONE: status=%d iovcnt=%d outstanding=%d\n",
-		      status, zctx->iovcnt, flush_ctx->outstanding_writes.load());
 
 	// Free this zone's iovec
 	if (zctx->iovs) {
@@ -1731,7 +1727,6 @@ static void zone_write_done(void *cb_arg, int status)
 
 	// If all writes done, complete the flush
 	if (remaining == 0) {
-		SPDK_DEBUGLOG(icache, "ZONE_WRITE_DONE: all writes done, calling flush_done\n");
 		write_buffer_flush_done(flush_ctx, flush_ctx->first_error.load());
 	}
 }
@@ -1747,7 +1742,6 @@ void LogCacheAsync::flush_write_buffer()
 	uint32_t block_size = block_size_;
 	size_t total_blocks = write_buffer_.size();
 
-	SPDK_DEBUGLOG(icache, "FLUSH_BUFFER: starting flush of %zu blocks\n", total_blocks);
 
 	// Allocate flush context
 	auto *flush_ctx = new (std::nothrow) WriteBufferFlushCtx();
@@ -1765,8 +1759,6 @@ void LogCacheAsync::flush_write_buffer()
 		if (!cache_->append_block_metadata(0, static_cast<long>(blk.key),
 						   static_cast<int>(block_size), &cache_offset)) {
 			// No free segments - need GC/Evict
-			SPDK_DEBUGLOG(icache, "append_block_metadata needs GC/Evict for key %lu (got %zu blocks)\n",
-				       blk.key, i);
 			delete flush_ctx;
 			flush_pending_ = true;
 			return;
@@ -1784,6 +1776,9 @@ void LogCacheAsync::flush_write_buffer()
 			flush_ctx->io_block_counts[blk.io]++;
 		}
 	}
+
+	// Track host write bytes for WAF calculation
+	add_host_write_bytes(total_blocks * block_size);
 
 	// Get zone info from device
 	uint64_t zone_size = device_->zone_size_bytes();
@@ -1832,8 +1827,6 @@ void LogCacheAsync::flush_write_buffer()
 		i += group.count;
 	}
 
-	SPDK_DEBUGLOG(icache, "flush_write_buffer: %zu blocks split into %zu groups\n",
-		       total_blocks, groups.size());
 
 	// Set outstanding writes count
 	flush_ctx->outstanding_writes = static_cast<int>(groups.size());
@@ -1887,8 +1880,6 @@ static void write_buffer_flush_done(void *cb_arg, int status)
 {
 	auto *flush_ctx = static_cast<WriteBufferFlushCtx*>(cb_arg);
 
-	SPDK_DEBUGLOG(icache, "FLUSH_DONE: status=%d io_count=%zu\n",
-		      status, flush_ctx->io_block_counts.size());
 
 	// Update flushed block counts and complete IOs that are fully flushed
 	for (auto &pair : flush_ctx->io_block_counts) {
@@ -1903,8 +1894,6 @@ static void write_buffer_flush_done(void *cb_arg, int status)
 		// Atomically add flushed blocks
 		size_t new_flushed = io->flushed_blocks.fetch_add(blocks_in_this_flush) + blocks_in_this_flush;
 
-		SPDK_DEBUGLOG(icache, "FLUSH_DONE: io=%p flushed=%zu total=%lu\n",
-			      io, new_flushed, io->total_blocks);
 
 		// Only complete when all blocks for this IO have been flushed
 		if (new_flushed >= io->total_blocks) {
@@ -1947,8 +1936,6 @@ static int write_buffer_timeout_poller(void *arg)
 //==============================================================================
 static void cache_io_complete(CacheIo *io, int status)
 {
-	SPDK_DEBUGLOG(icache, "IO_COMPLETE: io=%p lba=%lu is_write=%d status=%d\n",
-		      io, io->lba, io->is_write, status);
 	auto cb = io->cb_fn;
 	void *arg = io->cb_arg;
 	delete io;
@@ -2005,11 +1992,8 @@ static void host_read_block_done(void *cb_arg, int status);
 
 static void host_read_next_block(CacheIo *io)
 {
-	SPDK_DEBUGLOG(icache, "READ_NEXT: io=%p lba=%lu blk=%lu/%lu status=%d\n",
-		      io, io->lba, io->current_block_idx, io->total_blocks, io->last_status);
 
 	if (io->last_status != 0) {
-		SPDK_DEBUGLOG(icache, "READ_NEXT: completing with error %d\n", io->last_status);
 		io->state = CacheIoState::HOST_READ_DONE;
 		cache_io_complete(io, io->last_status);
 		return;
@@ -2017,7 +2001,6 @@ static void host_read_next_block(CacheIo *io)
 
 	if (io->current_block_idx >= io->total_blocks) {
 		// All blocks read - no copy needed, data is already in iovs
-		SPDK_DEBUGLOG(icache, "READ_NEXT: all blocks done, completing\n");
 		io->state = CacheIoState::HOST_READ_DONE;
 		cache_io_complete(io, 0);
 		return;
@@ -2053,7 +2036,6 @@ static void host_read_next_block(CacheIo *io)
 			cache_io_complete(io, -EIO);
 			return;
 		}
-		SPDK_DEBUGLOG(icache, "READ_NEXT: reading from cache offset=%lu\n", cache_offset);
 		io->state = CacheIoState::HOST_READ_CACHE_READ;
 		int rc = cache->device()->read_cache_async(cache_offset, dest, block_size,
 							   host_read_block_done, read_ctx);
@@ -2065,7 +2047,6 @@ static void host_read_next_block(CacheIo *io)
 	} else {
 		// Read from backend
 		uint64_t backend_offset = key * block_size;
-		SPDK_DEBUGLOG(icache, "READ_NEXT: reading from backend offset=%lu\n", backend_offset);
 		io->state = CacheIoState::HOST_READ_BACKEND_READ;
 		int rc = cache->device()->read_backend_async(backend_offset, dest, block_size,
 							     host_read_block_done, read_ctx);
@@ -2084,7 +2065,6 @@ static void host_read_block_done(void *cb_arg, int status)
 	uint64_t blk_idx = ctx->block_idx;
 	delete ctx;
 
-	SPDK_DEBUGLOG(icache, "READ_DONE: io=%p blk=%lu status=%d\n", io, blk_idx, status);
 
 	if (status != 0) {
 		SPDK_ERRLOG("READ_DONE: error status=%d for blk=%lu\n", status, blk_idx);
@@ -2125,8 +2105,6 @@ static void host_write_block_done(void *cb_arg, int status)
 {
 	CacheIo *io = static_cast<CacheIo *>(cb_arg);
 
-	SPDK_DEBUGLOG(icache, "WRITE_BLK_DONE: io=%p blk=%lu status=%d\n",
-		      io, io->current_block_idx, status);
 
 	if (status != 0 && io->last_status == 0) {
 		SPDK_ERRLOG("WRITE_BLK_DONE: error status=%d\n", status);
@@ -2140,7 +2118,6 @@ static void host_write_block_done(void *cb_arg, int status)
 	// Check if we need GC/Evict after this write
 	if (cache->need_gc_or_evict() && !cache->gc_in_progress() && !cache->evict_in_progress()) {
 		// Need to trigger GC/Evict
-		SPDK_DEBUGLOG(icache, "WRITE_BLK_DONE: triggering GC/Evict\n");
 		io->state = CacheIoState::HOST_WRITE_WAIT_GC_EVICT;
 		cache->pending_writes().push_back(io);
 
@@ -2158,8 +2135,6 @@ static void host_write_next_block(CacheIo *io)
 	log_cache_ctx *ctx = io->ctx;
 	LogCacheAsync *cache = ctx->cache.get();
 
-	SPDK_DEBUGLOG(icache, "WRITE_NEXT: io=%p lba=%lu blk=%lu/%lu status=%d\n",
-		      io, io->lba, io->current_block_idx, io->total_blocks, io->last_status);
 
 	if (io->last_status != 0) {
 		// If blocks have already been buffered, don't complete here
@@ -2167,12 +2142,9 @@ static void host_write_next_block(CacheIo *io)
 		if (io->current_block_idx > 0) {
 			// Update total_blocks to reflect only buffered blocks
 			// This ensures IO completes when flushed_blocks reaches this count
-			SPDK_DEBUGLOG(icache, "WRITE_NEXT: error with buffered blocks, adjusting total=%lu\n",
-				      io->current_block_idx);
 			io->total_blocks = io->current_block_idx;
 			return;
 		}
-		SPDK_DEBUGLOG(icache, "WRITE_NEXT: completing with error %d\n", io->last_status);
 		io->state = CacheIoState::HOST_WRITE_DONE;
 		cache_io_complete(io, io->last_status);
 		return;
@@ -2181,7 +2153,6 @@ static void host_write_next_block(CacheIo *io)
 	if (io->current_block_idx >= io->total_blocks) {
 		// All blocks buffered for this IO
 		// Don't complete here - completion will be called after flush_write_buffer completes
-		SPDK_DEBUGLOG(icache, "WRITE_NEXT: all blocks buffered, waiting for flush\n");
 		return;
 	}
 
@@ -2202,7 +2173,6 @@ static void host_write_next_block(CacheIo *io)
 		return;
 	}
 
-	SPDK_DEBUGLOG(icache, "WRITE_NEXT: adding blk key=%lu to buffer\n", key);
 	// Add to 16KB write buffer instead of writing directly
 	cache->buffer_add_block(io, io->current_block_idx, key, src);
 
@@ -2428,7 +2398,10 @@ static void gc_read_done(void *cb_arg, int status)
 			int rc = io->ctx->device->writev_cache_async(first_dst_offset, iovs, BLOCKS_PER_16K,
 								     BLOCKS_PER_16K * block_size,
 								     gc_write_done, write_ctx);
-			if (rc != 0) {
+			if (rc == 0) {
+				// Track GC write bytes for WAF calculation
+				io->ctx->cache->add_gc_write_bytes(BLOCKS_PER_16K * block_size);
+			} else {
 				free(iovs);
 				delete write_ctx;
 				io->last_status = rc;
@@ -2487,7 +2460,10 @@ static void gc_submit_next_leftover(GcIo *io)
 	// 4KB sequential write at WP
 	int rc = io->ctx->device->write_cache_async(blk.dst_offset, src, block_size,
 	                                            gc_write_done, write_ctx);
-	if (rc != 0) {
+	if (rc == 0) {
+		// Track GC write bytes for WAF calculation
+		io->ctx->cache->add_gc_write_bytes(block_size);
+	} else {
 		delete write_ctx;
 		io->last_status = rc;
 		io->current_leftover_idx++;
@@ -2761,27 +2737,21 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 
 	if (cache->gc_in_progress() || cache->evict_in_progress()) {
 		// Already running
-		SPDK_DEBUGLOG(bdev_icache, "start_gc_or_evict: GC/Evict already running\n");
 		if (on_complete) on_complete(0);
 		return;
 	}
 
 	if (!cache->cache()->need_gc_or_evict()) {
 		// No need to GC/Evict
-		SPDK_DEBUGLOG(bdev_icache, "start_gc_or_evict: no need for GC/Evict\n");
 		if (on_complete) on_complete(0);
 		return;
 	}
 
-	SPDK_DEBUGLOG(icache, "start_gc_or_evict: need GC/Evict, trying...\n");
 
 	// Try GC first (compaction)
 	LogCache::GcPrepareResult gc_result;
 	bool gc_prepared = cache->cache()->prepare_gc(gc_result);
-	SPDK_DEBUGLOG(icache, "prepare_gc returned %d\n", gc_prepared);
 	if (gc_prepared) {
-		SPDK_DEBUGLOG(icache, "prepare_gc succeeded: do_evict_only=%d, blocks_to_copy=%zu\n",
-			       gc_result.do_evict_only, gc_result.blocks_to_copy.size());
 		if (!gc_result.do_evict_only && !gc_result.blocks_to_copy.empty()) {
 			// Do GC (compaction)
 			cache->set_gc_in_progress(true);
@@ -2809,13 +2779,9 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 	// Fall back to evict
 	LogCache::EvictPrepareResult evict_result;
 	bool evict_prepared = cache->cache()->prepare_evict(evict_result);
-	SPDK_DEBUGLOG(icache, "prepare_evict returned %d\n", evict_prepared);
 	if (evict_prepared) {
-		SPDK_DEBUGLOG(icache, "prepare_evict succeeded: chunks=%zu, victim_seg=%p\n",
-			       evict_result.chunks.size(), (void*)evict_result.victim_seg);
 		if (evict_result.chunks.empty() && evict_result.victim_seg) {
 			// No valid blocks, just reset segment asynchronously
-			SPDK_DEBUGLOG(icache, "Evict: no valid blocks, just reset segment\n");
 			auto *reset_ctx = new (std::nothrow) SimpleResetCtx();
 			if (!reset_ctx) {
 				if (on_complete) on_complete(-ENOMEM);
@@ -2826,7 +2792,6 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 			return;
 		}
 
-		SPDK_DEBUGLOG(icache, "Starting evict with %zu chunks\n", evict_result.chunks.size());
 		cache->set_evict_in_progress(true);
 
 		auto *evict_io = new (std::nothrow) EvictIo();
@@ -3034,7 +2999,6 @@ log_cache_ctx_write_async(struct log_cache_ctx *ctx,
 	(void)cache_ch;
 	(void)backend_ch;
 
-	SPDK_DEBUGLOG(icache, "WRITE_ASYNC: lba=%lu len=%zu iovcnt=%d\n", lba, total_len, iovcnt);
 
 	if (!ctx || !iovs || iovcnt <= 0 || total_len == 0) {
 		SPDK_ERRLOG("WRITE_ASYNC: invalid params ctx=%p iovs=%p iovcnt=%d len=%zu\n",
@@ -3062,7 +3026,6 @@ log_cache_ctx_write_async(struct log_cache_ctx *ctx,
 	io->last_status = 0;
 	io->flushed_blocks.store(0);
 
-	SPDK_DEBUGLOG(icache, "WRITE_ASYNC: calling state_machine io=%p\n", io);
 	cache_io_state_machine(io);
 	return 0;
 }
@@ -3078,7 +3041,6 @@ log_cache_ctx_read_async(struct log_cache_ctx *ctx,
 	(void)cache_ch;
 	(void)backend_ch;
 
-	SPDK_DEBUGLOG(icache, "READ_ASYNC: lba=%lu len=%zu iovcnt=%d\n", lba, total_len, iovcnt);
 
 	if (!ctx || !iovs || iovcnt <= 0 || total_len == 0) {
 		SPDK_ERRLOG("READ_ASYNC: invalid params ctx=%p iovs=%p iovcnt=%d len=%zu\n",
@@ -3105,7 +3067,6 @@ log_cache_ctx_read_async(struct log_cache_ctx *ctx,
 	io->completed_blocks = 0;
 	io->last_status = 0;
 
-	SPDK_DEBUGLOG(icache, "READ_ASYNC: calling state_machine io=%p\n", io);
 	cache_io_state_machine(io);
 	return 0;
 }
