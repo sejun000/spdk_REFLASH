@@ -1653,6 +1653,11 @@ nvmf_tcp_poll_group_create(struct spdk_nvmf_transport *transport,
 	struct spdk_nvmf_tcp_poll_group *tgroup;
 	int rc;
 
+	/* Skip creating poll group on core 8 (reserved for icache log_worker) */
+	if (spdk_env_get_current_core() == 8) {
+		return NULL;
+	}
+
 	tgroup = calloc(1, sizeof(*tgroup));
 	if (!tgroup) {
 		return NULL;

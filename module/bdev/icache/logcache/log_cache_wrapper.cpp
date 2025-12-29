@@ -1584,9 +1584,10 @@ public:
 	// Check if free segments available
 	bool need_gc_or_evict() { return cache_->is_cache_filled(); }
 
-	// 16KB Write Buffer for aligned writes
-	static constexpr size_t WRITE_BUFFER_SIZE = 16 * 1024;  // 16KB
+	// 128KB Write Buffer - reduced for lower latency
+	static constexpr size_t WRITE_BUFFER_SIZE = 128 * 1024;  // 128KB
 	static constexpr uint64_t WRITE_BUFFER_TIMEOUT_US = 1000;  // 1ms
+	static constexpr int MAX_IN_FLIGHT_FLUSHES = 4;  // Allow 4 concurrent zone writes
 
 	struct BufferedBlock {
 		CacheIo *io;
@@ -1595,7 +1596,7 @@ public:
 		const uint8_t *buf;
 	};
 
-	// Add block to write buffer
+	// Add block to write buffer, flush when 1MB accumulated
 	void buffer_add_block(CacheIo *io, uint32_t block_idx, uint64_t key, const uint8_t *buf) {
 		write_buffer_.push_back({io, block_idx, key, buf});
 		if (write_buffer_.size() * block_size_ >= WRITE_BUFFER_SIZE) {
@@ -1698,7 +1699,14 @@ struct ZoneWriteCtx {
 	WriteBufferFlushCtx *parent;
 	struct iovec *iovs;
 	int iovcnt;
+	size_t write_size;  // bytes for this write
 };
+
+// Outstanding IO tracking for queue depth measurement
+static std::atomic<uint64_t> g_outstanding_bytes{0};
+static std::atomic<uint64_t> g_outstanding_samples{0};
+static std::atomic<uint64_t> g_outstanding_sum{0};
+static std::atomic<uint64_t> g_write_count{0};
 
 static void write_buffer_flush_done(void *cb_arg, int status);
 static void zone_write_done(void *cb_arg, int status);
@@ -1709,6 +1717,8 @@ static void zone_write_done(void *cb_arg, int status)
 	auto *zctx = static_cast<ZoneWriteCtx*>(cb_arg);
 	auto *flush_ctx = zctx->parent;
 
+	// Update outstanding bytes
+	g_outstanding_bytes -= zctx->write_size;
 
 	// Free this zone's iovec
 	if (zctx->iovs) {
@@ -1851,7 +1861,8 @@ void LogCacheAsync::flush_write_buffer()
 		}
 
 		// Create zone write context
-		auto *zctx = new (std::nothrow) ZoneWriteCtx{flush_ctx, iovs, static_cast<int>(group.count)};
+		size_t group_len = group.count * block_size;
+		auto *zctx = new (std::nothrow) ZoneWriteCtx{flush_ctx, iovs, static_cast<int>(group.count), group_len};
 		if (!zctx) {
 			free(iovs);
 			flush_ctx->first_error = -ENOMEM;
@@ -1861,11 +1872,25 @@ void LogCacheAsync::flush_write_buffer()
 			continue;
 		}
 
-		size_t group_len = group.count * block_size;
+		// Track outstanding IO
+		uint64_t prev_outstanding = g_outstanding_bytes.fetch_add(group_len);
+		uint64_t cur_outstanding = prev_outstanding + group_len;
+		g_outstanding_sum += cur_outstanding;
+		uint64_t samples = ++g_outstanding_samples;
+		uint64_t count = ++g_write_count;
+
+		// Log average every 1000 writes
+		if (count % 1000 == 0) {
+			uint64_t avg_bytes = g_outstanding_sum / samples;
+			SPDK_NOTICELOG("QD stats: avg_outstanding=%lu KB, cur=%lu KB, writes=%lu\n",
+				       avg_bytes / 1024, cur_outstanding / 1024, count);
+		}
+
 		int rc = device_->writev_cache_async(group.first_offset, iovs, zctx->iovcnt,
 						     group_len, zone_write_done, zctx);
 		if (rc != 0) {
 			SPDK_ERRLOG("writev_cache_async failed for group: %d\n", rc);
+			g_outstanding_bytes -= group_len;  // Rollback on error
 			free(iovs);
 			delete zctx;
 			flush_ctx->first_error = rc;

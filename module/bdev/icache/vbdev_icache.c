@@ -49,7 +49,7 @@ struct icache_bdev_io {
 };
 
 #define ICACHE_MAX_RW_BYTES	(2 * 1024 * 1024)
-#define ICACHE_WORKER_CORE	1  /* Dedicated core for log_wrapper */
+#define ICACHE_WORKER_CORE	8  /* Dedicated core for log_wrapper */
 
 /* Dedicated log_wrapper thread (single-threaded, no ublk_poll) */
 static struct spdk_thread *g_log_worker_thread = NULL;

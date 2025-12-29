@@ -120,7 +120,7 @@ start_spdk_tgt() {
     log "spdk_tgt is ready (RPC socket ${RPC_SOCKET})"
 
     # Set log level to WARNING (suppress NOTICE logs)
-    #sudo "$ROOT_DIR/scripts/rpc.py" -s "$RPC_SOCKET" log_set_print_level WARNING 2>/dev/null || true
+    sudo "$ROOT_DIR/scripts/rpc.py" -s "$RPC_SOCKET" log_set_print_level WARNING 2>/dev/null || true
 }
 
 create_tier() {
