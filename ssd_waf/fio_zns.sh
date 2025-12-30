@@ -34,5 +34,24 @@ sudo fio --name=zns_test \
     --offset=0 \
     --numjobs=2 \
     --iodepth=64 \
-    --zonemode=zbd 
-    #--max_open_zones=14
+    --size=4g \
+    --zonemode=zbd \
+    --max_open_zones=2 
+    #--runtime=10s \
+    #--time_based
+sudo fio --name=zns_test \
+    --filename="$DEVICE" \
+    --ioengine=libaio \
+    --direct=1 \
+    --bs=4k \
+    --size=4g \
+    --rw=randrw \
+    --rwmixread=50 \
+    --offset=0 \
+    --numjobs=8 \
+    --io_size=10g \
+    --iodepth=64 \
+    --zonemode=zbd \
+    --max_open_zones=2 \
+    --runtime=10s \
+    --time_based

@@ -43,9 +43,9 @@ namespace icache {
 //==============================================================================
 class DmaBufferPool {
 public:
-	static constexpr size_t CHUNK_SIZE = 256 * 1024;      // 256KB per chunk
+	static constexpr size_t CHUNK_SIZE = 1024 * 1024;     // 1MB per chunk (for 256 x 4KB evict)
 	static constexpr size_t POOL_SIZE = 2ULL * 1024 * 1024 * 1024;  // 2GB total
-	static constexpr size_t NUM_CHUNKS = POOL_SIZE / CHUNK_SIZE;    // 8192 chunks
+	static constexpr size_t NUM_CHUNKS = POOL_SIZE / CHUNK_SIZE;    // 2048 chunks
 
 	static DmaBufferPool& instance() {
 		static DmaBufferPool pool;
@@ -190,6 +190,8 @@ struct ZoneResetAsyncCtx {
 	void *user_cb_arg;
 	int last_status;
 	SpdkCacheDevice *device;  // For updating ZoneQueue state
+	uint64_t start_tsc;       // For measuring reset time
+	int zones_reset;          // Count of zones reset
 };
 
 // Zone Queue Entry - pending IO for a zone
@@ -358,12 +360,20 @@ zone_reset_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	// Move to next zone
 	ctx->current_zone += ctx->zone_size_blocks;
+	ctx->zones_reset++;
 
 	if (ctx->current_zone <= ctx->end_zone) {
 		// More zones to reset
 		zone_reset_next(ctx);
 	} else {
-		// All zones reset - clear ZoneQueue state
+		// All zones reset - log elapsed time
+		uint64_t elapsed_tsc = spdk_get_ticks() - ctx->start_tsc;
+		uint64_t elapsed_us = elapsed_tsc * 1000000 / spdk_get_ticks_hz();
+		SPDK_NOTICELOG("Zone reset complete: %d zones, %lu us (%.2f ms/zone)\n",
+			       ctx->zones_reset, elapsed_us,
+			       (double)elapsed_us / 1000.0 / ctx->zones_reset);
+
+		// Clear ZoneQueue state
 		if (ctx->device && ctx->last_status == 0) {
 			clear_zone_state_after_reset(ctx->device, ctx->start_zone,
 						     ctx->end_zone, ctx->zone_size_blocks);
@@ -379,10 +389,15 @@ zone_reset_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 static void
 zone_reset_next(ZoneResetAsyncCtx *ctx)
 {
+	uint64_t zone_idx = ctx->current_zone / ctx->zone_size_blocks;
+	uint64_t end_zone_idx = ctx->end_zone / ctx->zone_size_blocks;
+	SPDK_NOTICELOG("zone_reset_next: zone_idx=%lu (block=%lu), end_zone_idx=%lu\n",
+		       zone_idx, ctx->current_zone, end_zone_idx);
 	int rc = spdk_bdev_zone_management(ctx->desc, ctx->ch, ctx->current_zone,
 					   SPDK_BDEV_ZONE_RESET, zone_reset_completion, ctx);
 	if (rc) {
 		// Failed to submit, complete with error
+		SPDK_ERRLOG("zone_reset_next: spdk_bdev_zone_management failed with rc=%d\n", rc);
 		if (ctx->user_cb) {
 			ctx->user_cb(ctx->user_cb_arg, rc);
 		}
@@ -766,11 +781,87 @@ public:
 				       buf, len, offset, false, cb, cb_arg);
 	}
 
+	int readv_cache_async(uint64_t offset, struct iovec *iovs, int iovcnt,
+			      size_t total_len, cache_device_io_cb cb, void *cb_arg) override
+	{
+		if (total_len == 0 || iovcnt == 0) {
+			if (cb) cb(cb_arg, 0);
+			return 0;
+		}
+		if (!m_cache_ch) {
+			return -EINVAL;
+		}
+
+		uint64_t block_offset, num_blocks;
+		if (convert_to_blocks(m_cache_bdev, offset, total_len, &block_offset, &num_blocks)) {
+			return -EINVAL;
+		}
+		if (num_blocks == 0) {
+			if (cb) cb(cb_arg, 0);
+			return 0;
+		}
+
+		auto *async_ctx = new (std::nothrow) AsyncIoCtx();
+		if (!async_ctx) {
+			return -ENOMEM;
+		}
+		async_ctx->user_cb = cb;
+		async_ctx->user_cb_arg = cb_arg;
+
+		int rc = spdk_bdev_readv_blocks(m_cache_desc, m_cache_ch,
+						iovs, iovcnt,
+						block_offset, num_blocks,
+						async_io_completion, async_ctx);
+		if (rc) {
+			delete async_ctx;
+			return rc;
+		}
+		return 0;
+	}
+
 	int write_backend_async(uint64_t offset, const void *buf, size_t len,
 				cache_device_io_cb cb, void *cb_arg) override
 	{
 		return submit_rw_async(m_backend_desc, m_backend_ch, m_backend_bdev,
 				       buf, len, offset, true, cb, cb_arg);
+	}
+
+	int writev_backend_async(uint64_t offset, struct iovec *iovs, int iovcnt,
+				 size_t total_len, cache_device_io_cb cb, void *cb_arg) override
+	{
+		if (total_len == 0 || iovcnt == 0) {
+			if (cb) cb(cb_arg, 0);
+			return 0;
+		}
+		if (!m_backend_ch) {
+			return -EINVAL;
+		}
+
+		uint64_t block_offset, num_blocks;
+		if (convert_to_blocks(m_backend_bdev, offset, total_len, &block_offset, &num_blocks)) {
+			return -EINVAL;
+		}
+		if (num_blocks == 0) {
+			if (cb) cb(cb_arg, 0);
+			return 0;
+		}
+
+		auto *async_ctx = new (std::nothrow) AsyncIoCtx();
+		if (!async_ctx) {
+			return -ENOMEM;
+		}
+		async_ctx->user_cb = cb;
+		async_ctx->user_cb_arg = cb_arg;
+
+		int rc = spdk_bdev_writev_blocks(m_backend_desc, m_backend_ch,
+						 iovs, iovcnt,
+						 block_offset, num_blocks,
+						 async_io_completion, async_ctx);
+		if (rc) {
+			delete async_ctx;
+			return rc;
+		}
+		return 0;
 	}
 
 	int read_backend_async(uint64_t offset, void *buf, size_t len,
@@ -808,6 +899,10 @@ public:
 
 		uint64_t start_zone = spdk_bdev_get_zone_id(m_cache_bdev, block_offset);
 		uint64_t end_zone = spdk_bdev_get_zone_id(m_cache_bdev, block_offset + num_blocks - 1);
+		SPDK_NOTICELOG("reset_cache_region_async: offset=0x%lx, len=%zu, block_offset=0x%lx, num_blocks=%lu\n",
+		       offset, len, block_offset, num_blocks);
+		SPDK_NOTICELOG("  start_zone=%lu, end_zone=%lu, zone_size_blocks=%lu\n",
+		       start_zone, end_zone, m_cache_zone_blocks);
 
 		// Create async context
 		auto *ctx = new (std::nothrow) ZoneResetAsyncCtx();
@@ -829,6 +924,8 @@ public:
 		ctx->user_cb_arg = cb_arg;
 		ctx->last_status = 0;
 		ctx->device = this;
+		ctx->start_tsc = spdk_get_ticks();
+		ctx->zones_reset = 0;
 
 		// Start first zone reset
 		zone_reset_next(ctx);
@@ -1398,6 +1495,9 @@ struct CacheIo {
 	size_t completed_blocks;
 	int last_status;
 
+	// For parallel read
+	std::atomic<size_t> parallel_reads_done{0};
+
 	// For write buffer: track flushed blocks across multiple flushes
 	std::atomic<size_t> flushed_blocks{0};
 
@@ -1466,20 +1566,50 @@ struct EvictIo {
 	size_t completed_writes;
 	int last_status;
 
+	// Parallel chunk processing - process N 128k chunks at once
+	static constexpr size_t PARALLEL_CHUNKS = 8;    // 8 * 128k = 1MB
+	static constexpr size_t CHUNK_SIZE = 32 * 4096; // 128k per chunk
+	size_t parallel_batch_start;   // Start index of current parallel batch
+	size_t parallel_batch_count;   // Number of chunks in current batch
+	std::atomic<size_t> parallel_reads_done;   // Atomic counter for parallel reads
+	std::atomic<size_t> parallel_writes_done;  // Atomic counter for parallel writes
+
+	// LBA coalescing - track coalesced writes separately
+	size_t coalesced_writes_total;  // Total coalesced writes issued
+
+	// Timing for segment evict
+	uint64_t start_ticks;
+	uint64_t read_total_us;   // Accumulated read time
+	uint64_t write_total_us;  // Accumulated write time
+	uint64_t batch_read_start_ticks;  // Per-batch read start
+	uint64_t batch_write_start_ticks; // Per-batch write start (after all reads done)
+	size_t total_bytes;
+
+	// Segment info for read strategy
+	uint64_t segment_base_offset;  // Physical base of victim segment
+	size_t segment_size_blocks;    // Total blocks in segment
+	double valid_ratio;            // valid_cnt / segment_size
+	bool use_sequential_read;      // true if valid_ratio >= 50%
+
 	// Batch processing (256KB = 64 blocks at a time)
 	// Matches DmaBufferPool::CHUNK_SIZE for efficient allocation
 	static constexpr size_t BATCH_BLOCKS = 64;  // 256KB / 4KB
 	size_t batch_start;      // Current batch start within chunk
 	size_t batch_count;      // Number of blocks in current batch
 
-	// Staging buffer (DMA-capable, hugepage)
+	// Staging buffer (DMA-capable, hugepage) - now sized for PARALLEL_CHUNKS
 	void *staging;
 	size_t staging_size;
 
 	// Completion callback
 	std::function<void(int)> on_complete;
 
-	EvictIo() : batch_start(0), batch_count(0), staging(nullptr), staging_size(0) {}
+	EvictIo() : batch_start(0), batch_count(0), parallel_batch_start(0),
+	            parallel_batch_count(0), parallel_reads_done(0), parallel_writes_done(0),
+	            coalesced_writes_total(0), start_ticks(0), read_total_us(0), write_total_us(0),
+	            batch_read_start_ticks(0), batch_write_start_ticks(0), total_bytes(0), segment_base_offset(0),
+	            segment_size_blocks(0), valid_ratio(0), use_sequential_read(false),
+	            staging(nullptr), staging_size(0) {}
 	~EvictIo() {
 		if (staging) {
 			icache::dma_pool_free(staging, staging_size);
@@ -1524,11 +1654,15 @@ public:
 		const uint64_t zns_zone_size = ZNS_ZONE_SIZE_BLOCKS * block_size;
 		const uint64_t zns_zone_capacity = ZNS_ZONE_CAPACITY_BLOCKS * block_size;
 
-		// ZNS: segment_bytes = zone_capacity (writable space)
-		// zone_size_bytes = for physical_base alignment
+		// ZNS with striping: segment spans STRIPE_WIDTH zones
+		// segment_bytes = zone_capacity * stripe_width (for legacy, but now calculated in LogCache)
+		// zone_capacity_bytes = writable capacity per zone
+		// zone_size_bytes = zone address space size (for alignment)
 		Config cfg;
-		cfg.segment_bytes = zns_zone_capacity;
+		cfg.segment_bytes = zns_zone_capacity;  // Single zone capacity (legacy)
 		cfg.zone_size_bytes = zns_zone_size;
+		cfg.zone_capacity_bytes = zns_zone_capacity;
+		cfg.stripe_width = STRIPE_WIDTH;
 
 		cache_ = std::make_unique<LogCache>(
 			cold_capacity,
@@ -1554,9 +1688,9 @@ public:
 	// Check if key exists in cache
 	bool exists(long key) { return cache_->exists(key); }
 
-	// Get block offset for a segment and index
+	// Get block offset for a segment and index (with striping support)
 	uint64_t block_offset(const LogCacheSegment *seg, size_t idx) const {
-		return seg->physical_base + static_cast<uint64_t>(idx) * block_size_;
+		return seg->get_block_offset(idx, block_size_);
 	}
 
 	// Get mapping info for a key
@@ -1583,6 +1717,12 @@ public:
 
 	// Check if free segments available
 	bool need_gc_or_evict() { return cache_->is_cache_filled(); }
+
+	// Free segment count for watermark checks
+	size_t free_segment_count() const { return cache_->free_segment_count(); }
+
+	// Critical threshold - block host writes only when below this
+	static constexpr size_t CRITICAL_FREE_SEGMENTS = 5;
 
 	// 128KB Write Buffer - reduced for lower latency
 	static constexpr size_t WRITE_BUFFER_SIZE = 128 * 1024;  // 128KB
@@ -1708,6 +1848,9 @@ static std::atomic<uint64_t> g_outstanding_samples{0};
 static std::atomic<uint64_t> g_outstanding_sum{0};
 static std::atomic<uint64_t> g_write_count{0};
 
+// TEST: Skip zone write and complete immediately (for measuring icache overhead only)
+static constexpr bool SKIP_ZONE_WRITE_FOR_TEST = false;
+
 static void write_buffer_flush_done(void *cb_arg, int status);
 static void zone_write_done(void *cb_arg, int status);
 
@@ -1749,6 +1892,13 @@ void LogCacheAsync::flush_write_buffer()
 		return;
 	}
 
+	// Only block if GC/Evict in progress AND segments critically low
+	if ((gc_in_progress_ || evict_in_progress_) &&
+	    free_segment_count() <= CRITICAL_FREE_SEGMENTS) {
+		flush_pending_ = true;
+		return;
+	}
+
 	uint32_t block_size = block_size_;
 	size_t total_blocks = write_buffer_.size();
 
@@ -1762,6 +1912,8 @@ void LogCacheAsync::flush_write_buffer()
 
 	// Get metadata first (NO iovec allocation yet - will do per-group)
 	// Store buffer pointers for later iovec setup
+	static uint64_t flush_block_count = 0;
+	static uint64_t block_start_tsc = 0;
 	std::vector<const uint8_t*> buf_ptrs;
 	for (size_t i = 0; i < write_buffer_.size(); i++) {
 		auto &blk = write_buffer_[i];
@@ -1769,12 +1921,27 @@ void LogCacheAsync::flush_write_buffer()
 		if (!cache_->append_block_metadata(0, static_cast<long>(blk.key),
 						   static_cast<int>(block_size), &cache_offset)) {
 			// No free segments - need GC/Evict
+			if (flush_block_count == 0) {
+				block_start_tsc = spdk_get_ticks();
+			}
+			flush_block_count++;
+			if (flush_block_count == 1 || flush_block_count % 10000 == 0) {
+				SPDK_WARNLOG("BLOCKED: flush_write_buffer waiting for GC (blocked %lu times)\n", flush_block_count);
+			}
 			delete flush_ctx;
 			flush_pending_ = true;
 			return;
 		}
 		flush_ctx->cache_offsets.push_back(cache_offset);
 		buf_ptrs.push_back(blk.buf);
+	}
+
+	// Log if we were blocked and now succeeded
+	if (flush_block_count > 0) {
+		uint64_t blocked_us = (spdk_get_ticks() - block_start_tsc) * 1000000 / spdk_get_ticks_hz();
+		SPDK_NOTICELOG("UNBLOCKED: flush_write_buffer succeeded after %lu blocks, %lu us blocked\n",
+			       flush_block_count, blocked_us);
+		flush_block_count = 0;
 	}
 
 	// Move buffer and count blocks per IO
@@ -1840,6 +2007,12 @@ void LogCacheAsync::flush_write_buffer()
 
 	// Set outstanding writes count
 	flush_ctx->outstanding_writes = static_cast<int>(groups.size());
+
+	// TEST: Skip zone write and complete immediately
+	if (SKIP_ZONE_WRITE_FOR_TEST) {
+		write_buffer_flush_done(flush_ctx, 0);
+		return;
+	}
 
 	// Issue writes for each group
 	for (auto &group : groups) {
@@ -1980,6 +2153,23 @@ static void gc_io_complete(GcIo *io, int status)
 
 static void evict_io_complete(EvictIo *io, int status)
 {
+	// Calculate and log segment evict time
+	uint64_t elapsed_ticks = spdk_get_ticks() - io->start_ticks;
+	uint64_t elapsed_us = elapsed_ticks * 1000000 / spdk_get_ticks_hz();
+	double elapsed_sec = elapsed_us / 1000000.0;
+	double mb = io->total_bytes / (1024.0 * 1024.0);
+	double throughput_mbs = (elapsed_sec > 0) ? (mb / elapsed_sec) : 0;
+
+	double read_sec = io->read_total_us / 1000000.0;
+	double write_sec = io->write_total_us / 1000000.0;
+	double read_mbs = (read_sec > 0) ? (mb / read_sec) : 0;
+	double write_mbs = (write_sec > 0) ? (mb / write_sec) : 0;
+
+	SPDK_NOTICELOG("Evict segment: %.1f MB, total=%.2fs (%.0f MB/s), "
+		       "read=%.2fs (%.0f MB/s), write=%.2fs (%.0f MB/s), status=%d\n",
+		       mb, elapsed_sec, throughput_mbs,
+		       read_sec, read_mbs, write_sec, write_mbs, status);
+
 	auto on_complete = std::move(io->on_complete);
 	delete io;
 	if (on_complete) {
@@ -2090,13 +2280,17 @@ static void host_read_block_done(void *cb_arg, int status)
 	uint64_t blk_idx = ctx->block_idx;
 	delete ctx;
 
-
 	if (status != 0) {
 		SPDK_ERRLOG("READ_DONE: error status=%d for blk=%lu\n", status, blk_idx);
 		io->last_status = status;
 	}
-	io->current_block_idx++;
-	host_read_next_block(io);
+
+	// Parallel completion: increment counter and check if all done
+	size_t done = ++io->parallel_reads_done;
+	if (done >= io->total_blocks) {
+		io->state = CacheIoState::HOST_READ_DONE;
+		cache_io_complete(io, io->last_status);
+	}
 }
 
 static void cache_io_run_host_read(CacheIo *io)
@@ -2111,13 +2305,77 @@ static void cache_io_run_host_read(CacheIo *io)
 	}
 
 	io->state = CacheIoState::HOST_READ_SUBMIT;
-	io->total_blocks = io->total_len / io->ctx->block_size;
-	io->current_block_idx = 0;
-	io->completed_blocks = 0;
+	uint32_t block_size = io->ctx->block_size;
+	io->total_blocks = io->total_len / block_size;
+	io->parallel_reads_done.store(0);
 	io->last_status = 0;
 
-	// No staging buffer needed - use iov directly (already hugepage-backed)
-	host_read_next_block(io);
+	if (io->total_blocks == 0) {
+		cache_io_complete(io, 0);
+		return;
+	}
+
+	LogCacheAsync *cache = io->ctx->cache.get();
+
+	// Submit all blocks in parallel
+	for (size_t blk_idx = 0; blk_idx < io->total_blocks; blk_idx++) {
+		uint64_t key = io->lba + blk_idx;
+
+		uint8_t *dest = get_iov_buf_for_block(io->iovs, io->iovcnt, block_size, blk_idx);
+		if (!dest) {
+			SPDK_ERRLOG("READ_PARALLEL: failed to get iov buf for blk=%zu\n", blk_idx);
+			// Count as done with error
+			io->last_status = -EINVAL;
+			size_t done = ++io->parallel_reads_done;
+			if (done >= io->total_blocks) {
+				cache_io_complete(io, io->last_status);
+				return;
+			}
+			continue;
+		}
+
+		auto *read_ctx = new (std::nothrow) ReadBlockCtx{io, blk_idx};
+		if (!read_ctx) {
+			io->last_status = -ENOMEM;
+			size_t done = ++io->parallel_reads_done;
+			if (done >= io->total_blocks) {
+				cache_io_complete(io, io->last_status);
+				return;
+			}
+			continue;
+		}
+
+		int rc = 0;
+		if (cache->exists(static_cast<long>(key))) {
+			uint64_t cache_offset;
+			if (!cache->cache()->get_cache_location(static_cast<long>(key), &cache_offset)) {
+				delete read_ctx;
+				io->last_status = -EIO;
+				size_t done = ++io->parallel_reads_done;
+				if (done >= io->total_blocks) {
+					cache_io_complete(io, io->last_status);
+					return;
+				}
+				continue;
+			}
+			rc = cache->device()->read_cache_async(cache_offset, dest, block_size,
+							       host_read_block_done, read_ctx);
+		} else {
+			uint64_t backend_offset = key * block_size;
+			rc = cache->device()->read_backend_async(backend_offset, dest, block_size,
+								 host_read_block_done, read_ctx);
+		}
+
+		if (rc != 0) {
+			delete read_ctx;
+			io->last_status = rc;
+			size_t done = ++io->parallel_reads_done;
+			if (done >= io->total_blocks) {
+				cache_io_complete(io, io->last_status);
+				return;
+			}
+		}
+	}
 }
 
 //==============================================================================
@@ -2145,6 +2403,11 @@ static void host_write_block_done(void *cb_arg, int status)
 		// Need to trigger GC/Evict
 		io->state = CacheIoState::HOST_WRITE_WAIT_GC_EVICT;
 		cache->pending_writes().push_back(io);
+		static uint64_t wait_gc_count = 0;
+		if (++wait_gc_count % 1000 == 1) {
+			SPDK_WARNLOG("BLOCKED: host_write waiting for GC, pending_writes=%zu (blocked %lu times)\n",
+			       cache->pending_writes().size(), wait_gc_count);
+		}
 
 		start_gc_or_evict(io->ctx, [ctx = io->ctx](int status) {
 			process_pending_writes(ctx);
@@ -2541,10 +2804,8 @@ static void gc_write_done(void *cb_arg, int status)
 }
 
 //==============================================================================
-// Evict State Machine
+// Evict State Machine (128k chunk reads + pipelined 4k writes)
 //==============================================================================
-static void evict_read_done(void *cb_arg, int status);
-static void evict_write_done(void *cb_arg, int status);
 
 // Callback for async finalize_evict completion
 static void evict_finalize_done(void *cb_arg, int status)
@@ -2553,6 +2814,16 @@ static void evict_finalize_done(void *cb_arg, int status)
 	io->ctx->cache->set_evict_in_progress(false);
 	evict_io_complete(io, status != 0 ? status : io->last_status);
 }
+
+// Context for cache read - includes batch_idx for immediate write after read
+struct CoalescedReadCtx {
+	EvictIo *io;
+	struct iovec *iovs;
+	int iovcnt;
+	size_t batch_idx;  // Which chunk in the batch this read is for
+};
+
+static void coalesced_read_done(void *cb_arg, int status);
 
 static void evict_start_chunk(EvictIo *io)
 {
@@ -2566,18 +2837,25 @@ static void evict_start_chunk(EvictIo *io)
 	}
 
 	io->state = EvictIoState::BACKEND_READ_BLOCK;
-	auto &chunk = chunks[io->current_chunk_idx];
+	io->batch_read_start_ticks = spdk_get_ticks();
+	io->batch_write_start_ticks = 0;
 	uint32_t block_size = io->ctx->block_size;
-	size_t chunk_blocks = chunk.valid_mask.size();
+	constexpr size_t CHUNK_BLOCKS = 32;  // 128k = 32 * 4k
+	size_t chunk_size = CHUNK_BLOCKS * block_size;  // 128k
 
-	// Free previous staging buffer if any
+	// Calculate batch size (8 chunks = 1MB)
+	size_t remaining = chunks.size() - io->current_chunk_idx;
+	io->parallel_batch_start = io->current_chunk_idx;
+	io->parallel_batch_count = std::min(remaining, EvictIo::PARALLEL_CHUNKS);
+
+	// Free previous staging buffer
 	if (io->staging) {
 		icache::dma_pool_free(io->staging, io->staging_size);
 		io->staging = nullptr;
 	}
 
-	// Allocate DMA-capable staging for this chunk
-	io->staging_size = chunk_blocks * block_size;
+	// Allocate staging for 128k * batch_count
+	io->staging_size = io->parallel_batch_count * chunk_size;
 	io->staging = icache::dma_pool_alloc(io->staging_size);
 	if (!io->staging) {
 		io->ctx->cache->set_evict_in_progress(false);
@@ -2585,98 +2863,153 @@ static void evict_start_chunk(EvictIo *io)
 		return;
 	}
 
-	io->completed_reads = 0;
+	// Count total valid blocks for write completion tracking
+	size_t total_valid_blocks = 0;
+	for (size_t i = 0; i < io->parallel_batch_count; ++i) {
+		auto &chunk = chunks[io->parallel_batch_start + i];
+		for (bool valid : chunk.valid_mask) {
+			if (valid) total_valid_blocks++;
+		}
+	}
 
-	// Read all blocks in chunk (from cache if valid, from backend if not)
-	for (size_t i = 0; i < chunk_blocks; ++i) {
-		uint8_t *dest = static_cast<uint8_t*>(io->staging) + i * block_size;
-		uint64_t key = chunk.start_key + i;
+	io->parallel_reads_done.store(0);
+	io->parallel_writes_done.store(0);
+	io->coalesced_writes_total = total_valid_blocks;
 
-		struct EvictReadCtx {
-			EvictIo *io;
-			size_t block_in_chunk;
-		};
-		auto *read_ctx = new (std::nothrow) EvictReadCtx{io, i};
+	LogCacheSegment *victim = io->prepare_result.victim_seg;
+
+	// Issue 8 x 128k reads in parallel
+	for (size_t batch_idx = 0; batch_idx < io->parallel_batch_count; ++batch_idx) {
+		size_t chunk_idx = io->parallel_batch_start + batch_idx;
+		auto &chunk = chunks[chunk_idx];
+
+		void *buf = static_cast<uint8_t*>(io->staging) + batch_idx * chunk_size;
+
+		// Calculate cache offset: first block of this 128k chunk
+		size_t first_seg_idx = chunk.cache_chunk_idx * CHUNK_BLOCKS;
+		uint64_t cache_offset = victim->get_block_offset(first_seg_idx, block_size);
+
+		auto *read_ctx = new (std::nothrow) CoalescedReadCtx{io, nullptr, 0, batch_idx};
 		if (!read_ctx) {
 			io->last_status = -ENOMEM;
-			io->completed_reads++;
+			io->parallel_reads_done++;
+			// Count all valid blocks in this chunk as done
+			for (bool valid : chunk.valid_mask) {
+				if (valid) io->parallel_writes_done++;
+			}
 			continue;
 		}
 
-		int rc;
-		if (chunk.valid_mask[i]) {
-			// Read from cache - get cache offset
-			uint64_t cache_offset;
-			if (io->ctx->cache->cache()->get_cache_location(static_cast<long>(key), &cache_offset)) {
-				rc = io->ctx->device->read_cache_async(cache_offset, dest, block_size,
-								       evict_read_done, read_ctx);
-				if (rc != 0) {
-					delete read_ctx;
-					io->last_status = rc;
-					io->completed_reads++;
-				}
-			} else {
-				// Cache miss (shouldn't happen), read from backend
-				uint64_t backend_offset = key * block_size;
-				rc = io->ctx->device->read_backend_async(backend_offset, dest, block_size,
-									 evict_read_done, read_ctx);
-				if (rc != 0) {
-					delete read_ctx;
-					io->last_status = rc;
-					io->completed_reads++;
-				}
-			}
-		} else {
-			// Read from backend
-			uint64_t backend_offset = key * block_size;
-			rc = io->ctx->device->read_backend_async(backend_offset, dest, block_size,
-								 evict_read_done, read_ctx);
-			if (rc != 0) {
-				delete read_ctx;
-				io->last_status = rc;
-				io->completed_reads++;
+		// Read 128k from cache
+		int rc = io->ctx->device->read_cache_async(cache_offset, buf, chunk_size,
+							   coalesced_read_done, read_ctx);
+		if (rc != 0) {
+			delete read_ctx;
+			io->last_status = rc;
+			io->parallel_reads_done++;
+			for (bool valid : chunk.valid_mask) {
+				if (valid) io->parallel_writes_done++;
 			}
 		}
 	}
 
-	// Check if all reads completed synchronously (error case)
-	if (io->completed_reads >= chunk_blocks) {
-		// All reads done, start write
-		io->state = EvictIoState::BACKEND_WRITE_BLOCK;
+	// Check if all completed synchronously (error case)
+	if (io->coalesced_writes_total == 0 ||
+	    io->parallel_writes_done.load() >= io->coalesced_writes_total) {
+		io->current_chunk_idx += io->parallel_batch_count;
+		evict_start_chunk(io);
+	}
+}
 
-		uint64_t backend_offset = chunk.start_key * block_size;
+// Write completion callback for pipelined read->write
+static void pipelined_write_done(void *cb_arg, int status);
 
-		struct EvictWriteCtx {
-			EvictIo *io;
-			size_t chunk_idx;
-		};
-		auto *write_ctx = new (std::nothrow) EvictWriteCtx{io, io->current_chunk_idx};
+static void coalesced_read_done(void *cb_arg, int status)
+{
+	auto *ctx = static_cast<CoalescedReadCtx *>(cb_arg);
+	EvictIo *io = ctx->io;
+	size_t batch_idx = ctx->batch_idx;
+
+	delete[] ctx->iovs;
+	delete ctx;
+
+	auto &chunks = io->prepare_result.chunks;
+	size_t chunk_idx = io->parallel_batch_start + batch_idx;
+	auto &chunk = chunks[chunk_idx];
+	uint32_t block_size = io->ctx->block_size;
+	constexpr size_t CHUNK_BLOCKS = 32;
+	size_t chunk_size = CHUNK_BLOCKS * block_size;
+
+	// Count valid blocks in this chunk for error handling
+	size_t valid_count = 0;
+	for (bool valid : chunk.valid_mask) {
+		if (valid) valid_count++;
+	}
+
+	if (status != 0) {
+		if (io->last_status == 0) io->last_status = status;
+		// Read failed - count all valid blocks as write done
+		size_t done = io->parallel_writes_done.fetch_add(valid_count) + valid_count;
+		if (done >= io->coalesced_writes_total) {
+			uint64_t elapsed = spdk_get_ticks() - io->batch_read_start_ticks;
+			io->write_total_us += elapsed * 1000000 / spdk_get_ticks_hz();
+			io->current_chunk_idx += io->parallel_batch_count;
+			evict_start_chunk(io);
+		}
+		return;
+	}
+
+	size_t reads_done = ++io->parallel_reads_done;
+
+	// Record read time when all 128k reads are done
+	if (reads_done == io->parallel_batch_count) {
+		uint64_t read_elapsed = spdk_get_ticks() - io->batch_read_start_ticks;
+		io->read_total_us += read_elapsed * 1000000 / spdk_get_ticks_hz();
+		io->batch_write_start_ticks = spdk_get_ticks();
+	}
+
+	// Pipelined: issue 4k writes for all valid blocks in this 128k chunk
+	void *chunk_buf = static_cast<uint8_t*>(io->staging) + batch_idx * chunk_size;
+
+	for (size_t i = 0; i < CHUNK_BLOCKS && i < chunk.valid_mask.size(); ++i) {
+		if (!chunk.valid_mask[i]) continue;
+
+		uint64_t backend_key = chunk.backend_keys[i];
+		uint64_t backend_offset = backend_key * block_size;
+		void *blk_buf = static_cast<uint8_t*>(chunk_buf) + i * block_size;
+
+		auto *write_ctx = new (std::nothrow) CoalescedReadCtx{io, nullptr, 0, batch_idx};
 		if (!write_ctx) {
 			io->last_status = -ENOMEM;
-			io->current_chunk_idx++;
-			evict_start_chunk(io);
-			return;
+			size_t done = ++io->parallel_writes_done;
+			if (done >= io->coalesced_writes_total) {
+				uint64_t elapsed = spdk_get_ticks() - io->batch_write_start_ticks;
+				io->write_total_us += elapsed * 1000000 / spdk_get_ticks_hz();
+				io->current_chunk_idx += io->parallel_batch_count;
+				evict_start_chunk(io);
+			}
+			continue;
 		}
 
-		int rc = io->ctx->device->write_backend_async(backend_offset, io->staging,
-							      chunk_blocks * block_size,
-							      evict_write_done, write_ctx);
+		int rc = io->ctx->device->write_backend_async(backend_offset, blk_buf, block_size,
+							      pipelined_write_done, write_ctx);
 		if (rc != 0) {
 			delete write_ctx;
 			io->last_status = rc;
-			io->current_chunk_idx++;
-			evict_start_chunk(io);
+			size_t done = ++io->parallel_writes_done;
+			if (done >= io->coalesced_writes_total) {
+				uint64_t elapsed = spdk_get_ticks() - io->batch_write_start_ticks;
+				io->write_total_us += elapsed * 1000000 / spdk_get_ticks_hz();
+				io->current_chunk_idx += io->parallel_batch_count;
+				evict_start_chunk(io);
+			}
 		}
 	}
 }
 
-static void evict_read_done(void *cb_arg, int status)
+static void pipelined_write_done(void *cb_arg, int status)
 {
-	struct EvictReadCtx {
-		EvictIo *io;
-		size_t block_in_chunk;
-	};
-	auto *ctx = static_cast<EvictReadCtx *>(cb_arg);
+	auto *ctx = static_cast<CoalescedReadCtx *>(cb_arg);
 	EvictIo *io = ctx->io;
 	delete ctx;
 
@@ -2684,59 +3017,23 @@ static void evict_read_done(void *cb_arg, int status)
 		io->last_status = status;
 	}
 
-	io->completed_reads++;
+	size_t done = ++io->parallel_writes_done;
 
-	auto &chunk = io->prepare_result.chunks[io->current_chunk_idx];
-	size_t chunk_blocks = chunk.valid_mask.size();
+	if (done >= io->coalesced_writes_total) {
+		// All writes done - record write timing
+		uint64_t write_start = io->batch_write_start_ticks ? io->batch_write_start_ticks : io->batch_read_start_ticks;
+		uint64_t elapsed = spdk_get_ticks() - write_start;
+		io->write_total_us += elapsed * 1000000 / spdk_get_ticks_hz();
 
-	if (io->completed_reads >= chunk_blocks) {
-		// All reads done, start write
-		io->state = EvictIoState::BACKEND_WRITE_BLOCK;
-		uint32_t block_size = io->ctx->block_size;
-		uint64_t backend_offset = chunk.start_key * block_size;
-
-		struct EvictWriteCtx {
-			EvictIo *io;
-			size_t chunk_idx;
-		};
-		auto *write_ctx = new (std::nothrow) EvictWriteCtx{io, io->current_chunk_idx};
-		if (!write_ctx) {
-			io->last_status = -ENOMEM;
-			io->current_chunk_idx++;
-			evict_start_chunk(io);
-			return;
-		}
-
-		int rc = io->ctx->device->write_backend_async(backend_offset, io->staging,
-							      chunk_blocks * block_size,
-							      evict_write_done, write_ctx);
-		if (rc != 0) {
-			delete write_ctx;
-			io->last_status = rc;
-			io->current_chunk_idx++;
-			evict_start_chunk(io);
-		}
+		io->state = EvictIoState::BACKEND_WRITE_DONE;
+		io->current_chunk_idx += io->parallel_batch_count;
+		evict_start_chunk(io);
 	}
 }
 
-static void evict_write_done(void *cb_arg, int status)
-{
-	struct EvictWriteCtx {
-		EvictIo *io;
-		size_t chunk_idx;
-	};
-	auto *ctx = static_cast<EvictWriteCtx *>(cb_arg);
-	EvictIo *io = ctx->io;
-	delete ctx;
-
-	if (status != 0 && io->last_status == 0) {
-		io->last_status = status;
-	}
-
-	io->state = EvictIoState::BACKEND_WRITE_DONE;
-	io->current_chunk_idx++;
-	evict_start_chunk(io);
-}
+// NOTE: Old evict_read_done, evict_start_parallel_writes, coalesced_write_done,
+// and evict_write_done removed - now using pipelined model in coalesced_read_done
+// and pipelined_write_done
 
 //==============================================================================
 // GC/Evict Trigger
@@ -2776,9 +3073,12 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 	// Try GC first (compaction)
 	LogCache::GcPrepareResult gc_result;
 	bool gc_prepared = cache->cache()->prepare_gc(gc_result);
+	SPDK_NOTICELOG("GC: prepare_gc returned %d, do_evict_only=%d, blocks_to_copy=%zu\n",
+	       gc_prepared, gc_result.do_evict_only, gc_result.blocks_to_copy.size());
 	if (gc_prepared) {
 		if (!gc_result.do_evict_only && !gc_result.blocks_to_copy.empty()) {
 			// Do GC (compaction)
+			SPDK_NOTICELOG("GC: Starting compaction with %zu blocks\n", gc_result.blocks_to_copy.size());
 			cache->set_gc_in_progress(true);
 
 			auto *gc_io = new (std::nothrow) GcIo();
@@ -2804,9 +3104,16 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 	// Fall back to evict
 	LogCache::EvictPrepareResult evict_result;
 	bool evict_prepared = cache->cache()->prepare_evict(evict_result);
+	SPDK_NOTICELOG("Evict: prepare_evict returned %d, chunks=%zu, victim_seg=%p\n",
+	       evict_prepared, evict_result.chunks.size(), evict_result.victim_seg);
 	if (evict_prepared) {
 		if (evict_result.chunks.empty() && evict_result.victim_seg) {
 			// No valid blocks, just reset segment asynchronously
+			SPDK_NOTICELOG("Evict: No valid blocks, resetting segment %p (stripe_width=%d)\n",
+			       evict_result.victim_seg, evict_result.victim_seg->stripe_width_);
+			for (int z = 0; z < evict_result.victim_seg->stripe_width_; z++) {
+				SPDK_NOTICELOG("  Zone %d: physical_base=0x%lx\n", z, evict_result.victim_seg->physical_bases[z]);
+			}
 			auto *reset_ctx = new (std::nothrow) SimpleResetCtx();
 			if (!reset_ctx) {
 				if (on_complete) on_complete(-ENOMEM);
@@ -2818,6 +3125,8 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 		}
 
 		cache->set_evict_in_progress(true);
+		SPDK_NOTICELOG("Evict: Starting evict with %zu chunks, victim_seg=%p\n",
+		       evict_result.chunks.size(), evict_result.victim_seg);
 
 		auto *evict_io = new (std::nothrow) EvictIo();
 		if (!evict_io) {
@@ -2828,6 +3137,20 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 
 		evict_io->state = EvictIoState::EVICT_SEGMENT_SUBMIT;
 		evict_io->ctx = ctx;
+		evict_io->start_ticks = spdk_get_ticks();
+		evict_io->total_bytes = evict_result.chunks.size() * 32 * ctx->block_size;  // 128k per chunk
+
+		// Calculate valid ratio for read strategy
+		auto *victim = evict_result.victim_seg;
+		evict_io->segment_size_blocks = victim->blocks.size();
+		evict_io->segment_base_offset = victim->physical_bases[0];
+		size_t valid_cnt = victim->valid_cnt;  // Actual valid block count
+		evict_io->valid_ratio = (double)valid_cnt / evict_io->segment_size_blocks;
+		evict_io->use_sequential_read = (evict_io->valid_ratio >= 0.5);
+
+		SPDK_NOTICELOG("Evict: valid_ratio=%.1f%%, use_sequential_read=%d\n",
+			       evict_io->valid_ratio * 100, evict_io->use_sequential_read);
+
 		evict_io->prepare_result = std::move(evict_result);
 		evict_io->current_chunk_idx = 0;
 		evict_io->completed_reads = 0;

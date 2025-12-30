@@ -35,7 +35,9 @@ struct Config
 {
     std::size_t segment_bytes  = 512ull * 1024 * 1024; ///< default 512 MB zone
     std::size_t zone_size_bytes = 0;                   ///< zone size for physical_base (0 = use segment_bytes)
-    
+    std::size_t zone_capacity_bytes = 0;               ///< writable capacity per zone (for striping)
+    int         stripe_width = STRIPE_WIDTH;           ///< number of zones per segment
+
     double      free_ratio_low = 0.01;                ///< 1 %
     int         evicted_blk_size = 1;    // 4k eviction
     uint64_t         print_stats_interval = 10 * 1024ull * 1024 * 1024; // 10 GB
@@ -61,6 +63,7 @@ public:
         uint64_t dst_offset;      // Destination offset in new segment
         long key;
         size_t src_idx;           // Source index in victim segment
+        size_t dst_idx;           // Destination index in target segment (for striping)
         uint64_t create_timestamp;
     };
 
@@ -74,9 +77,11 @@ public:
     };
 
     struct EvictBlockInfo {
-        uint64_t start_key;       // 64k aligned start key
-        std::vector<bool> valid_mask;  // Which 4k blocks are valid in cache
-        std::vector<std::pair<LogCacheSegment*, size_t>> cache_locations; // seg, idx pairs
+        static constexpr size_t CHUNK_BLOCKS = 32;  // 128k = 32 * 4k
+        uint64_t cache_chunk_idx;     // 128k chunk index within segment
+        std::vector<bool> valid_mask;  // [32] which 4k blocks are valid
+        std::vector<uint64_t> backend_keys;  // [32] backend LBA for each block
+        std::vector<size_t> seg_indices;  // [32] segment block indices
     };
 
     struct EvictPrepareResult {
@@ -152,6 +157,9 @@ public:
 
     // Mapping access for async read
     bool get_cache_location(long key, uint64_t *offset);
+
+    // Free segment count for watermark checks
+    size_t free_segment_count() const { return free_pool.size(); }
 
 private:
     /* configuration ******************************************************/

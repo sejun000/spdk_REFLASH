@@ -129,6 +129,23 @@ create_tier() {
     log "Tier creation complete"
 }
 
+# Set QoS limit on icache bdev (MB/s, 0 = unlimited)
+ICACHE_QOS_MBPS=${ICACHE_QOS_MBPS:-0}
+
+set_qos_limit() {
+    if [[ "${ICACHE_QOS_MBPS}" == "0" ]]; then
+        log "QoS limit disabled (ICACHE_QOS_MBPS=0)"
+        return 0
+    fi
+
+    local bdev_name="${ICACHE_NAME:-icache0}"
+    log "Setting QoS limit on ${bdev_name}: ${ICACHE_QOS_MBPS} MB/s"
+    sudo "$ROOT_DIR/scripts/rpc.py" -s "$RPC_SOCKET" \
+        bdev_set_qos_limit "${bdev_name}" --rw_mbytes_per_sec "${ICACHE_QOS_MBPS}" && \
+        log "QoS limit set successfully" || \
+        log "Failed to set QoS limit"
+}
+
 connect_host() {
     if ! command -v nvme >/dev/null 2>&1; then
         log "'nvme' CLI not found; skipping connect step"
@@ -156,4 +173,5 @@ sudo HUGEMEM=8192 "${ROOT_DIR}/scripts/setup.sh"
 
 start_spdk_tgt
 create_tier
+set_qos_limit
 connect_host

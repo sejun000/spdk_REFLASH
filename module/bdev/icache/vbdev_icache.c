@@ -840,8 +840,35 @@ vbdev_icache_create(const char *name, const char *cache_bdev_name,
 		goto err_open;
 	}
 
+	// Limit cache size (TODO: make this configurable via RPC)
+	// Align to zone_size * STRIPE_WIDTH for proper segment boundaries
+	uint64_t cache_size_limit_gb = 100;
+	uint64_t cache_blockcnt = icache->cache_bdev->blockcnt;
+	uint64_t limit_blockcnt = (cache_size_limit_gb * 1024ULL * 1024 * 1024) / icache->cache_bdev->blocklen;
+
+	// Get zone size and align to stripe boundaries
+	uint64_t zone_size_blocks = spdk_bdev_get_zone_size(icache->cache_bdev);
+	if (zone_size_blocks > 0) {
+		// STRIPE_WIDTH from log_cache_segment.h
+		#ifndef STRIPE_WIDTH
+		#define STRIPE_WIDTH 2
+		#endif
+		uint64_t align_unit = zone_size_blocks * STRIPE_WIDTH;
+		// Round UP to alignment boundary
+		limit_blockcnt = ((limit_blockcnt + align_unit - 1) / align_unit) * align_unit;
+		SPDK_NOTICELOG("icache: zone_size=%lu blocks, stripe_width=%d, align_unit=%lu blocks\n",
+			       zone_size_blocks, STRIPE_WIDTH, align_unit);
+	}
+
+	if (limit_blockcnt < cache_blockcnt) {
+		SPDK_NOTICELOG("icache: Limiting cache size from %lu to %lu blocks (%lu MB)\n",
+			       cache_blockcnt, limit_blockcnt,
+			       (limit_blockcnt * icache->cache_bdev->blocklen) / (1024 * 1024));
+		cache_blockcnt = limit_blockcnt;
+	}
+
 	icache->log_ctx = log_cache_ctx_create(icache->cache_desc, icache->backend_desc,
-					       icache->cache_bdev->blockcnt,
+					       cache_blockcnt,
 					       icache->backend_bdev->blockcnt,
 					       icache->cache_bdev->blocklen,
 					       icache->cache_type,

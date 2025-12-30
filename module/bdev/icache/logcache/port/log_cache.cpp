@@ -8,6 +8,8 @@
 #include <list>
 #include <memory>
 
+#include "spdk/log.h"
+
 extern uint64_t interval;
 /* ------------------------------------------------------------------ */
 /* ctor / dtor                                                        */
@@ -51,34 +53,52 @@ LogCache::LogCache(uint64_t              cold_capacity,
       ghost_cache(cache_block_count * 0.1),
       device_io_(device_io)
 {
-    segment_size_blocks = cfg_.segment_bytes / blk_sz;
-    // For ZNS: use zone_size to calculate number of segments (zones)
-    std::size_t zone_stride = cfg_.zone_size_bytes > 0 ? cfg_.zone_size_bytes : cfg_.segment_bytes;
-    total_segments = cache_block_count * blk_sz / zone_stride;
+    // For striping: segment_bytes = zone_capacity * stripe_width
+    // Each segment spans stripe_width zones
+    int stripe_width = cfg_.stripe_width;
+    std::size_t zone_capacity = cfg_.zone_capacity_bytes > 0 ? cfg_.zone_capacity_bytes : cfg_.segment_bytes;
+    std::size_t zone_size = cfg_.zone_size_bytes > 0 ? cfg_.zone_size_bytes : cfg_.segment_bytes;
+
+    // With striping: segment holds stripe_width zones worth of blocks
+    segment_size_blocks = (zone_capacity / blk_sz) * stripe_width;
+
+    // Calculate total zones first, then divide by stripe_width
+    std::size_t total_zones = cache_block_count * blk_sz / zone_size;
+    total_segments = total_zones / stripe_width;
+
     total_cache_block_count = cache_block_count;
     total_capacity_bytes = cache_block_count * blk_sz;
     assert(segment_size_blocks > 0 && "segment_bytes too small");
     assert(total_segments      > 0 && "device_bytes too small");
     log_cache_timestamp = 0;
 
-    evictor->init(&log_cache_timestamp, cfg_.segment_bytes / blk_sz, total_segments);
+    SPDK_NOTICELOG("LogCache init: stripe_width=%d, zone_capacity=%zuMB, zone_size=%zuMB\n",
+           stripe_width, zone_capacity / (1024*1024), zone_size / (1024*1024));
+    SPDK_NOTICELOG("LogCache init: segment_size_blocks=%zu, total_zones=%zu, total_segments=%zu\n",
+           segment_size_blocks, total_zones, total_segments);
 
+    evictor->init(&log_cache_timestamp, segment_size_blocks, total_segments);
 
     if (compactor) {
-        compactor->init(&log_cache_timestamp, cfg_.segment_bytes / blk_sz, total_segments);
+        compactor->init(&log_cache_timestamp, segment_size_blocks, total_segments);
     }
 
     stream_policy = input_stream_policy;
     global_valid_blocks = 0;
-    // For ZNS: use zone_size_bytes for physical_base alignment (zone boundaries)
-    // segment_bytes is the actual writable capacity per zone
-    std::size_t base_stride = cfg_.zone_size_bytes > 0 ? cfg_.zone_size_bytes : cfg_.segment_bytes;
 
     /* 세그먼트 전부 미리 생성 → free_pool */
+    /* With striping: each segment has stripe_width physical_bases */
     for (std::size_t i = 0; i < total_segments; ++i)
     {
-        auto seg = std::make_unique<LogCacheSegment>(segment_size_blocks, log_cache_timestamp);
-        seg->physical_base = i * base_stride;
+        auto seg = std::make_unique<LogCacheSegment>(segment_size_blocks, log_cache_timestamp, stripe_width);
+        seg->zone_capacity_bytes_ = zone_capacity;
+        // Set physical_bases for each zone in the stripe
+        for (int z = 0; z < stripe_width; ++z) {
+            std::size_t zone_idx = i * stripe_width + z;
+            seg->physical_bases[z] = zone_idx * zone_size;
+        }
+        // Legacy compatibility
+        seg->physical_base = seg->physical_bases[0];
         free_pool.push_back(seg.get());
         all_segments.push_back(std::move(seg));
     }
@@ -100,7 +120,8 @@ LogCache::~LogCache()
 
 uint64_t LogCache::block_offset(const LogCacheSegment *seg, std::size_t idx) const
 {
-    return seg->physical_base + static_cast<uint64_t>(idx) * cache_block_size;
+    // Use striped offset calculation
+    return seg->get_block_offset(idx, cache_block_size);
 }
 
 int LogCache::write_cache_data(uint64_t offset, const void *buf, size_t len)
@@ -140,7 +161,10 @@ void LogCache::reset_cache_region(LogCacheSegment *seg)
     if (!device_io_ || seg == nullptr) {
         return;
     }
-    device_io_->reset_cache_region(seg->physical_base, cfg_.segment_bytes);
+    // For striped segments: reset all N zones
+    std::size_t zone_size = cfg_.zone_size_bytes > 0 ? cfg_.zone_size_bytes : cfg_.segment_bytes;
+    std::size_t reset_len = zone_size * seg->stripe_width_;
+    device_io_->reset_cache_region(seg->physical_bases[0], reset_len);
 }
 
 void LogCache::ensure_staging_buffer(size_t len)
@@ -446,7 +470,7 @@ LogCacheSegment* LogCache::alloc_segment(bool shrink)
     }
 
     // In async mode, keep 3 segments as buffer for GC/Evict to have room to work
-    constexpr size_t ASYNC_RESERVE_SEGMENTS = 3;
+    constexpr size_t ASYNC_RESERVE_SEGMENTS = 5;
     if (async_mode_ && free_pool.size() <= ASYNC_RESERVE_SEGMENTS) {
         return nullptr;  // Caller should trigger async GC/Evict
     }
@@ -640,9 +664,9 @@ bool LogCache::is_cache_filled() {
         static_cast<std::size_t>(std::ceil(total_segments *
                                            cfg_.free_ratio_low));
 
-    // In async mode, also consider reserve threshold
-    constexpr size_t ASYNC_RESERVE_SEGMENTS = 3;
-    if (async_mode_ && free_pool.size() <= ASYNC_RESERVE_SEGMENTS + 1) {
+    // In async mode, trigger GC early
+    constexpr size_t ASYNC_GC_TRIGGER_SEGMENTS = 10;
+    if (async_mode_ && free_pool.size() <= ASYNC_GC_TRIGGER_SEGMENTS) {
         return true;
     }
 
@@ -699,7 +723,13 @@ void LogCache::reset_segment_async(LogCacheSegment* s, cache_device_io_cb cb, vo
 
     // Create async context
     auto *ctx = new ResetSegmentAsyncCtx{this, s, cb, cb_arg};
-    device_io_->reset_cache_region_async(s->physical_base, cfg_.segment_bytes,
+    // For striped segments: reset all N zones
+    // Use zone_size * stripe_width to cover all zones (not zone_capacity)
+    std::size_t zone_size = cfg_.zone_size_bytes > 0 ? cfg_.zone_size_bytes : cfg_.segment_bytes;
+    std::size_t reset_len = zone_size * s->stripe_width_;
+    SPDK_NOTICELOG("reset_segment_async: seg=%p, physical_bases[0]=0x%lx, zone_size=%zu, stripe_width=%d, reset_len=%zu\n",
+           s, s->physical_bases[0], zone_size, s->stripe_width_, reset_len);
+    device_io_->reset_cache_region_async(s->physical_bases[0], reset_len,
                                           reset_segment_async_cb, ctx);
 }
 
@@ -794,8 +824,8 @@ void LogCache::evict_segment(LogCacheSegment* s)
     int evicted_blocks_for_victim = 0;
     /* 모든 valid page flush */
     if (s->valid_cnt == 0) {
-        printf("%ld\n", s->valid_cnt);
-        printf("No valid blocks to evict.\n");
+        SPDK_NOTICELOG("valid_cnt=%ld\n", s->valid_cnt);
+        SPDK_NOTICELOG("No valid blocks to evict.\n");
     }
     
     for (std::size_t i = 0; i < s->blocks.size(); ++i)
@@ -917,9 +947,22 @@ bool LogCache::need_gc_or_evict() const
     const std::size_t low_water =
         static_cast<std::size_t>(std::ceil(total_segments * cfg_.free_ratio_low));
 
-    // In async mode, also trigger GC/Evict when approaching reserve threshold
-    constexpr size_t ASYNC_RESERVE_SEGMENTS = 3;
-    if (async_mode_ && free_pool.size() <= ASYNC_RESERVE_SEGMENTS + 1) {
+    // Debug: periodically print free_pool size
+    static uint64_t check_count = 0;
+    if (++check_count % 100000 == 0) {
+        SPDK_NOTICELOG("GC check: free_pool=%zu, total_segments=%zu, low_water=%zu\n",
+               free_pool.size(), total_segments, low_water);
+    }
+
+    // In async mode, trigger GC early (before blocking host IO)
+    // GC_TRIGGER: start GC while host IO continues
+    // BLOCK threshold (in get_free_segment): stop host IO
+    constexpr size_t ASYNC_GC_TRIGGER_SEGMENTS = 10;  // Start GC at <= 10 free segments
+    if (async_mode_ && free_pool.size() <= ASYNC_GC_TRIGGER_SEGMENTS) {
+        static uint64_t gc_trigger_count = 0;
+        if (++gc_trigger_count % 1000 == 1) {
+            SPDK_NOTICELOG("GC triggered! free_pool=%zu <= %zu\n", free_pool.size(), ASYNC_GC_TRIGGER_SEGMENTS);
+        }
         return true;
     }
 
@@ -1014,7 +1057,8 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
 
             GcBlockInfo info;
             info.src_offset = block_offset(victim, i);
-            info.dst_offset = block_offset(result.target_seg, result.target_seg->write_ptr);
+            info.dst_idx = result.target_seg->write_ptr;  // Store index for striping
+            info.dst_offset = block_offset(result.target_seg, info.dst_idx);
             info.key = blk.key;
             info.src_idx = i;
             info.create_timestamp = blk.create_timestamp;
@@ -1049,33 +1093,43 @@ bool LogCache::prepare_evict(EvictPrepareResult &result)
         return true;
     }
 
-    // Group blocks by 64k chunks (based on evicted_blk_size)
-    const int EVICTED_BLOCK_SIZE = cfg_.evicted_blk_size;
-    std::map<uint64_t, EvictBlockInfo> chunk_map;
+    // Group blocks into 128k chunks (32 * 4k)
+    // Only create chunk if at least one block is valid
+    constexpr size_t CHUNK_BLOCKS = EvictBlockInfo::CHUNK_BLOCKS;  // 32
+    size_t num_chunks = (victim->blocks.size() + CHUNK_BLOCKS - 1) / CHUNK_BLOCKS;
 
-    for (std::size_t i = 0; i < victim->blocks.size(); ++i) {
-        auto &blk = victim->blocks[i];
-        if (!blk.valid) continue;
+    for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+        size_t start_blk = chunk_idx * CHUNK_BLOCKS;
+        size_t end_blk = std::min(start_blk + CHUNK_BLOCKS, victim->blocks.size());
 
-        uint64_t chunk_start = (blk.key / EVICTED_BLOCK_SIZE) * EVICTED_BLOCK_SIZE;
-
-        auto it = chunk_map.find(chunk_start);
-        if (it == chunk_map.end()) {
-            EvictBlockInfo info;
-            info.start_key = chunk_start;
-            info.valid_mask.resize(EVICTED_BLOCK_SIZE, false);
-            info.cache_locations.resize(EVICTED_BLOCK_SIZE, {nullptr, 0});
-            chunk_map[chunk_start] = std::move(info);
-            it = chunk_map.find(chunk_start);
+        // Check if any valid block in this chunk
+        bool has_valid = false;
+        for (size_t i = start_blk; i < end_blk; ++i) {
+            if (victim->blocks[i].valid) {
+                has_valid = true;
+                break;
+            }
         }
 
-        size_t offset_in_chunk = blk.key - chunk_start;
-        it->second.valid_mask[offset_in_chunk] = true;
-        it->second.cache_locations[offset_in_chunk] = {victim, i};
-    }
+        if (!has_valid) continue;  // Skip chunk with no valid blocks
 
-    for (auto &pair : chunk_map) {
-        result.chunks.push_back(std::move(pair.second));
+        EvictBlockInfo info;
+        info.cache_chunk_idx = chunk_idx;
+        info.valid_mask.resize(CHUNK_BLOCKS, false);
+        info.backend_keys.resize(CHUNK_BLOCKS, 0);
+        info.seg_indices.resize(CHUNK_BLOCKS, 0);
+
+        for (size_t i = start_blk; i < end_blk; ++i) {
+            size_t offset_in_chunk = i - start_blk;
+            auto &blk = victim->blocks[i];
+            info.seg_indices[offset_in_chunk] = i;
+            if (blk.valid) {
+                info.valid_mask[offset_in_chunk] = true;
+                info.backend_keys[offset_in_chunk] = blk.key;
+            }
+        }
+
+        result.chunks.push_back(std::move(info));
     }
 
     return true;
@@ -1090,8 +1144,8 @@ void LogCache::finalize_gc(GcPrepareResult &result)
     for (auto &info : result.blocks_to_copy) {
         auto &src_blk = victim->blocks[info.src_idx];
 
-        // Find the destination index from the offset
-        size_t dst_idx = (info.dst_offset - target->physical_base) / cache_block_size;
+        // Use stored destination index (needed for striping)
+        size_t dst_idx = info.dst_idx;
 
         // Update target block metadata
         auto &dst_blk = target->blocks[dst_idx];
@@ -1154,7 +1208,7 @@ void LogCache::finalize_evict(EvictPrepareResult &result)
         for (size_t i = 0; i < chunk.valid_mask.size(); ++i) {
             if (!chunk.valid_mask[i]) continue;
 
-            long key = chunk.start_key + i;
+            long key = chunk.backend_keys[i];
             auto it = mapping.find(key);
             if (it != mapping.end()) {
                 auto &blk = it->second.seg->blocks[it->second.idx];
@@ -1185,8 +1239,8 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
     for (auto &info : result.blocks_to_copy) {
         auto &src_blk = victim->blocks[info.src_idx];
 
-        // Find the destination index from the offset
-        size_t dst_idx = (info.dst_offset - target->physical_base) / cache_block_size;
+        // Use stored destination index (needed for striping)
+        size_t dst_idx = info.dst_idx;
 
         // Update target block metadata
         auto &dst_blk = target->blocks[dst_idx];
@@ -1244,7 +1298,7 @@ void LogCache::finalize_evict_async(EvictPrepareResult &result, cache_device_io_
         for (size_t i = 0; i < chunk.valid_mask.size(); ++i) {
             if (!chunk.valid_mask[i]) continue;
 
-            long key = chunk.start_key + i;
+            long key = chunk.backend_keys[i];
             auto it = mapping.find(key);
             if (it != mapping.end()) {
                 auto &blk = it->second.seg->blocks[it->second.idx];
