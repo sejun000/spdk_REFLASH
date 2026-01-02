@@ -1,4 +1,5 @@
 #include "log_cache_wrapper.h"
+#include "log_cache_config.h"
 
 #include <algorithm>
 #include <atomic>
@@ -30,6 +31,28 @@ extern "C" {
 
 #include "port/cache_device.h"
 #include "port/evict_policy_greedy.h"
+#include "port/evict_policy_cost_benefit.h"
+
+// Score functions for CbEvictPolicy (same as icache.cpp)
+static double score_age_evict(Segment *seg) {
+    return -static_cast<double>(seg->create_timestamp);
+}
+
+// Global variables for score_warm_first (set by LogCache during GC)
+extern uint64_t g_threshold;
+extern uint64_t g_timestamp;
+static constexpr double segments = 8192.0;
+
+static double score_warm_first(Segment *seg) {
+    if (g_threshold <= 0 || g_timestamp <= 0) {
+        // Fallback to simple age-based score if globals not set
+        return -static_cast<double>(seg->create_timestamp);
+    }
+    double u = seg->valid_cnt / segments;
+    if (u < 0.0001) u = 0.0001;  // Avoid division by zero
+    return std::min(g_threshold - (g_timestamp - seg->create_timestamp),
+                    g_timestamp - seg->create_timestamp) * (1 - u) / u;
+}
 #include "port/log_cache.h"
 #include "port/log_cache_segment.h"
 
@@ -238,25 +261,43 @@ struct ZoneQueue {
 		return !zone_opened && !open_in_progress;
 	}
 
-	bool can_submit(uint64_t offset, size_t len) const {
+	bool can_submit(uint64_t offset, size_t len, bool debug = false) const {
 		// Can't submit if zone is not opened
 		if (!zone_opened) {
+			if (debug) {
+				SPDK_NOTICELOG("can_submit: FAIL zone_opened=false, offset=%lu\n", offset);
+			}
 			return false;
 		}
 		// Can't submit if flush is in progress (wait for device WP to advance)
 		if (flush_in_progress) {
+			if (debug) {
+				SPDK_NOTICELOG("can_submit: FAIL flush_in_progress, offset=%lu\n", offset);
+			}
 			return false;
 		}
 		// Can't write to already written area (ZNS sequential write constraint)
 		if (offset < write_pointer) {
+			if (debug) {
+				SPDK_NOTICELOG("can_submit: FAIL offset=%lu < WP=%lu\n", offset, write_pointer);
+			}
 			return false;
 		}
 		if (is_aligned(offset, len)) {
 			// Aligned: can submit if within ZRWA window from flushed_wp (device WP)
-			return offset + len <= flushed_wp + ZONE_MAX_LBA_DISTANCE;
+			bool ok = offset + len <= flushed_wp + ZONE_MAX_LBA_DISTANCE;
+			if (debug && !ok) {
+				SPDK_NOTICELOG("can_submit: FAIL aligned offset+len=%lu > flushed_wp+1MB=%lu\n",
+					       offset + len, flushed_wp + ZONE_MAX_LBA_DISTANCE);
+			}
+			return ok;
 		} else {
 			// Non-aligned: can only submit if it's exactly at write_pointer
-			return offset == write_pointer;
+			bool ok = offset == write_pointer;
+			if (debug && !ok) {
+				SPDK_NOTICELOG("can_submit: FAIL non-aligned offset=%lu != WP=%lu\n", offset, write_pointer);
+			}
+			return ok;
 		}
 	}
 
@@ -424,9 +465,16 @@ public:
 		if (m_cache_zoned) {
 			m_cache_zone_blocks = spdk_bdev_get_zone_size(m_cache_bdev);
 		} else {
+#if FDP
+			// FDP mode: keep m_cache_zoned = false
+			// This skips zone open, ZRWA flush, and zone reset commands
+			m_cache_zone_blocks = 0x80000;  // 524288 blocks = 2GB (virtual zone size for eviction)
+			SPDK_NOTICELOG("FDP mode enabled: ZNS commands disabled\n");
+#else
 			// Fallback: force ZNS mode with hardcoded zone size
 			m_cache_zoned = true;
 			m_cache_zone_blocks = 0x80000;  // 524288 blocks = 2GB zone size
+#endif
 		}
 
 	}
@@ -875,7 +923,16 @@ public:
 				     cache_device_io_cb cb, void *cb_arg) override
 	{
 		// Check if ZNS and valid parameters
+		// For FDP mode (m_cache_zoned=false): skip zone reset but clear zone state
 		if (!m_cache_zoned || len == 0 || m_cache_zone_blocks == 0) {
+			// FDP mode: still need to clear zone state for reuse
+			if (m_cache_zone_blocks > 0 && len > 0) {
+				uint64_t start_zone = offset / (m_cache_zone_blocks * m_block_size);
+				uint64_t end_zone = (offset + len - 1) / (m_cache_zone_blocks * m_block_size);
+				for (uint64_t z = start_zone; z <= end_zone; ++z) {
+					clear_zone_state(z);
+				}
+			}
 			if (cb) {
 				cb(cb_arg, 0);
 			}
@@ -1567,7 +1624,7 @@ struct EvictIo {
 	int last_status;
 
 	// Parallel chunk processing - process N 128k chunks at once
-	static constexpr size_t PARALLEL_CHUNKS = 8;    // 8 * 128k = 1MB
+	static constexpr size_t PARALLEL_CHUNKS = 16;   // 16 * 128k = 2MB
 	static constexpr size_t CHUNK_SIZE = 32 * 4096; // 128k per chunk
 	size_t parallel_batch_start;   // Start index of current parallel batch
 	size_t parallel_batch_count;   // Number of chunks in current batch
@@ -1630,6 +1687,7 @@ public:
 		      const std::string& waf_log_path,
 		      const std::string& stat_log_path,
 		      double valid_rate_threshold,
+		      const std::string& cache_type,
 		      icache::SpdkCacheDevice *device)
 		: block_size_(block_size),
 		  device_(device),
@@ -1664,6 +1722,30 @@ public:
 		cfg.zone_capacity_bytes = zns_zone_capacity;
 		cfg.stripe_width = STRIPE_WIDTH;
 
+		// Select evict/compactor policy based on cache_type
+		std::unique_ptr<EvictPolicy> evictor;
+		std::unique_ptr<EvictPolicy> compactor;
+		double effective_valid_rate = valid_rate_threshold;
+		bool score_low_valid_first = false;
+
+		if (cache_type == "LOG_GREEDY_COST_BENEFIT_10" || cache_type == "LOG_GREEDY_COST_BENEFIT_11") {
+			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
+			compactor = std::make_unique<CbEvictPolicy>(score_warm_first);
+			if (cache_type == "LOG_GREEDY_COST_BENEFIT_10") {
+				effective_valid_rate = 0.6;
+				score_low_valid_first = true;
+			}
+			// LOG_GREEDY_COST_BENEFIT_11 uses valid_rate_threshold from parameter
+		} else if (cache_type == "LOG_COST_BENEFIT") {
+			evictor = std::make_unique<CbEvictPolicy>();
+		} else {
+			// Default: LOG_GREEDY
+			evictor = std::make_unique<GreedyEvictPolicy>();
+		}
+
+		SPDK_NOTICELOG("LogCacheAsync: cache_type=%s, valid_rate=%.2f, has_compactor=%d\n",
+			       cache_type.c_str(), effective_valid_rate, compactor != nullptr);
+
 		cache_ = std::make_unique<LogCache>(
 			cold_capacity,
 			cache_block_count,
@@ -1672,13 +1754,13 @@ public:
 			std::string{},
 			std::string{},
 			waf_path,
-			std::make_unique<GreedyEvictPolicy>(),
+			std::move(evictor),
 			&cfg,
 			nullptr,
-			valid_rate_threshold,
-			nullptr,
+			effective_valid_rate,
+			std::move(compactor),
 			0.0,
-			false,
+			score_low_valid_first,
 			stat_log_path,
 			device);
 		cache_->set_stats_prefix("icache");
@@ -2172,9 +2254,11 @@ static void evict_io_complete(EvictIo *io, int status)
 
 	auto on_complete = std::move(io->on_complete);
 	delete io;
+	SPDK_NOTICELOG("evict_io_complete: calling on_complete=%p\n", (void*)&on_complete);
 	if (on_complete) {
 		on_complete(status);
 	}
+	SPDK_NOTICELOG("evict_io_complete: done\n");
 }
 
 //==============================================================================
@@ -2531,6 +2615,7 @@ static void gc_start_batch(GcIo *io)
 	// Check if all batches done
 	if (io->batch_start >= blocks.size()) {
 		// All batches processed, finalize asynchronously
+		SPDK_NOTICELOG("GC: All batches done, finalizing (total_blocks=%zu)\n", blocks.size());
 		io->state = GcIoState::GC_SEGMENT_DONE;
 		io->ctx->cache->cache()->finalize_gc_async(io->prepare_result, gc_finalize_done, io);
 		return;
@@ -2543,6 +2628,11 @@ static void gc_start_batch(GcIo *io)
 	// Calculate batch size
 	size_t remaining = blocks.size() - io->batch_start;
 	io->batch_count = std::min(remaining, GcIo::BATCH_BLOCKS);
+
+	SPDK_NOTICELOG("GC: Starting batch %zu/%zu (batch_count=%zu)\n",
+		       io->batch_start / GcIo::BATCH_BLOCKS + 1,
+		       (blocks.size() + GcIo::BATCH_BLOCKS - 1) / GcIo::BATCH_BLOCKS,
+		       io->batch_count);
 
 	uint32_t block_size = io->ctx->block_size;
 
@@ -2562,6 +2652,7 @@ static void gc_start_batch(GcIo *io)
 	}
 
 	// Submit reads for this batch only
+	SPDK_NOTICELOG("GC: Submitting %zu reads for batch\n", io->batch_count);
 	for (size_t i = 0; i < io->batch_count; ++i) {
 		size_t block_idx = io->batch_start + i;
 		auto &blk = blocks[block_idx];
@@ -2581,11 +2672,13 @@ static void gc_start_batch(GcIo *io)
 		int rc = io->ctx->device->read_cache_async(blk.src_offset, dest, block_size,
 							   gc_read_done, read_ctx);
 		if (rc != 0) {
+			SPDK_ERRLOG("GC: read_cache_async failed for block %zu, rc=%d\n", block_idx, rc);
 			delete read_ctx;
 			io->last_status = rc;
 			io->completed_reads++;
 		}
 	}
+	SPDK_NOTICELOG("GC: All %zu reads submitted, completed_reads=%zu\n", io->batch_count, io->completed_reads);
 
 	// Check if all reads completed synchronously (error case)
 	if (io->completed_reads >= io->batch_count && io->last_status != 0) {
@@ -2602,10 +2695,14 @@ static void gc_read_done(void *cb_arg, int status)
 	};
 	auto *ctx = static_cast<GcReadCtx *>(cb_arg);
 	GcIo *io = ctx->io;
+	size_t read_idx = ctx->idx;
 	delete ctx;
 
-	if (status != 0 && io->last_status == 0) {
-		io->last_status = status;
+	if (status != 0) {
+		SPDK_ERRLOG("GC: read_done failed for idx=%zu, status=%d\n", read_idx, status);
+		if (io->last_status == 0) {
+			io->last_status = status;
+		}
 	}
 
 	io->completed_reads++;
@@ -2614,6 +2711,7 @@ static void gc_read_done(void *cb_arg, int status)
 
 	// Check if current batch reads are done
 	if (io->completed_reads >= io->batch_count) {
+		SPDK_NOTICELOG("GC: All %zu reads done, last_status=%d\n", io->batch_count, io->last_status);
 		// Current batch reads done, start writes for this batch
 		if (io->last_status != 0) {
 			io->ctx->cache->set_gc_in_progress(false);
@@ -2635,6 +2733,9 @@ static void gc_read_done(void *cb_arg, int status)
 		io->completed_16k_writes = 0;
 		io->current_leftover_idx = 0;
 		io->completed_writes = 0;
+
+		SPDK_NOTICELOG("GC: Starting writes - 16K_chunks=%zu, leftover_blocks=%zu\n",
+			       io->num_16k_chunks, io->leftover_blocks);
 
 		// If no 16KB chunks, start leftover immediately (sequential)
 		if (io->num_16k_chunks == 0) {
@@ -2697,8 +2798,11 @@ static void gc_read_done(void *cb_arg, int status)
 			}
 		}
 
+		SPDK_NOTICELOG("GC: All 16K writes submitted, completed_16k=%zu\n", io->completed_16k_writes);
+
 		// Check if all 16KB writes completed synchronously (error case)
 		if (io->completed_16k_writes >= io->num_16k_chunks) {
+			SPDK_NOTICELOG("GC: All 16K writes done synchronously (error case?)\n");
 			if (io->leftover_blocks > 0) {
 				gc_submit_next_leftover(io);
 			} else {
@@ -2776,8 +2880,11 @@ static void gc_write_done(void *cb_arg, int status)
 	}
 	delete ctx;
 
-	if (status != 0 && io->last_status == 0) {
-		io->last_status = status;
+	if (status != 0) {
+		SPDK_ERRLOG("GC: write_done failed, is_16k=%d, status=%d\n", is_16k_write, status);
+		if (io->last_status == 0) {
+			io->last_status = status;
+		}
 	}
 
 	if (is_16k_write) {
@@ -2786,11 +2893,14 @@ static void gc_write_done(void *cb_arg, int status)
 
 		// Check if all 16KB chunks done
 		if (io->completed_16k_writes >= io->num_16k_chunks) {
+			SPDK_NOTICELOG("GC: All 16K writes done (completed=%zu/%zu), starting leftovers\n",
+				       io->completed_16k_writes, io->num_16k_chunks);
 			// Start leftover sequential writes (if any)
 			if (io->leftover_blocks > 0) {
 				gc_submit_next_leftover(io);
 			} else {
 				// No leftovers, move to next batch
+				SPDK_NOTICELOG("GC: No leftovers, moving to next batch\n");
 				io->state = GcIoState::WRITE_GC_DONE;
 				io->batch_start += io->batch_count;
 				gc_start_batch(io);
@@ -3171,6 +3281,11 @@ static void process_pending_writes(log_cache_ctx *ctx)
 {
 	LogCacheAsync *cache = ctx->cache.get();
 
+	SPDK_NOTICELOG("process_pending_writes: pending=%zu, need_gc_or_evict=%d, gc_in_progress=%d, evict_in_progress=%d, flush_pending=%d, free_segs=%zu\n",
+		       cache->pending_writes().size(), cache->need_gc_or_evict(),
+		       cache->gc_in_progress(), cache->evict_in_progress(),
+		       cache->flush_pending(), cache->cache()->free_segment_count());
+
 	// Retry pending flush_write_buffer if needed
 	if (cache->flush_pending() && !cache->need_gc_or_evict()) {
 		cache->set_flush_pending(false);
@@ -3180,6 +3295,7 @@ static void process_pending_writes(log_cache_ctx *ctx)
 	while (!cache->pending_writes().empty()) {
 		if (cache->need_gc_or_evict()) {
 			// Need more GC/Evict
+			SPDK_NOTICELOG("process_pending_writes: need more gc/evict\n");
 			if (!cache->gc_in_progress() && !cache->evict_in_progress()) {
 				start_gc_or_evict(ctx, [ctx](int status) {
 					process_pending_writes(ctx);
@@ -3195,6 +3311,7 @@ static void process_pending_writes(log_cache_ctx *ctx)
 		io->state = CacheIoState::HOST_WRITE_SUBMIT;
 		host_write_next_block(io);
 	}
+	SPDK_NOTICELOG("process_pending_writes: done, pending=%zu\n", cache->pending_writes().size());
 }
 
 //==============================================================================
@@ -3225,7 +3342,10 @@ is_supported_cache_type(const char *type)
 	if (type == nullptr || type[0] == '\0') {
 		return true;
 	}
-	return strcasecmp(type, "LOG_GREEDY") == 0;
+	return strcasecmp(type, "LOG_GREEDY") == 0 ||
+	       strcasecmp(type, "LOG_GREEDY_COST_BENEFIT_10") == 0 ||
+	       strcasecmp(type, "LOG_GREEDY_COST_BENEFIT_11") == 0 ||
+	       strcasecmp(type, "LOG_COST_BENEFIT") == 0;
 }
 
 //==============================================================================
@@ -3268,6 +3388,8 @@ log_cache_ctx_create(struct spdk_bdev_desc *cache_desc,
 		return nullptr;
 	}
 
+	std::string cache_type_str = cache_type ? cache_type : "LOG_GREEDY";
+
 	try {
 		ctx->cache = std::make_unique<LogCacheAsync>(
 			cold_capacity_bytes,
@@ -3278,6 +3400,7 @@ log_cache_ctx_create(struct spdk_bdev_desc *cache_desc,
 			waf_path,
 			stat_path,
 			valid_rate_threshold,
+			cache_type_str,
 			ctx->device.get());
 	} catch (const std::exception &ex) {
 		SPDK_ERRLOG("icache: failed to construct LogCacheAsync: %s\n", ex.what());

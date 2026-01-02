@@ -7,13 +7,17 @@ RPC_SOCKET=${SPDK_RPC_SOCKET:-/var/tmp/spdk.sock}
 RPC=("$RPC_BIN" "-s" "$RPC_SOCKET")
 export PYTHONPATH="${PYTHONPATH:-}:$ROOT_DIR/python"
 
+# FDP SSD as cache, regular SSD as backend
 CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
 BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
 CACHE_CTRL=${CACHE_CTRL:-cache_ctrl}
 BACKEND_CTRL=${BACKEND_CTRL:-backend_ctrl}
 CACHE_NS=${CACHE_NS:-${CACHE_CTRL}n1}
 BACKEND_NS=${BACKEND_NS:-${BACKEND_CTRL}n1}
+
+# FDP cache size: 200GB (passed from run_tier_fdp.sh)
 CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-200}
+
 MAX_PENDING_IO=${MAX_PENDING_IO:-64}
 ICACHE_NAME=${ICACHE_NAME:-icache0}
 # NVMe-oF TCP is primary (lower latency for local testing)
@@ -30,7 +34,7 @@ NVMF_SERIAL=${NVMF_SERIAL:-ICACHE0001}
 ICACHE_CACHE_TYPE=${ICACHE_CACHE_TYPE:-LOG_GREEDY}
 ICACHE_WAF_LOG=${ICACHE_WAF_LOG:-$ROOT_DIR/ssd_waf/icache_waf.log}
 ICACHE_STAT_LOG=${ICACHE_STAT_LOG:-}
-ICACHE_VALID_RATE_THRESHOLD=${ICACHE_VALID_RATE_THRESHOLD:-0.0}
+ICACHE_VALID_RATE_THRESHOLD=${ICACHE_VALID_RATE_THRESHOLD:-0.9}
 
 if [[ -n "$ICACHE_WAF_LOG" ]]; then
     mkdir -p "$(dirname "$ICACHE_WAF_LOG")"
@@ -42,7 +46,7 @@ if [[ -n "$ICACHE_STAT_LOG" ]]; then
 fi
 
 log() {
-    echo "[create_tier] $*"
+    echo "[create_tier_fdp] $*"
 }
 
 rpc_call() {
@@ -58,49 +62,14 @@ rpc_call() {
 	fi
 }
 
-nsid_from_name() {
-	local ns=$1
-	if [[ $ns =~ n([0-9]+) ]]; then
-		echo "${BASH_REMATCH[1]}"
-	else
-		echo "1"
-	fi
-}
-
-# Pre-format devices using nvme-cli (before SPDK takes over)
-# This should be called BEFORE starting spdk_tgt
-pre_format_devices() {
-	log "Pre-formatting devices using nvme-cli..."
-
-	# Get NVMe device paths from BDF
-	local cache_dev=$(ls /sys/bus/pci/devices/${CACHE_BDF}/nvme/*/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null)
-	local backend_dev=$(ls /sys/bus/pci/devices/${BACKEND_BDF}/nvme/*/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null)
-
-	if [[ -n "$cache_dev" ]] && [[ -e "/dev/${cache_dev}n1" ]]; then
-		log "Resetting ZNS zones on /dev/${cache_dev}n1"
-		sudo nvme format /dev/${cache_dev}n1 -s 2 --force > /dev/null || \
-			log "Zone reset failed or not ZNS device, continuing..."
-	else
-		log "Cache device not found at ${CACHE_BDF}, skipping reset"
-	fi
-
-	if [[ -n "$backend_dev" ]] && [[ -e "/dev/${backend_dev}n1" ]]; then
-		log "Formatting /dev/${backend_dev}n1"
-		sudo nvme format "/dev/${backend_dev}n1" -l 0 -s 2 --force>/dev/null || \
-			log "Format failed, continuing..."
-	else
-		log "Backend device not found at ${BACKEND_BDF}, skipping format"
-	fi
-
-	sleep 2
-}
-
 sleep 2
 CACHE_SPLIT_MB=$((CACHE_SPLIT_GB * 1024))
 if (( CACHE_SPLIT_MB <= 0 )); then
     echo "Invalid CACHE_SPLIT_GB ($CACHE_SPLIT_GB)" >&2
     exit 1
 fi
+
+log "FDP Mode: Cache ${CACHE_SPLIT_GB}GB, Backend full capacity"
 
 log "Attaching cache controller ${CACHE_CTRL} at ${CACHE_BDF}"
 if ! rpc_call "attach cache controller ${CACHE_CTRL}" \
@@ -115,19 +84,19 @@ if ! rpc_call "attach backend controller ${BACKEND_CTRL}" \
 	log "Ignoring attach failure (controller may already exist)"
 fi
 sleep 2
-# Use full namespace instead of split partition (for ZNS zone management support)
-# The cache size limit will be enforced in icache module via CACHE_SPLIT_GB
+
+# Use full namespace (FDP doesn't use zones, cache size enforced in icache module)
 CACHE_DEVICE=${CACHE_NS}
-log "Using full namespace ${CACHE_DEVICE} (limit ${CACHE_SPLIT_GB}GB enforced in icache)"
+log "Using FDP cache namespace ${CACHE_DEVICE} (limit ${CACHE_SPLIT_GB}GB enforced in icache)"
 
 cat <<MSG
-[create_tier] Done.
- Cache bdev : ${CACHE_DEVICE}
- Backend bdev : ${BACKEND_NS}
- Max pending IO (for icache module) : ${MAX_PENDING_IO}
- Cache policy : ${ICACHE_CACHE_TYPE}
- WAF log path : ${ICACHE_WAF_LOG}
-Creating icache bdev \"${ICACHE_NAME}\" (cache=${CACHE_DEVICE}, backend=${BACKEND_NS})
+[create_tier_fdp] Done.
+ Cache bdev (FDP) : ${CACHE_DEVICE}
+ Backend bdev     : ${BACKEND_NS}
+ Max pending IO   : ${MAX_PENDING_IO}
+ Cache policy     : ${ICACHE_CACHE_TYPE}
+ WAF log path     : ${ICACHE_WAF_LOG}
+Creating icache bdev "${ICACHE_NAME}" (cache=${CACHE_DEVICE}, backend=${BACKEND_NS})
 MSG
 
 ICACHE_RPC_ARGS=(
@@ -187,13 +156,10 @@ if [[ "${NVMF_ENABLE}" != "0" ]]; then
 fi
 
 # Fallback: Expose icache bdev via ublk (if NVMF failed or UBLK_ENABLE=1)
-# ublk uses core 0, log_worker uses core 1 (dedicated)
 UBLK_CPUMASK=${UBLK_CPUMASK:-0x1}  # Core 0 only for ublk
 
 if [[ "${DEVICE_EXPOSED}" == "0" ]] || [[ "${UBLK_ENABLE}" != "0" ]]; then
 	sleep 2
-	# Create ublk target first with cpumask (required before starting disks)
-	# Core 1 is reserved for log_wrapper worker thread
 	if ! rpc_call "create ublk target on core 0" ublk_create_target -m "${UBLK_CPUMASK}"; then
 		log "ublk_create_target failed (may already exist), continuing"
 	fi

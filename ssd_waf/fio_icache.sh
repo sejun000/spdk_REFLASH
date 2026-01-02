@@ -1,11 +1,14 @@
 #!/bin/bash
 
-# icache 디바이스를 찾아 fio 실행
+# icache 디바이스를 찾아 fio 실행 + 검증
 # ublk (/dev/ublkb0) 또는 NVMe-oF (ICACHE) 사용
 
 UBLK_DEV_ID=${UBLK_DEV_ID:-0}
 UBLK_DEVICE="/dev/ublkb${UBLK_DEV_ID}"
 RUNTIME=${RUNTIME:-120}  # Default 2 minutes
+TEST_SIZE=${TEST_SIZE:-10G}  # 검증용 테스트 크기
+VERIFY_ONLY=${VERIFY_ONLY:-0}  # 1이면 검증만 수행
+SKIP_VERIFY=${SKIP_VERIFY:-0}  # 1이면 검증 스킵
 LOG_PREFIX="fio_bw_$(date +%Y%m%d_%H%M%S)"
 
 # ublk 디바이스 우선 확인
@@ -13,16 +16,46 @@ if [ -e "$UBLK_DEVICE" ]; then
     DEVICE="$UBLK_DEVICE"
     echo "ublk 디바이스 발견: $DEVICE"
 else
-    # Fallback: NVMe-oF 디바이스 검색 (ICACHE 또는 NULL)
-    DEVICE=$(sudo nvme list 2>/dev/null | grep -iE "ICACHE|NULL" | awk '{print $1}')
+    # Fallback: NVMe-oF 디바이스 검색 (ICACHE, FTLBDEV, 또는 NULL)
+    DEVICE=$(sudo nvme list 2>/dev/null | grep -iE "ICACHE|FTLBDEV|NULL" | awk '{print $1}')
     if [ -z "$DEVICE" ]; then
-        echo "디바이스를 찾을 수 없습니다. (ublk: $UBLK_DEVICE, NVMe: ICACHE/NULL)"
+        echo "디바이스를 찾을 수 없습니다. (ublk: $UBLK_DEVICE, NVMe: ICACHE/FTLBDEV/NULL)"
         exit 1
     fi
     echo "NVMe-oF 디바이스 발견: $DEVICE"
 fi
 
-echo "fio random 4k write ${RUNTIME}s 시작..."
+# 검증만 수행 모드
+if [ "${VERIFY_ONLY}" == "1" ]; then
+    echo "=========================================="
+    echo "  검증만 수행 (이전 write 데이터 확인)"
+    echo "=========================================="
+    sudo fio --name=verify_only \
+        --filename="$DEVICE" \
+        --ioengine=libaio \
+        --direct=1 \
+        --bs=4k \
+        --rw=randread \
+        --size=${TEST_SIZE} \
+        --numjobs=4 \
+        --iodepth=32 \
+        --verify=crc32c \
+        --verify_only \
+        --group_reporting
+
+    if [ $? -eq 0 ]; then
+        echo "검증 성공!"
+    else
+        echo "검증 실패!"
+        exit 1
+    fi
+    exit 0
+fi
+
+echo "=========================================="
+echo "  Phase 1: Write with verification pattern"
+echo "=========================================="
+echo "fio random 4k write ${RUNTIME}s (with crc32c verify pattern)..."
 echo "BW log: ${LOG_PREFIX}_bw.*.log"
 
 sudo fio --name=random_test \
@@ -31,13 +64,62 @@ sudo fio --name=random_test \
     --direct=1 \
     --bs=4k \
     --rw=randwrite \
+    --size=${TEST_SIZE} \
     --runtime=${RUNTIME} \
     --time_based \
     --numjobs=4 \
     --iodepth=32 \
+    --verify=crc32c \
+    --do_verify=0 \
     --group_reporting \
     --write_bw_log=${LOG_PREFIX} \
     --log_avg_msec=1000
+
+WRITE_STATUS=$?
+
+if [ ${WRITE_STATUS} -ne 0 ]; then
+    echo "Write 실패!"
+    exit 1
+fi
+
+# 검증 스킵 옵션
+if [ "${SKIP_VERIFY}" == "1" ]; then
+    echo "검증 스킵 (SKIP_VERIFY=1)"
+else
+    echo ""
+    echo "=========================================="
+    echo "  Phase 2: Read and Verify"
+    echo "=========================================="
+    echo "쓴 데이터 읽어서 검증 중..."
+
+    sudo fio --name=verify_read \
+        --filename="$DEVICE" \
+        --ioengine=libaio \
+        --direct=1 \
+        --bs=4k \
+        --rw=randread \
+        --size=${TEST_SIZE} \
+        --numjobs=4 \
+        --iodepth=32 \
+        --verify=crc32c \
+        --verify_only \
+        --group_reporting
+
+    VERIFY_STATUS=$?
+
+    if [ ${VERIFY_STATUS} -eq 0 ]; then
+        echo ""
+        echo "=========================================="
+        echo "  검증 성공! 데이터 정합성 확인됨"
+        echo "=========================================="
+    else
+        echo ""
+        echo "=========================================="
+        echo "  검증 실패! 데이터 불일치 발생"
+        echo "=========================================="
+        exit 1
+    fi
+fi
 
 # Generate graph if python available
 if command -v python3 &> /dev/null; then
