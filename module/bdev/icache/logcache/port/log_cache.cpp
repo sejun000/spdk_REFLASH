@@ -374,7 +374,7 @@ void LogCache::append_block(int stream_id, long key, int lba_sz, const void *pay
     }
 }
 
-bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64_t *cache_offset)
+bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64_t *cache_offset, int *out_stream_id)
 {
     periodic();
     ghost_cache.access(key);
@@ -418,6 +418,10 @@ bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64
     write_size_to_cache += lba_sz;
 
     *cache_offset = dst_offset;
+    // Return the actual stream_id (segment's class_num) for FDP placement handle
+    if (out_stream_id) {
+        *out_stream_id = seg->get_class_num();
+    }
     return true;
 }
 
@@ -469,10 +473,12 @@ LogCacheSegment* LogCache::alloc_segment(bool shrink)
         check_and_evict_if_needed();     // proactive (no-op in async mode)
     }
 
-    // In async mode, keep 3 segments as buffer for GC/Evict to have room to work
+    // In async mode, keep segments reserved for GC/Evict to have room to work
+    // shrink=true means host write, shrink=false means GC
+    // Only block host writes when low on segments, GC must always be able to allocate
     constexpr size_t ASYNC_RESERVE_SEGMENTS = 5;
-    if (async_mode_ && free_pool.size() <= ASYNC_RESERVE_SEGMENTS) {
-        return nullptr;  // Caller should trigger async GC/Evict
+    if (async_mode_ && shrink && free_pool.size() <= ASYNC_RESERVE_SEGMENTS) {
+        return nullptr;  // Host write blocked - caller should trigger async GC/Evict
     }
 
     if (free_pool.empty()) {
@@ -1041,6 +1047,13 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
         // Prepare GC - collect valid blocks to copy
         result.target_seg = get_segment_to_active_stream(true, result.gc_stream_id);
 
+        // If no target segment available, fall back to evict-only
+        if (!result.target_seg) {
+            result.do_evict_only = true;
+            result.blocks_to_copy.clear();
+            return true;
+        }
+
         for (std::size_t i = 0; i < victim->blocks.size(); ++i) {
             auto &blk = victim->blocks[i];
             if (!blk.valid) continue;
@@ -1057,6 +1070,13 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
                 int assigned_class_num = result.target_seg->get_class_num();
                 gc_active_seg.erase(result.target_seg->get_class_num());
                 result.target_seg = get_segment_to_active_stream(true, assigned_class_num);
+
+                // If no more segments available, fall back to evict-only
+                if (!result.target_seg) {
+                    result.do_evict_only = true;
+                    result.blocks_to_copy.clear();
+                    break;
+                }
             }
 
             GcBlockInfo info;

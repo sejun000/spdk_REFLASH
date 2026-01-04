@@ -32,6 +32,7 @@ extern "C" {
 #include "port/cache_device.h"
 #include "port/evict_policy_greedy.h"
 #include "port/evict_policy_cost_benefit.h"
+#include "port/istream.h"
 
 // Score functions for CbEvictPolicy (same as icache.cpp)
 static double score_age_evict(Segment *seg) {
@@ -227,6 +228,7 @@ struct ZoneQueueEntry {
 	bool is_write;
 	struct iovec *iovs;  // For writev pending queue
 	int iovcnt;          // For writev pending queue
+	int placement_handle;  // FDP placement handle
 };
 
 // Zone Queue - manages WP-based throttling per zone
@@ -738,8 +740,9 @@ public:
 
 	// Scatter-gather write to cache (16KB aligned, no memcpy)
 	// Uses pending queue if can't submit immediately
+	// placement_handle: FDP placement handle (0 ~ FDP_NUM_PLACEMENT_HANDLES-1)
 	int writev_cache_async(uint64_t offset, struct iovec *iovs, int iovcnt, size_t total_len,
-			       cache_device_io_cb cb, void *cb_arg)
+			       cache_device_io_cb cb, void *cb_arg, int placement_handle = 0)
 	{
 
 		if (!m_cache_ch || total_len == 0) {
@@ -762,6 +765,7 @@ public:
 			entry.is_write = true;
 			entry.iovs = iovs;
 			entry.iovcnt = iovcnt;
+			entry.placement_handle = placement_handle;
 			zq.pending.push(entry);
 
 			// Trigger zone open with ZRWA
@@ -783,15 +787,16 @@ public:
 			entry.is_write = true;
 			entry.iovs = iovs;
 			entry.iovcnt = iovcnt;
+			entry.placement_handle = placement_handle;
 			zq.pending.push(entry);
 			return 0;
 		}
 
-		return submit_writev_direct(zone_id, offset, iovs, iovcnt, total_len, cb, cb_arg);
+		return submit_writev_direct(zone_id, offset, iovs, iovcnt, total_len, cb, cb_arg, placement_handle);
 	}
 
 	int submit_writev_direct(uint64_t zone_id, uint64_t offset, struct iovec *iovs, int iovcnt,
-				 size_t total_len, cache_device_io_cb cb, void *cb_arg)
+				 size_t total_len, cache_device_io_cb cb, void *cb_arg, int placement_handle = 0)
 	{
 		assert(iovs != nullptr && "submit_writev_direct: iovs is NULL");
 		for (int i = 0; i < iovcnt; ++i) {
@@ -816,9 +821,22 @@ public:
 		ctx->user_cb = cb;
 		ctx->user_cb_arg = cb_arg;
 
-		int rc = spdk_bdev_writev_blocks(m_cache_desc, m_cache_ch, iovs, iovcnt,
+		int rc;
+#if FDP
+		// FDP mode: use extended write with placement handle
+		struct spdk_bdev_ext_io_opts opts = {};
+		opts.size = sizeof(opts);
+		opts.nvme_cdw12.write.dtype = 2;  // Directive Type = FDP (Data Placement)
+		opts.nvme_cdw13.write.dspec = static_cast<uint16_t>(placement_handle);  // Placement Handle ID
+
+		rc = spdk_bdev_writev_blocks_ext(m_cache_desc, m_cache_ch, iovs, iovcnt,
 						 block_offset, num_blocks,
-						 zone_async_io_completion, ctx);
+						 zone_async_io_completion, ctx, &opts);
+#else
+		rc = spdk_bdev_writev_blocks(m_cache_desc, m_cache_ch, iovs, iovcnt,
+					     block_offset, num_blocks,
+					     zone_async_io_completion, ctx);
+#endif
 		if (rc) {
 			delete ctx;
 			zq.remove_inflight(offset);
@@ -1186,7 +1204,8 @@ private:
 				// This is a writev request - use submit_writev_direct
 				rc = submit_writev_direct(zone_id, submit_entry.offset,
 							  submit_entry.iovs, submit_entry.iovcnt,
-							  submit_entry.len, submit_entry.cb, submit_entry.cb_arg);
+							  submit_entry.len, submit_entry.cb, submit_entry.cb_arg,
+							  submit_entry.placement_handle);
 			} else {
 				// Regular write request
 				zq.add_inflight(submit_entry.offset, submit_entry.len);
@@ -1595,6 +1614,7 @@ struct GcIo {
 	size_t num_16k_chunks;       // Number of 16KB aligned chunks in current batch
 	size_t leftover_blocks;      // Number of leftover blocks (0-3)
 	size_t completed_16k_writes; // Completed 16KB chunk writes
+	size_t expected_16k_writes;  // Total expected writes (including stripe-split individual writes)
 	size_t current_leftover_idx; // Current leftover index being written (sequential)
 
 	// Staging buffer for current batch (DMA-capable, hugepage)
@@ -1605,7 +1625,8 @@ struct GcIo {
 	std::function<void(int)> on_complete;
 
 	GcIo() : batch_start(0), batch_count(0), num_16k_chunks(0), leftover_blocks(0),
-	         completed_16k_writes(0), current_leftover_idx(0), staging(nullptr), staging_size(0) {}
+	         completed_16k_writes(0), expected_16k_writes(0), current_leftover_idx(0),
+	         staging(nullptr), staging_size(0) {}
 	~GcIo() {
 		if (staging) {
 			icache::dma_pool_free(staging, staging_size);
@@ -1713,20 +1734,32 @@ public:
 			}
 		}
 
-		// Hardcoded ZNS values for the test device
-		static constexpr uint64_t ZNS_ZONE_SIZE_BLOCKS = 0x80000;      // 524288 blocks
-		static constexpr uint64_t ZNS_ZONE_CAPACITY_BLOCKS = 0x43500;  // 275712 blocks
-		const uint64_t zns_zone_size = ZNS_ZONE_SIZE_BLOCKS * block_size;
-		const uint64_t zns_zone_capacity = ZNS_ZONE_CAPACITY_BLOCKS * block_size;
+		// Zone configuration for ZNS vs FDP
+		static constexpr uint64_t ZNS_ZONE_SIZE_BLOCKS = 0x80000;      // 524288 blocks = 2GB
+		static constexpr uint64_t ZNS_ZONE_CAPACITY_BLOCKS = 0x43500;  // 275712 blocks = ~1.07GB
+		static constexpr uint64_t FDP_ZONE_SIZE_BLOCKS = 0x80000;      // 524288 blocks = 2GB
+
+#if FDP
+		// FDP mode: zone_size == zone_capacity (no holes in address space)
+		zone_size_bytes = FDP_ZONE_SIZE_BLOCKS * block_size;
+		zone_capacity_bytes = FDP_ZONE_SIZE_BLOCKS * block_size;  // Same as zone_size!
+		SPDK_NOTICELOG("FDP mode: zone_size=zone_capacity=%lu bytes\n", zone_size_bytes);
+#else
+		// ZNS mode: zone_capacity < zone_size
+		zone_size_bytes = ZNS_ZONE_SIZE_BLOCKS * block_size;
+		zone_capacity_bytes = ZNS_ZONE_CAPACITY_BLOCKS * block_size;
+		SPDK_NOTICELOG("ZNS mode: zone_size=%lu, zone_capacity=%lu bytes\n",
+			       zone_size_bytes, zone_capacity_bytes);
+#endif
 
 		// ZNS with striping: segment spans STRIPE_WIDTH zones
 		// segment_bytes = zone_capacity * stripe_width (for legacy, but now calculated in LogCache)
 		// zone_capacity_bytes = writable capacity per zone
 		// zone_size_bytes = zone address space size (for alignment)
 		Config cfg;
-		cfg.segment_bytes = zns_zone_capacity;  // Single zone capacity (legacy)
-		cfg.zone_size_bytes = zns_zone_size;
-		cfg.zone_capacity_bytes = zns_zone_capacity;
+		cfg.segment_bytes = zone_capacity_bytes;  // Single zone capacity (legacy)
+		cfg.zone_size_bytes = zone_size_bytes;
+		cfg.zone_capacity_bytes = zone_capacity_bytes;
 		cfg.stripe_width = STRIPE_WIDTH;
 
 		// Select evict/compactor policy based on cache_type
@@ -1750,8 +1783,12 @@ public:
 			evictor = std::make_unique<GreedyEvictPolicy>();
 		}
 
-		SPDK_NOTICELOG("LogCacheAsync: cache_type=%s, valid_rate=%.2f, has_compactor=%d\n",
-			       cache_type.c_str(), effective_valid_rate, compactor != nullptr);
+		// Create IStream policy for stream separation (same as icache.cpp)
+		set_stream_interval(static_cast<uint64_t>(cache_block_count));
+		IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+
+		SPDK_NOTICELOG("LogCacheAsync: cache_type=%s, valid_rate=%.2f, has_compactor=%d, istream=%p\n",
+			       cache_type.c_str(), effective_valid_rate, compactor != nullptr, input_stream_policy);
 
 		cache_ = std::make_unique<LogCache>(
 			cold_capacity,
@@ -1763,7 +1800,7 @@ public:
 			waf_path,
 			std::move(evictor),
 			&cfg,
-			nullptr,
+			input_stream_policy,
 			effective_valid_rate,
 			std::move(compactor),
 			0.0,
@@ -1823,11 +1860,12 @@ public:
 		uint32_t block_idx;
 		uint64_t key;
 		const uint8_t *buf;
+		int stream_id;  // For FDP placement handle
 	};
 
 	// Add block to write buffer, flush when 1MB accumulated
-	void buffer_add_block(CacheIo *io, uint32_t block_idx, uint64_t key, const uint8_t *buf) {
-		write_buffer_.push_back({io, block_idx, key, buf});
+	void buffer_add_block(CacheIo *io, uint32_t block_idx, uint64_t key, const uint8_t *buf, int stream_id = 0) {
+		write_buffer_.push_back({io, block_idx, key, buf, stream_id});
 		if (write_buffer_.size() * block_size_ >= WRITE_BUFFER_SIZE) {
 			flush_write_buffer();
 		}
@@ -1916,6 +1954,7 @@ static void cache_io_complete(CacheIo *io, int status);
 struct WriteBufferFlushCtx {
 	std::vector<LogCacheAsync::BufferedBlock> blocks;
 	std::vector<uint64_t> cache_offsets;
+	std::vector<int> stream_ids;  // For FDP placement handle
 	// Track IOs and their block counts in this flush
 	std::unordered_map<CacheIo*, size_t> io_block_counts;
 	// For split writes: track outstanding write count
@@ -1929,6 +1968,7 @@ struct ZoneWriteCtx {
 	struct iovec *iovs;
 	int iovcnt;
 	size_t write_size;  // bytes for this write
+	int placement_handle;  // FDP placement handle for this write
 };
 
 // Outstanding IO tracking for queue depth measurement
@@ -2007,8 +2047,9 @@ void LogCacheAsync::flush_write_buffer()
 	for (size_t i = 0; i < write_buffer_.size(); i++) {
 		auto &blk = write_buffer_[i];
 		uint64_t cache_offset;
+		int stream_id = 0;
 		if (!cache_->append_block_metadata(0, static_cast<long>(blk.key),
-						   static_cast<int>(block_size), &cache_offset)) {
+						   static_cast<int>(block_size), &cache_offset, &stream_id)) {
 			// No free segments - need GC/Evict
 			if (flush_block_count == 0) {
 				block_start_tsc = spdk_get_ticks();
@@ -2022,6 +2063,7 @@ void LogCacheAsync::flush_write_buffer()
 			return;
 		}
 		flush_ctx->cache_offsets.push_back(cache_offset);
+		flush_ctx->stream_ids.push_back(stream_id);
 		buf_ptrs.push_back(blk.buf);
 	}
 
@@ -2056,6 +2098,7 @@ void LogCacheAsync::flush_write_buffer()
 		size_t start_idx;
 		size_t count;
 		uint64_t first_offset;
+		int stream_id;  // For FDP placement handle
 	};
 	std::vector<WriteGroup> groups;
 
@@ -2064,6 +2107,7 @@ void LogCacheAsync::flush_write_buffer()
 		WriteGroup group;
 		group.start_idx = i;
 		group.first_offset = flush_ctx->cache_offsets[i];
+		group.stream_id = flush_ctx->stream_ids[i];
 		group.count = 1;
 
 		// Calculate zone boundary for this offset
@@ -2071,10 +2115,11 @@ void LogCacheAsync::flush_write_buffer()
 		uint64_t zone_start = zone_id * zone_size;
 		uint64_t zone_end = zone_start + zone_capacity;
 
-		// Add consecutive blocks that stay within zone capacity
+		// Add consecutive blocks that stay within zone capacity AND same stream_id
 		while (i + group.count < total_blocks) {
 			uint64_t expected_next = group.first_offset + group.count * block_size;
 			uint64_t actual_next = flush_ctx->cache_offsets[i + group.count];
+			int next_stream_id = flush_ctx->stream_ids[i + group.count];
 
 			// Check if consecutive
 			if (actual_next != expected_next) {
@@ -2085,6 +2130,13 @@ void LogCacheAsync::flush_write_buffer()
 			if (actual_next + block_size > zone_end) {
 				break;  // Would exceed zone capacity
 			}
+
+#if FDP
+			// For FDP: break if stream_id changes (different placement handle)
+			if (next_stream_id != group.stream_id) {
+				break;
+			}
+#endif
 
 			group.count++;
 		}
@@ -2124,7 +2176,8 @@ void LogCacheAsync::flush_write_buffer()
 
 		// Create zone write context
 		size_t group_len = group.count * block_size;
-		auto *zctx = new (std::nothrow) ZoneWriteCtx{flush_ctx, iovs, static_cast<int>(group.count), group_len};
+		int placement_handle = group.stream_id % FDP_NUM_PLACEMENT_HANDLES;
+		auto *zctx = new (std::nothrow) ZoneWriteCtx{flush_ctx, iovs, static_cast<int>(group.count), group_len, placement_handle};
 		if (!zctx) {
 			free(iovs);
 			flush_ctx->first_error = -ENOMEM;
@@ -2149,7 +2202,7 @@ void LogCacheAsync::flush_write_buffer()
 		}
 
 		int rc = device_->writev_cache_async(group.first_offset, iovs, zctx->iovcnt,
-						     group_len, zone_write_done, zctx);
+						     group_len, zone_write_done, zctx, placement_handle);
 		if (rc != 0) {
 			SPDK_ERRLOG("writev_cache_async failed for group: %d\n", rc);
 			g_outstanding_bytes -= group_len;  // Rollback on error
@@ -2741,8 +2794,30 @@ static void gc_read_done(void *cb_arg, int status)
 		io->current_leftover_idx = 0;
 		io->completed_writes = 0;
 
-		SPDK_NOTICELOG("GC: Starting writes - 16K_chunks=%zu, leftover_blocks=%zu\n",
-			       io->num_16k_chunks, io->leftover_blocks);
+		// Pre-calculate expected writes (accounting for stripe boundary splits)
+		// STRIPE_CHUNK_BLOCKS is defined as 32 in log_cache_segment.h
+		io->expected_16k_writes = 0;
+		for (size_t chunk = 0; chunk < io->num_16k_chunks; ++chunk) {
+			size_t chunk_start = chunk * BLOCKS_PER_16K;
+			size_t first_block_idx = io->batch_start + chunk_start;
+			size_t last_block_in_chunk = first_block_idx + BLOCKS_PER_16K - 1;
+
+			// Bounds check to prevent out-of-range access
+			if (last_block_in_chunk >= blocks.size()) {
+				SPDK_ERRLOG("GC: bounds error in pre-calc: last_block_in_chunk=%zu >= blocks.size()=%zu\n",
+					    last_block_in_chunk, blocks.size());
+				io->expected_16k_writes += 1;  // Safe fallback
+				continue;
+			}
+
+			size_t first_dst_idx = blocks[first_block_idx].dst_idx;
+			size_t last_dst_idx = blocks[last_block_in_chunk].dst_idx;
+			bool crosses_stripe = (first_dst_idx / STRIPE_CHUNK_BLOCKS) != (last_dst_idx / STRIPE_CHUNK_BLOCKS);
+			io->expected_16k_writes += crosses_stripe ? BLOCKS_PER_16K : 1;
+		}
+
+		SPDK_NOTICELOG("GC: Starting writes - 16K_chunks=%zu, expected_writes=%zu, leftover_blocks=%zu\n",
+			       io->num_16k_chunks, io->expected_16k_writes, io->leftover_blocks);
 
 		// If no 16KB chunks, start leftover immediately (sequential)
 		if (io->num_16k_chunks == 0) {
@@ -2758,9 +2833,74 @@ static void gc_read_done(void *cb_arg, int status)
 		}
 
 		// Submit 16KB aligned chunks using scatter-gather (parallel, within 1MB window)
-		// BATCH_BLOCKS=128 (512KB) ensures we stay within 1MB window
+		// Check stripe boundary: STRIPE_CHUNK_BLOCKS=32, don't batch across stripe chunks
 		for (size_t chunk = 0; chunk < io->num_16k_chunks; ++chunk) {
 			size_t chunk_start = chunk * BLOCKS_PER_16K;
+			size_t first_block_idx = io->batch_start + chunk_start;
+			size_t last_block_in_chunk = first_block_idx + BLOCKS_PER_16K - 1;
+
+			// Bounds check to prevent out-of-range access
+			if (last_block_in_chunk >= blocks.size()) {
+				SPDK_ERRLOG("GC: bounds error in write loop: last_block_in_chunk=%zu >= blocks.size()=%zu\n",
+					    last_block_in_chunk, blocks.size());
+				io->completed_16k_writes++;  // Skip this chunk
+				continue;
+			}
+
+			// Get dst_idx for first and last block in this 16KB chunk
+			size_t first_dst_idx = blocks[first_block_idx].dst_idx;
+			size_t last_dst_idx = blocks[last_block_in_chunk].dst_idx;
+
+			// Check if they're in the same stripe chunk (STRIPE_CHUNK_BLOCKS = 32)
+			bool crosses_stripe = (first_dst_idx / STRIPE_CHUNK_BLOCKS) != (last_dst_idx / STRIPE_CHUNK_BLOCKS);
+
+			if (crosses_stripe) {
+				// Stripe boundary crossed - write each block individually
+				SPDK_NOTICELOG("GC: 16K chunk %zu crosses stripe boundary (dst_idx %zu-%zu), writing individually\n",
+					       chunk, first_dst_idx, last_dst_idx);
+				int gc_placement_handle = io->prepare_result.gc_stream_id % FDP_NUM_PLACEMENT_HANDLES;
+				for (size_t i = 0; i < BLOCKS_PER_16K; ++i) {
+					size_t block_idx = first_block_idx + i;
+					uint8_t *src = static_cast<uint8_t*>(io->staging) + (chunk_start + i) * block_size;
+					uint64_t dst_offset = blocks[block_idx].dst_offset;
+
+					// Allocate single iovec for this block
+					struct iovec *single_iov = static_cast<struct iovec*>(malloc(sizeof(struct iovec)));
+					if (!single_iov) {
+						io->last_status = -ENOMEM;
+						io->completed_16k_writes++;
+						continue;
+					}
+					single_iov->iov_base = src;
+					single_iov->iov_len = block_size;
+
+					struct GcWriteCtx {
+						GcIo *io;
+						struct iovec *iovs;
+					};
+					auto *write_ctx = new (std::nothrow) GcWriteCtx{io, single_iov};
+					if (!write_ctx) {
+						free(single_iov);
+						io->last_status = -ENOMEM;
+						io->completed_16k_writes++;
+						continue;
+					}
+
+					// Use writev with single iovec to pass placement handle
+					int rc = io->ctx->device->writev_cache_async(dst_offset, single_iov, 1,
+										     block_size, gc_write_done,
+										     write_ctx, gc_placement_handle);
+					if (rc == 0) {
+						io->ctx->cache->add_gc_write_bytes(block_size);
+					} else {
+						free(single_iov);
+						delete write_ctx;
+						io->last_status = rc;
+						io->completed_16k_writes++;
+					}
+				}
+				continue;
+			}
 
 			// Allocate iovec for this chunk
 			struct iovec *iovs = static_cast<struct iovec*>(calloc(BLOCKS_PER_16K, sizeof(struct iovec)));
@@ -2771,7 +2911,7 @@ static void gc_read_done(void *cb_arg, int status)
 			}
 
 			// Setup iovecs
-			uint64_t first_dst_offset = blocks[io->batch_start + chunk_start].dst_offset;
+			uint64_t first_dst_offset = blocks[first_block_idx].dst_offset;
 			for (size_t i = 0; i < BLOCKS_PER_16K; ++i) {
 				uint8_t *src = static_cast<uint8_t*>(io->staging) + (chunk_start + i) * block_size;
 				iovs[i].iov_base = src;
@@ -2790,10 +2930,11 @@ static void gc_read_done(void *cb_arg, int status)
 				continue;
 			}
 
-			// 16KB scatter-gather write
+			// 16KB scatter-gather write with FDP placement handle
+			int gc_placement_handle = io->prepare_result.gc_stream_id % FDP_NUM_PLACEMENT_HANDLES;
 			int rc = io->ctx->device->writev_cache_async(first_dst_offset, iovs, BLOCKS_PER_16K,
 								     BLOCKS_PER_16K * block_size,
-								     gc_write_done, write_ctx);
+								     gc_write_done, write_ctx, gc_placement_handle);
 			if (rc == 0) {
 				// Track GC write bytes for WAF calculation
 				io->ctx->cache->add_gc_write_bytes(BLOCKS_PER_16K * block_size);
@@ -2805,10 +2946,11 @@ static void gc_read_done(void *cb_arg, int status)
 			}
 		}
 
-		SPDK_NOTICELOG("GC: All 16K writes submitted, completed_16k=%zu\n", io->completed_16k_writes);
+		SPDK_NOTICELOG("GC: All 16K writes submitted, completed_16k=%zu, expected=%zu\n",
+			       io->completed_16k_writes, io->expected_16k_writes);
 
 		// Check if all 16KB writes completed synchronously (error case)
-		if (io->completed_16k_writes >= io->num_16k_chunks) {
+		if (io->completed_16k_writes >= io->expected_16k_writes) {
 			SPDK_NOTICELOG("GC: All 16K writes done synchronously (error case?)\n");
 			if (io->leftover_blocks > 0) {
 				gc_submit_next_leftover(io);
@@ -2879,6 +3021,8 @@ static void gc_write_done(void *cb_arg, int status)
 	auto *ctx = static_cast<GcWriteCtx *>(cb_arg);
 	GcIo *io = ctx->io;
 
+	// iovs == nullptr means leftover write
+	// iovs != nullptr means 16KB-type write (normal batch or stripe-split individual)
 	bool is_16k_write = (ctx->iovs != nullptr);
 
 	// Free iovec array if it was a scatter-gather write
@@ -2895,13 +3039,13 @@ static void gc_write_done(void *cb_arg, int status)
 	}
 
 	if (is_16k_write) {
-		// 16KB chunk completed
+		// 16KB-type write completed (normal batch or stripe-split individual)
 		io->completed_16k_writes++;
 
-		// Check if all 16KB chunks done
-		if (io->completed_16k_writes >= io->num_16k_chunks) {
+		// Check if all expected writes done (including stripe-split individual writes)
+		if (io->completed_16k_writes >= io->expected_16k_writes) {
 			SPDK_NOTICELOG("GC: All 16K writes done (completed=%zu/%zu), starting leftovers\n",
-				       io->completed_16k_writes, io->num_16k_chunks);
+				       io->completed_16k_writes, io->expected_16k_writes);
 			// Start leftover sequential writes (if any)
 			if (io->leftover_blocks > 0) {
 				gc_submit_next_leftover(io);
@@ -3174,6 +3318,9 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 {
 	LogCacheAsync *cache = ctx->cache.get();
 
+	SPDK_NOTICELOG("start_gc_or_evict: entering, gc_in_progress=%d, evict_in_progress=%d, free_segs=%zu\n",
+		       cache->gc_in_progress(), cache->evict_in_progress(), cache->free_segment_count());
+
 	if (cache->gc_in_progress() || cache->evict_in_progress()) {
 		// Already running
 		if (on_complete) on_complete(0);
@@ -3188,6 +3335,7 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 
 
 	// Try GC first (compaction)
+	SPDK_NOTICELOG("start_gc_or_evict: calling prepare_gc\n");
 	LogCache::GcPrepareResult gc_result;
 	bool gc_prepared = cache->cache()->prepare_gc(gc_result);
 	SPDK_NOTICELOG("GC: prepare_gc returned %d, do_evict_only=%d, blocks_to_copy=%zu\n",
