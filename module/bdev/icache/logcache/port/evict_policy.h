@@ -36,9 +36,12 @@ public:
 
     /* valid_cnt 가 변했을 때 호출 */
     virtual void update(Segment* seg)    = 0;
-    virtual void update(Segment* seg, uint64_t current_time) { 
-        update(seg);  // 기본 구현은 current_time 무시 
+    virtual void update(Segment* seg, uint64_t current_time) {
+        update(seg);  // 기본 구현은 current_time 무시
     }
+
+    /* Check if evictor has any segments to choose from */
+    virtual bool empty() const { return false; }  // Default: not empty
     void init(uint64_t* time, std::size_t size, int num) {
         logical_time = time;  // 외부에서 logical_time을 설정
         pages_in_segment = size;  // 세그먼트 크기 설정

@@ -244,6 +244,7 @@ struct ZoneQueue {
 	bool flush_in_progress = false;              // Flush command in flight
 	bool zone_opened = false;                    // Zone opened with ZRWA
 	bool open_in_progress = false;               // Zone open command in flight
+	bool is_fdp = false;                         // FDP mode: skip ZRWA constraints
 	std::map<uint64_t, InflightIo> inflight_ios;  // offset -> {end_offset, completed}
 	std::queue<ZoneQueueEntry> pending;           // Pending IOs waiting for this zone
 
@@ -268,6 +269,10 @@ struct ZoneQueue {
 				SPDK_NOTICELOG("can_submit: FAIL zone_opened=false, offset=%lu\n", offset);
 			}
 			return false;
+		}
+		// FDP mode: no ZRWA constraints, can write anywhere in zone
+		if (is_fdp) {
+			return true;
 		}
 		// Can't submit if flush is in progress (wait for device WP to advance)
 		if (flush_in_progress) {
@@ -1374,12 +1379,13 @@ public:
 	{
 
 		if (!m_cache_zoned) {
-			// Not a ZNS device, no zone open needed - mark zone as opened and process pending
+			// FDP mode: no zone open needed, no ZRWA constraints
 			uint64_t zone_id = zone_slba / (m_cache_zone_blocks > 0 ? m_cache_zone_blocks : 1);
 			ZoneQueue &zq = zone_queues_[zone_id];
 			zq.zone_opened = true;
+			zq.is_fdp = true;  // Skip ZRWA constraints in can_submit()
 			zq.open_in_progress = false;
-			// Initialize WP to zone start offset (byte unit)
+			// Initialize WP (not used in FDP mode but keep for consistency)
 			uint64_t zone_start_offset = zone_id * m_cache_zone_blocks * m_block_size;
 			zq.write_pointer = zone_start_offset;
 			zq.flushed_wp = zone_start_offset;
@@ -1452,6 +1458,7 @@ public:
 		if (it != zone_queues_.end()) {
 			ZoneQueue &zq = it->second;
 			zq.zone_opened = false;
+			zq.is_fdp = false;  // Will be set again when zone is re-opened
 			zq.open_in_progress = false;
 			zq.write_pointer = 0;
 			zq.flushed_wp = 0;
@@ -3272,8 +3279,8 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 		return;
 	}
 
-	// Nothing to do
-	SPDK_ERRLOG("start_gc_or_evict: both prepare_gc and prepare_evict failed!\n");
+	// Nothing to evict right now - evictor queue may be temporarily empty
+	// This is normal when all segments have been evicted and new ones are filling up
 	if (on_complete) on_complete(0);
 }
 

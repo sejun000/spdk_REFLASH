@@ -28,6 +28,7 @@ public:
     void add   (Segment* seg) override;
     void remove(Segment* seg) override;
     void update(Segment* seg) override;
+    bool empty() const override { return heap_.empty(); }
 
 private:
     Heap heap_;

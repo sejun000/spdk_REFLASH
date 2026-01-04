@@ -842,7 +842,7 @@ vbdev_icache_create(const char *name, const char *cache_bdev_name,
 
 	// Limit cache size (TODO: make this configurable via RPC)
 	// Align to zone_size * STRIPE_WIDTH for proper segment boundaries
-	uint64_t cache_size_limit_gb = 100;
+	uint64_t cache_size_limit_gb = 200;
 	uint64_t cache_blockcnt = icache->cache_bdev->blockcnt;
 	uint64_t limit_blockcnt = (cache_size_limit_gb * 1024ULL * 1024 * 1024) / icache->cache_bdev->blocklen;
 

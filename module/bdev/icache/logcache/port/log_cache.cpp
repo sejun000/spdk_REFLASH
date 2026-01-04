@@ -959,6 +959,10 @@ bool LogCache::need_gc_or_evict() const
     // BLOCK threshold (in get_free_segment): stop host IO
     constexpr size_t ASYNC_GC_TRIGGER_SEGMENTS = 10;  // Start GC at <= 10 free segments
     if (async_mode_ && free_pool.size() <= ASYNC_GC_TRIGGER_SEGMENTS) {
+        // Don't trigger GC if evictor is empty (nothing to evict)
+        if (evictor->empty()) {
+            return false;
+        }
         static uint64_t gc_trigger_count = 0;
         if (++gc_trigger_count % 1000 == 1) {
             SPDK_NOTICELOG("GC triggered! free_pool=%zu <= %zu\n", free_pool.size(), ASYNC_GC_TRIGGER_SEGMENTS);
