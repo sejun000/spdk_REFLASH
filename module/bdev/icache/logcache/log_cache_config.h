@@ -14,6 +14,10 @@
 
 #define FDP 1
 
+// Number of FDP placement handles available (0 ~ FDP_NUM_PLACEMENT_HANDLES-1)
+// stream_id % FDP_NUM_PLACEMENT_HANDLES = placement handle
+#define FDP_NUM_PLACEMENT_HANDLES 7
+
 //==============================================================================
 // End of FDP Configuration
 //==============================================================================

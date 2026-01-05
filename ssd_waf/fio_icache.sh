@@ -5,11 +5,22 @@
 
 UBLK_DEV_ID=${UBLK_DEV_ID:-0}
 UBLK_DEVICE="/dev/ublkb${UBLK_DEV_ID}"
-RUNTIME=${RUNTIME:-120}  # Default 2 minutes
-TEST_SIZE=${TEST_SIZE:-10G}  # 검증용 테스트 크기
+RUNTIME=${RUNTIME:-180}  # Default 2 minutes
+TEST_SIZE=${TEST_SIZE:-100G}  # 검증용 테스트 크기
 VERIFY_ONLY=${VERIFY_ONLY:-0}  # 1이면 검증만 수행
 SKIP_VERIFY=${SKIP_VERIFY:-0}  # 1이면 검증 스킵
 LOG_PREFIX="fio_bw_$(date +%Y%m%d_%H%M%S)"
+
+# Verify 모드에서는 single thread 사용 (multi-job race condition 방지)
+# multi-job으로 같은 offset에 쓰면 header는 A job, data는 B job 데이터가 될 수 있음
+if [ "${SKIP_VERIFY}" != "1" ] || [ "${VERIFY_ONLY}" == "1" ]; then
+    NUMJOBS=1
+    IODEPTH=128  # single thread라서 iodepth 높임
+    echo "Verify mode: numjobs=1, iodepth=128 (single thread for data integrity)"
+else
+    NUMJOBS=4
+    IODEPTH=32
+fi
 
 # ublk 디바이스 우선 확인
 if [ -e "$UBLK_DEVICE" ]; then
@@ -37,8 +48,8 @@ if [ "${VERIFY_ONLY}" == "1" ]; then
         --bs=4k \
         --rw=randread \
         --size=${TEST_SIZE} \
-        --numjobs=4 \
-        --iodepth=32 \
+        --numjobs=${NUMJOBS} \
+        --iodepth=${IODEPTH} \
         --verify=crc32c \
         --verify_only \
         --group_reporting
@@ -67,8 +78,8 @@ sudo fio --name=random_test \
     --size=${TEST_SIZE} \
     --runtime=${RUNTIME} \
     --time_based \
-    --numjobs=4 \
-    --iodepth=32 \
+    --numjobs=${NUMJOBS} \
+    --iodepth=${IODEPTH} \
     --verify=crc32c \
     --do_verify=0 \
     --group_reporting \
@@ -99,8 +110,8 @@ else
         --bs=4k \
         --rw=randread \
         --size=${TEST_SIZE} \
-        --numjobs=4 \
-        --iodepth=32 \
+        --numjobs=${NUMJOBS} \
+        --iodepth=${IODEPTH} \
         --verify=crc32c \
         --verify_only \
         --group_reporting

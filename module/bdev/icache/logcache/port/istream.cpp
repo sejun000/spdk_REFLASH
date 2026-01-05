@@ -9,7 +9,7 @@
 
 uint64_t interval = 1;
 namespace {
-constexpr int kMultiHotColdStreams = 10;
+constexpr int kMultiHotColdStreams = 7;
 }
 
 void set_stream_interval(uint64_t cache_block_count) {

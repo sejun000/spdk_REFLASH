@@ -67,7 +67,7 @@ namespace icache {
 //==============================================================================
 class DmaBufferPool {
 public:
-	static constexpr size_t CHUNK_SIZE = 1024 * 1024;     // 1MB per chunk (for 256 x 4KB evict)
+	static constexpr size_t CHUNK_SIZE = 2 * 1024 * 1024; // 2MB per chunk (for 16 x 128KB evict)
 	static constexpr size_t POOL_SIZE = 2ULL * 1024 * 1024 * 1024;  // 2GB total
 	static constexpr size_t NUM_CHUNKS = POOL_SIZE / CHUNK_SIZE;    // 2048 chunks
 

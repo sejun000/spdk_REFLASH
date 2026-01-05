@@ -32,6 +32,8 @@ void CbEvictPolicy::update(Segment* s)
 
 Segment* CbEvictPolicy::choose_segment()
 {
+    size_t initial_size = heap_.size();
+
     /* top‑k (K_VALIDATE) 노드 재평가로 순위 확정 */
     for (int i = 0; i < K_VALIDATE && !heap_.empty(); ++i) {
         CBNode top = heap_.top();
@@ -44,5 +46,13 @@ Segment* CbEvictPolicy::choose_segment()
         auto h = heap_.push({ cur, top.seg });       // 재삽입
         h_[top.seg] = h;
     }
-    return heap_.empty() ? nullptr : heap_.top().seg;
+
+    // K_VALIDATE 반복 후에도 결정 안 됨 - 현재 top 선택
+    if (heap_.empty()) {
+        fprintf(stderr, "CbEvictPolicy::choose_segment: heap empty! initial_size=%zu\n", initial_size);
+        assert(false);
+    }
+    Segment* seg = heap_.top().seg;
+    remove(seg);
+    return seg;
 }

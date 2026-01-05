@@ -1168,6 +1168,15 @@ void LogCache::finalize_gc(GcPrepareResult &result)
     for (auto &info : result.blocks_to_copy) {
         auto &src_blk = victim->blocks[info.src_idx];
 
+        // Check if mapping still points to victim segment
+        // If not, a new write came in during GC - discard GC copy result
+        auto it = mapping.find(info.key);
+        if (it == mapping.end() || it->second.seg != victim || it->second.idx != info.src_idx) {
+            // New write occurred during GC - skip this block (log-structured: new data wins)
+            src_blk.valid = false;  // Still invalidate source
+            continue;
+        }
+
         // Use stored destination index (needed for striping)
         size_t dst_idx = info.dst_idx;
 
@@ -1262,6 +1271,15 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
     // Update mapping for copied blocks
     for (auto &info : result.blocks_to_copy) {
         auto &src_blk = victim->blocks[info.src_idx];
+
+        // Check if mapping still points to victim segment
+        // If not, a new write came in during GC - discard GC copy result
+        auto it = mapping.find(info.key);
+        if (it == mapping.end() || it->second.seg != victim || it->second.idx != info.src_idx) {
+            // New write occurred during GC - skip this block (log-structured: new data wins)
+            src_blk.valid = false;  // Still invalidate source
+            continue;
+        }
 
         // Use stored destination index (needed for striping)
         size_t dst_idx = info.dst_idx;

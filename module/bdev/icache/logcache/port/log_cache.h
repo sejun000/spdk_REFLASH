@@ -132,7 +132,8 @@ public:
     void reset_segment_async(LogCacheSegment *seg, cache_device_io_cb cb, void *cb_arg);
     void complete_segment_reset(LogCacheSegment *seg);  // Called by async callback
     // Append block metadata only, returns cache offset for async write
-    bool append_block_metadata(int stream_id, long key, int lba_sz, uint64_t *cache_offset);
+    // out_stream_id: optional output for the actual stream_id assigned (for FDP placement handle)
+    bool append_block_metadata(int stream_id, long key, int lba_sz, uint64_t *cache_offset, int *out_stream_id = nullptr);
     void dummy_fill_segment(LogCacheSegment* s);
     void set_device_io(CacheDeviceInterface *io) { device_io_ = io; }
     //void do_evict_and_compaction_with_same_policy();
