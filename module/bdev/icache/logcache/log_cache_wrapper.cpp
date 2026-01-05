@@ -942,6 +942,20 @@ public:
 				       buf, len, offset, false, cb, cb_arg);
 	}
 
+	// Deferred callback context for FDP mode reset
+	struct DeferredResetCtx {
+		cache_device_io_cb cb;
+		void *cb_arg;
+	};
+
+	static void deferred_reset_cb(void *arg) {
+		auto *ctx = static_cast<DeferredResetCtx*>(arg);
+		if (ctx->cb) {
+			ctx->cb(ctx->cb_arg, 0);
+		}
+		delete ctx;
+	}
+
 	int reset_cache_region_async(uint64_t offset, size_t len,
 				     cache_device_io_cb cb, void *cb_arg) override
 	{
@@ -956,8 +970,10 @@ public:
 					clear_zone_state(z);
 				}
 			}
+			// Defer callback to avoid nested callback chain
 			if (cb) {
-				cb(cb_arg, 0);
+				auto *ctx = new DeferredResetCtx{cb, cb_arg};
+				spdk_thread_send_msg(spdk_get_thread(), deferred_reset_cb, ctx);
 			}
 			return 0;
 		}
@@ -1604,18 +1620,56 @@ struct GcIo {
 	size_t completed_writes;
 	int last_status;
 
-	// Batch processing (256KB = 64 blocks at a time for cache device)
-	// Matches DmaBufferPool::CHUNK_SIZE for efficient allocation
-	static constexpr size_t BATCH_BLOCKS = 64;  // 256KB / 4KB
+	// Timing for QoS throttle
+	uint64_t start_ticks;
+	uint64_t total_gc_bytes;
+	uint64_t read_ticks;    // Total read time
+	uint64_t write_ticks;   // Total write time
+	uint64_t read_start;    // Batch read start
+	uint64_t write_start;   // Batch write start
+
+	// Batch processing (1MB = 256 blocks at a time for cache device)
+	static constexpr size_t BATCH_BLOCKS = 256;  // 1MB / 4KB
 	size_t batch_start;      // Current batch start index in blocks_to_copy
 	size_t batch_count;      // Number of blocks in current batch
 
-	// 16KB chunks and leftover tracking (for ZNS write rules)
-	size_t num_16k_chunks;       // Number of 16KB aligned chunks in current batch
-	size_t leftover_blocks;      // Number of leftover blocks (0-3)
-	size_t completed_16k_writes; // Completed 16KB chunk writes
-	size_t expected_16k_writes;  // Total expected writes (including stripe-split individual writes)
+	// Sequential read optimization (when valid_ratio >= 0.5)
+	double valid_ratio;
+	bool use_sequential_read;
+	uint64_t segment_base_offset;
+	size_t segment_size_blocks;
+
+	// 64KB chunks and leftover tracking (for ZNS write rules)
+	static constexpr size_t BLOCKS_PER_64K = 16;  // 64KB / 4KB
+	size_t num_64k_chunks;       // Number of 64KB aligned chunks in current batch
+	size_t leftover_blocks;      // Number of leftover blocks (0-15)
+	size_t completed_64k_writes; // Completed 64KB chunk writes
+	size_t expected_64k_writes;  // Total expected writes (including stripe-split individual writes)
 	size_t current_leftover_idx; // Current leftover index being written (sequential)
+
+	// Coalesced read tracking (back merge) - for scattered read mode
+	struct CoalescedRead {
+		uint64_t src_offset;   // Start offset
+		size_t num_blocks;     // Number of consecutive blocks
+		size_t first_idx;      // First block index in batch
+	};
+	std::vector<CoalescedRead> coalesced_reads;
+	size_t completed_coalesced_reads;
+
+	// Sequential read mode (128k chunks) - for high valid_ratio
+	static constexpr size_t SEQ_CHUNK_BLOCKS = 32;  // 128KB / 4KB
+	static constexpr size_t SEQ_PARALLEL_CHUNKS = 8;  // 8 * 128KB = 1MB parallel reads
+	struct SeqChunk {
+		size_t chunk_idx;      // 128k chunk index in segment
+		std::vector<size_t> valid_block_indices;  // indices in blocks_to_copy
+	};
+	std::vector<SeqChunk> seq_chunks;  // 128k chunks with valid blocks
+	size_t seq_current_chunk;          // Current chunk being processed
+	size_t seq_parallel_start;         // Start of current parallel batch
+	size_t seq_parallel_count;         // Number of chunks in current batch
+	std::atomic<size_t> seq_reads_done;
+	std::atomic<size_t> seq_writes_done;
+	size_t seq_total_writes;           // Total writes expected in current batch
 
 	// Staging buffer for current batch (DMA-capable, hugepage)
 	void *staging;
@@ -1624,9 +1678,16 @@ struct GcIo {
 	// Completion callback for pending writes
 	std::function<void(int)> on_complete;
 
-	GcIo() : batch_start(0), batch_count(0), num_16k_chunks(0), leftover_blocks(0),
-	         completed_16k_writes(0), expected_16k_writes(0), current_leftover_idx(0),
-	         staging(nullptr), staging_size(0) {}
+	GcIo() : batch_start(0), batch_count(0), valid_ratio(0), use_sequential_read(false),
+	         segment_base_offset(0), segment_size_blocks(0),
+	         num_64k_chunks(0), leftover_blocks(0),
+	         completed_64k_writes(0), expected_64k_writes(0), current_leftover_idx(0),
+	         completed_coalesced_reads(0),
+	         seq_current_chunk(0), seq_parallel_start(0), seq_parallel_count(0),
+	         seq_reads_done(0), seq_writes_done(0), seq_total_writes(0),
+	         staging(nullptr), staging_size(0),
+	         start_ticks(0), total_gc_bytes(0), read_ticks(0), write_ticks(0),
+	         read_start(0), write_start(0) {}
 	~GcIo() {
 		if (staging) {
 			icache::dma_pool_free(staging, staging_size);
@@ -1756,6 +1817,9 @@ public:
 		// segment_bytes = zone_capacity * stripe_width (for legacy, but now calculated in LogCache)
 		// zone_capacity_bytes = writable capacity per zone
 		// zone_size_bytes = zone address space size (for alignment)
+		// Store segment capacity for throttle calculation
+		segment_capacity_bytes_ = zone_capacity_bytes * STRIPE_WIDTH;
+
 		Config cfg;
 		cfg.segment_bytes = zone_capacity_bytes;  // Single zone capacity (legacy)
 		cfg.zone_size_bytes = zone_size_bytes;
@@ -1809,6 +1873,9 @@ public:
 			device);
 		cache_->set_stats_prefix("icache");
 		cache_->set_async_mode(true);  // Disable sync eviction, use async wrapper
+
+		// Initialize QoS throttle
+		throttle_init();
 	}
 
 	// Check if key exists in cache
@@ -1846,6 +1913,9 @@ public:
 
 	// Free segment count for watermark checks
 	size_t free_segment_count() const { return cache_->free_segment_count(); }
+
+	// Segment capacity for throttle calculation (freed capacity per GC/Evict)
+	uint64_t segment_capacity() const { return segment_capacity_bytes_; }
 
 	// Critical threshold - block host writes only when below this
 	static constexpr size_t CRITICAL_FREE_SEGMENTS = 5;
@@ -1926,6 +1996,7 @@ private:
 	bool evict_in_progress_;
 	std::list<CacheIo*> pending_writes_;
 	uint64_t zone_size_bytes_;
+	uint64_t segment_capacity_bytes_;  // zone_capacity * stripe_width
 
 	// 16KB Write Buffer
 	std::vector<BufferedBlock> write_buffer_;
@@ -1937,6 +2008,192 @@ private:
 	uint64_t host_write_bytes_ = 0;
 	uint64_t gc_write_bytes_ = 0;
 	uint64_t next_waf_log_threshold_ = WAF_LOG_INTERVAL;
+
+	//==========================================================================
+	// QoS Throttle (based on SPDK FTL approach)
+	// Limits host writes based on GC speed and free segment level
+	//==========================================================================
+	struct Throttle {
+		// GC speed tracking (Simple Moving Average)
+		static constexpr size_t SMA_WINDOW = 8;
+		uint64_t gc_bytes_history[SMA_WINDOW] = {0};
+		uint64_t gc_ticks_history[SMA_WINDOW] = {0};
+		size_t sma_idx = 0;
+		size_t sma_count = 0;
+		double gc_bandwidth_sma = 0;  // bytes per tick
+
+		// Free segment delta tracking (SMA)
+		static constexpr size_t DELTA_WINDOW = 4;
+		int64_t delta_history[DELTA_WINDOW] = {0};
+		size_t delta_idx = 0;
+		size_t delta_count = 0;
+		size_t prev_free_segs = 0;
+		double delta_sma = 0;  // Average change in free segments per interval
+
+		// Throttle state
+		uint64_t interval_tsc = 0;           // 20ms interval in ticks
+		uint64_t start_tsc = 0;              // Start of current interval
+		uint64_t blocks_submitted = 0;       // Host blocks submitted this interval
+		uint64_t blocks_submitted_limit = UINT64_MAX;  // Limit for this interval
+
+		// Current GC measurement
+		uint64_t gc_start_tsc = 0;
+		uint64_t gc_bytes_this_round = 0;
+
+		// Free segment target (controls throttle aggressiveness)
+		size_t free_segment_target = 10;     // Target free segments
+
+		// Watermark level tracking for logging
+		enum class Level { NORMAL, START, LOW, HIGH, CRIT };
+		Level prev_level = Level::NORMAL;
+	} throttle_;
+
+	// Watermark levels for GC trigger
+	static constexpr size_t GC_WATERMARK_START = 15;  // Start background GC
+	static constexpr size_t GC_WATERMARK_LOW = 10;    // More aggressive GC
+	static constexpr size_t GC_WATERMARK_HIGH = 5;    // Very aggressive GC
+	static constexpr size_t GC_WATERMARK_CRIT = 2;    // Critical - minimal host IO
+
+	// Throttle proportional control constants (relaxed from SPDK FTL defaults)
+	static constexpr double THROTTLE_KP = 10.0;           // Was 20.0, less aggressive
+	static constexpr double THROTTLE_MODIFIER_MIN = -0.5; // Was -0.8, at least 50% of GC speed
+	static constexpr double THROTTLE_MODIFIER_MAX = 0.5;
+	static constexpr uint64_t THROTTLE_INTERVAL_MS = 20;
+
+public:
+	// Initialize throttle (call after device ready)
+	void throttle_init() {
+		throttle_.interval_tsc = THROTTLE_INTERVAL_MS * spdk_get_ticks_hz() / 1000;
+		throttle_.start_tsc = spdk_get_ticks();
+		throttle_.free_segment_target = GC_WATERMARK_LOW;
+	}
+
+	// Record GC completion for bandwidth tracking
+	void throttle_gc_complete(uint64_t gc_bytes, uint64_t gc_ticks) {
+		if (gc_ticks == 0) return;
+
+		auto &t = throttle_;
+		t.gc_bytes_history[t.sma_idx] = gc_bytes;
+		t.gc_ticks_history[t.sma_idx] = gc_ticks;
+		t.sma_idx = (t.sma_idx + 1) % Throttle::SMA_WINDOW;
+		if (t.sma_count < Throttle::SMA_WINDOW) t.sma_count++;
+
+		// Calculate SMA
+		uint64_t total_bytes = 0, total_ticks = 0;
+		for (size_t i = 0; i < t.sma_count; i++) {
+			total_bytes += t.gc_bytes_history[i];
+			total_ticks += t.gc_ticks_history[i];
+		}
+		t.gc_bandwidth_sma = (total_ticks > 0) ?
+			static_cast<double>(total_bytes) / total_ticks : 0;
+
+		// Log every 10 GC completions
+		static uint64_t gc_count = 0;
+		if (++gc_count % 10 == 1) {
+			double bw_mbs = t.gc_bandwidth_sma * spdk_get_ticks_hz() / 1024.0 / 1024.0;
+			SPDK_NOTICELOG("THROTTLE: gc_complete #%lu, bytes=%lu, sma_bw=%.1fMB/s, limit=%lu\n",
+				       gc_count, gc_bytes, bw_mbs, t.blocks_submitted_limit);
+		}
+	}
+
+	// Update throttle limit (called periodically)
+	void throttle_update() {
+		auto &t = throttle_;
+		uint64_t now = spdk_get_ticks();
+
+		if (t.start_tsc == 0) {
+			t.start_tsc = now;
+			return;
+		}
+
+		if (now - t.start_tsc < t.interval_tsc) {
+			return;  // Not time yet
+		}
+
+		// Calculate error: (current_free - target) / total_segments
+		size_t current_free = free_segment_count();
+		size_t total_segs = cache_->size() > 0 ?
+			(cache_->size() / (512 * 1024 / block_size_)) : 100;  // Estimate
+		double err = static_cast<double>(current_free) - t.free_segment_target;
+		err /= total_segs;
+
+		// Proportional modifier
+		double modifier = THROTTLE_KP * err;
+		if (modifier < THROTTLE_MODIFIER_MIN) modifier = THROTTLE_MODIFIER_MIN;
+		if (modifier > THROTTLE_MODIFIER_MAX) modifier = THROTTLE_MODIFIER_MAX;
+
+		// Calculate limit based on GC bandwidth
+		if (t.gc_bandwidth_sma > 0 && (gc_in_progress_ || evict_in_progress_)) {
+			double blocks_per_interval = t.gc_bandwidth_sma * t.interval_tsc / block_size_;
+			t.blocks_submitted_limit = static_cast<uint64_t>(blocks_per_interval * (1.0 + modifier));
+			if (t.blocks_submitted_limit < 1) t.blocks_submitted_limit = 1;
+		} else {
+			t.blocks_submitted_limit = UINT64_MAX;  // No throttle if no GC
+		}
+
+		// Detect watermark level change
+		Throttle::Level cur_level;
+		if (current_free <= GC_WATERMARK_CRIT) cur_level = Throttle::Level::CRIT;
+		else if (current_free <= GC_WATERMARK_HIGH) cur_level = Throttle::Level::HIGH;
+		else if (current_free <= GC_WATERMARK_LOW) cur_level = Throttle::Level::LOW;
+		else if (current_free <= GC_WATERMARK_START) cur_level = Throttle::Level::START;
+		else cur_level = Throttle::Level::NORMAL;
+
+		if (cur_level != t.prev_level) {
+			static const char* level_names[] = {"NORMAL", "START", "LOW", "HIGH", "CRIT"};
+			SPDK_NOTICELOG("WATERMARK: %s -> %s (free_segs=%zu)\n",
+				       level_names[static_cast<int>(t.prev_level)],
+				       level_names[static_cast<int>(cur_level)],
+				       current_free);
+			t.prev_level = cur_level;
+		}
+
+		// Reset for next interval
+		t.start_tsc = now;
+		t.blocks_submitted = 0;
+	}
+
+	// Check if host write should be throttled
+	bool throttle_should_block() {
+		throttle_update();
+
+		// If no GC/Evict running, don't throttle (limit may be stale from previous interval)
+		if (!gc_in_progress_ && !evict_in_progress_) {
+			return false;
+		}
+
+		size_t free_segs = free_segment_count();
+
+		// Critical level (<=2) - block all host writes
+		if (free_segs <= GC_WATERMARK_CRIT) {
+			return true;
+		}
+
+		// Apply level-based throttle multiplier
+		uint64_t effective_limit = throttle_.blocks_submitted_limit;
+
+		if (free_segs <= GC_WATERMARK_HIGH) {
+			// HIGH level (<=5): 25% of normal limit
+			effective_limit = throttle_.blocks_submitted_limit / 4;
+			if (effective_limit < 1) effective_limit = 1;
+		} else if (free_segs <= GC_WATERMARK_LOW) {
+			// LOW level (<=10): 50% of normal limit
+			effective_limit = throttle_.blocks_submitted_limit / 2;
+			if (effective_limit < 1) effective_limit = 1;
+		}
+
+		return throttle_.blocks_submitted >= effective_limit;
+	}
+
+	// Record host write block submission
+	void throttle_record_host_write(size_t num_blocks) {
+		throttle_.blocks_submitted += num_blocks;
+	}
+
+	// Get current throttle state for debugging
+	size_t throttle_limit() const { return throttle_.blocks_submitted_limit; }
+	size_t throttle_submitted() const { return throttle_.blocks_submitted; }
+	double throttle_gc_bw() const { return throttle_.gc_bandwidth_sma; }
 };
 
 //==============================================================================
@@ -1971,11 +2228,8 @@ struct ZoneWriteCtx {
 	int placement_handle;  // FDP placement handle for this write
 };
 
-// Outstanding IO tracking for queue depth measurement
+// Outstanding IO tracking
 static std::atomic<uint64_t> g_outstanding_bytes{0};
-static std::atomic<uint64_t> g_outstanding_samples{0};
-static std::atomic<uint64_t> g_outstanding_sum{0};
-static std::atomic<uint64_t> g_write_count{0};
 
 // TEST: Skip zone write and complete immediately (for measuring icache overhead only)
 static constexpr bool SKIP_ZONE_WRITE_FOR_TEST = false;
@@ -2188,18 +2442,7 @@ void LogCacheAsync::flush_write_buffer()
 		}
 
 		// Track outstanding IO
-		uint64_t prev_outstanding = g_outstanding_bytes.fetch_add(group_len);
-		uint64_t cur_outstanding = prev_outstanding + group_len;
-		g_outstanding_sum += cur_outstanding;
-		uint64_t samples = ++g_outstanding_samples;
-		uint64_t count = ++g_write_count;
-
-		// Log average every 1000 writes
-		if (count % 1000 == 0) {
-			uint64_t avg_bytes = g_outstanding_sum / samples;
-			SPDK_NOTICELOG("QD stats: avg_outstanding=%lu KB, cur=%lu KB, writes=%lu\n",
-				       avg_bytes / 1024, cur_outstanding / 1024, count);
-		}
+		g_outstanding_bytes.fetch_add(group_len);
 
 		int rc = device_->writev_cache_async(group.first_offset, iovs, zctx->iovcnt,
 						     group_len, zone_write_done, zctx, placement_handle);
@@ -2255,8 +2498,8 @@ static int write_buffer_timeout_poller(void *arg)
 
 	LogCacheAsync *cache = ctx->cache.get();
 
-	// If flush is pending and we need GC/Evict, trigger it
-	if (cache->flush_pending() && cache->need_gc_or_evict() &&
+	// Proactive GC/Evict: trigger when needed, regardless of flush_pending
+	if (cache->need_gc_or_evict() &&
 	    !cache->gc_in_progress() && !cache->evict_in_progress()) {
 		start_gc_or_evict(ctx, [ctx](int status) {
 			process_pending_writes(ctx);
@@ -2286,6 +2529,27 @@ static void cache_io_complete(CacheIo *io, int status)
 
 static void gc_io_complete(GcIo *io, int status)
 {
+	// Calculate and log GC timing
+	if (io->start_ticks > 0) {
+		uint64_t elapsed_ticks = spdk_get_ticks() - io->start_ticks;
+		// Use segment capacity for throttle (freed space, not copied bytes)
+		io->ctx->cache->throttle_gc_complete(io->ctx->cache->segment_capacity(), elapsed_ticks);
+
+		double ticks_hz = spdk_get_ticks_hz();
+		double elapsed_sec = elapsed_ticks / ticks_hz;
+		double read_sec = io->read_ticks / ticks_hz;
+		double write_sec = io->write_ticks / ticks_hz;
+		double mb = io->total_gc_bytes / 1024.0 / 1024.0;
+		double throughput_mbs = (elapsed_sec > 0) ? (mb / elapsed_sec) : 0;
+		double read_mbs = (read_sec > 0) ? (mb / read_sec) : 0;
+		double write_mbs = (write_sec > 0) ? (mb / write_sec) : 0;
+
+		SPDK_NOTICELOG("GC segment: %.1f MB, total=%.2fs (%.0f MB/s), "
+			       "read=%.2fs (%.0f MB/s), write=%.2fs (%.0f MB/s), status=%d\n",
+			       mb, elapsed_sec, throughput_mbs,
+			       read_sec, read_mbs, write_sec, write_mbs, status);
+	}
+
 	auto on_complete = std::move(io->on_complete);
 	delete io;
 	if (on_complete) {
@@ -2306,6 +2570,9 @@ static void evict_io_complete(EvictIo *io, int status)
 	double write_sec = io->write_total_us / 1000000.0;
 	double read_mbs = (read_sec > 0) ? (mb / read_sec) : 0;
 	double write_mbs = (write_sec > 0) ? (mb / write_sec) : 0;
+
+	// Record evict timing for QoS throttle (use segment capacity = freed space)
+	io->ctx->cache->throttle_gc_complete(io->ctx->cache->segment_capacity(), elapsed_ticks);
 
 	SPDK_NOTICELOG("Evict segment: %.1f MB, total=%.2fs (%.0f MB/s), "
 		       "read=%.2fs (%.0f MB/s), write=%.2fs (%.0f MB/s), status=%d\n",
@@ -2624,24 +2891,51 @@ static void cache_io_run_host_write(CacheIo *io)
 		return;
 	}
 
-	// Start write directly - blocks will be buffered for 16KB alignment
-	io->state = CacheIoState::HOST_WRITE_SUBMIT;
+	LogCacheAsync *cache = io->ctx->cache.get();
+
+	// Initialize IO state (needed before any throttle check)
 	io->total_blocks = io->total_len / io->ctx->block_size;
 	io->current_block_idx = 0;
 	io->completed_blocks = 0;
 	io->last_status = 0;
+
+	// QoS throttle check - block host writes when GC pressure is high
+	if (cache->throttle_should_block()) {
+		io->state = CacheIoState::HOST_WRITE_WAIT_GC_EVICT;
+		cache->pending_writes().push_back(io);
+
+		// Trigger GC if not already running
+		if (!cache->gc_in_progress() && !cache->evict_in_progress()) {
+			start_gc_or_evict(io->ctx, [ctx = io->ctx](int status) {
+				process_pending_writes(ctx);
+			});
+		}
+		return;
+	}
+
+	// Start write directly - blocks will be buffered for 16KB alignment
+	io->state = CacheIoState::HOST_WRITE_SUBMIT;
+
+	// Record host write for QoS tracking
+	cache->throttle_record_host_write(io->total_blocks);
+
 	host_write_next_block(io);
 }
 
 //==============================================================================
 // GC State Machine (batch-based: 1MB at a time for cache device)
 //==============================================================================
-static void gc_read_done(void *cb_arg, int status);
+static void gc_coalesced_read_done(void *cb_arg, int status);
 static void gc_write_done(void *cb_arg, int status);
 static void gc_start_batch(GcIo *io);
 static void gc_submit_next_leftover(GcIo *io);
+static void gc_start_writes(GcIo *io);
+// Sequential read mode (128k chunks, pipeline read->write)
+static void gc_start_seq_batch(GcIo *io);
+static void gc_seq_read_done(void *cb_arg, int status);
+static void gc_seq_write_done(void *cb_arg, int status);
 
-// Callback for async finalize_gc completion
+// Callback for async finalize_gc completion (zone reset done)
 static void gc_finalize_done(void *cb_arg, int status)
 {
 	GcIo *io = static_cast<GcIo *>(cb_arg);
@@ -2663,7 +2957,37 @@ static void gc_start_reads(GcIo *io)
 		return;
 	}
 
-	// Start first batch
+	// Sequential read mode: build 128k chunk list
+	if (io->use_sequential_read) {
+		uint32_t block_size = io->ctx->block_size;
+		io->seq_chunks.clear();
+		io->seq_current_chunk = 0;
+
+		// Group blocks by 128k chunk index
+		std::map<size_t, std::vector<size_t>> chunk_map;
+		for (size_t i = 0; i < blocks.size(); ++i) {
+			// Calculate which 128k chunk this block belongs to (by src_idx in victim segment)
+			size_t src_idx = blocks[i].src_idx;
+			size_t chunk_idx = src_idx / GcIo::SEQ_CHUNK_BLOCKS;
+			chunk_map[chunk_idx].push_back(i);
+		}
+
+		// Convert to seq_chunks vector
+		for (auto &kv : chunk_map) {
+			GcIo::SeqChunk sc;
+			sc.chunk_idx = kv.first;
+			sc.valid_block_indices = std::move(kv.second);
+			io->seq_chunks.push_back(std::move(sc));
+		}
+
+		SPDK_NOTICELOG("GC seq mode: %zu blocks in %zu chunks\n",
+			       blocks.size(), io->seq_chunks.size());
+
+		gc_start_seq_batch(io);
+		return;
+	}
+
+	// Scattered read mode: start first batch
 	gc_start_batch(io);
 }
 
@@ -2672,10 +2996,14 @@ static void gc_start_batch(GcIo *io)
 {
 	auto &blocks = io->prepare_result.blocks_to_copy;
 
+	// Record previous batch write time (if any)
+	if (io->batch_start > 0 && io->write_start > 0) {
+		io->write_ticks += spdk_get_ticks() - io->write_start;
+	}
+
 	// Check if all batches done
 	if (io->batch_start >= blocks.size()) {
 		// All batches processed, finalize asynchronously
-		SPDK_NOTICELOG("GC: All batches done, finalizing (total_blocks=%zu)\n", blocks.size());
 		io->state = GcIoState::GC_SEGMENT_DONE;
 		io->ctx->cache->cache()->finalize_gc_async(io->prepare_result, gc_finalize_done, io);
 		return;
@@ -2684,15 +3012,11 @@ static void gc_start_batch(GcIo *io)
 	io->state = GcIoState::READ_GC_SUBMIT;
 	io->completed_reads = 0;
 	io->completed_writes = 0;
+	io->read_start = spdk_get_ticks();  // Start read timing
 
 	// Calculate batch size
 	size_t remaining = blocks.size() - io->batch_start;
 	io->batch_count = std::min(remaining, GcIo::BATCH_BLOCKS);
-
-	SPDK_NOTICELOG("GC: Starting batch %zu/%zu (batch_count=%zu)\n",
-		       io->batch_start / GcIo::BATCH_BLOCKS + 1,
-		       (blocks.size() + GcIo::BATCH_BLOCKS - 1) / GcIo::BATCH_BLOCKS,
-		       io->batch_count);
 
 	uint32_t block_size = io->ctx->block_size;
 
@@ -2711,254 +3035,269 @@ static void gc_start_batch(GcIo *io)
 		return;
 	}
 
-	// Submit reads for this batch only
-	SPDK_NOTICELOG("GC: Submitting %zu reads for batch\n", io->batch_count);
+	// Build coalesced reads (back merge consecutive blocks)
+	io->coalesced_reads.clear();
+	io->completed_coalesced_reads = 0;
+
 	for (size_t i = 0; i < io->batch_count; ++i) {
 		size_t block_idx = io->batch_start + i;
 		auto &blk = blocks[block_idx];
-		uint8_t *dest = static_cast<uint8_t*>(io->staging) + i * block_size;
 
-		struct GcReadCtx {
+		if (io->coalesced_reads.empty()) {
+			// First block - start new range
+			io->coalesced_reads.push_back({blk.src_offset, 1, i});
+		} else {
+			auto &last = io->coalesced_reads.back();
+			uint64_t expected_offset = last.src_offset + last.num_blocks * block_size;
+			if (blk.src_offset == expected_offset) {
+				// Consecutive - merge
+				last.num_blocks++;
+			} else {
+				// Not consecutive - start new range
+				io->coalesced_reads.push_back({blk.src_offset, 1, i});
+			}
+		}
+	}
+
+	// Submit coalesced reads
+	for (size_t r = 0; r < io->coalesced_reads.size(); ++r) {
+		auto &cr = io->coalesced_reads[r];
+		uint8_t *dest = static_cast<uint8_t*>(io->staging) + cr.first_idx * block_size;
+		size_t read_len = cr.num_blocks * block_size;
+
+		struct GcCoalescedReadCtx {
 			GcIo *io;
-			size_t idx;
+			size_t coalesced_idx;
 		};
-		auto *read_ctx = new (std::nothrow) GcReadCtx{io, i};
+		auto *read_ctx = new (std::nothrow) GcCoalescedReadCtx{io, r};
 		if (!read_ctx) {
 			io->last_status = -ENOMEM;
-			io->completed_reads++;
+			io->completed_coalesced_reads++;
 			continue;
 		}
 
-		int rc = io->ctx->device->read_cache_async(blk.src_offset, dest, block_size,
-							   gc_read_done, read_ctx);
+		int rc = io->ctx->device->read_cache_async(cr.src_offset, dest, read_len,
+							   gc_coalesced_read_done, read_ctx);
 		if (rc != 0) {
-			SPDK_ERRLOG("GC: read_cache_async failed for block %zu, rc=%d\n", block_idx, rc);
+			SPDK_ERRLOG("GC: coalesced read failed for offset=0x%lx, len=%zu, rc=%d\n",
+				    cr.src_offset, read_len, rc);
 			delete read_ctx;
 			io->last_status = rc;
-			io->completed_reads++;
+			io->completed_coalesced_reads++;
 		}
 	}
-	SPDK_NOTICELOG("GC: All %zu reads submitted, completed_reads=%zu\n", io->batch_count, io->completed_reads);
 
 	// Check if all reads completed synchronously (error case)
-	if (io->completed_reads >= io->batch_count && io->last_status != 0) {
+	if (io->completed_coalesced_reads >= io->coalesced_reads.size() && io->last_status != 0) {
 		io->ctx->cache->set_gc_in_progress(false);
 		gc_io_complete(io, io->last_status);
 	}
 }
 
-static void gc_read_done(void *cb_arg, int status)
+static void gc_coalesced_read_done(void *cb_arg, int status)
 {
-	struct GcReadCtx {
+	struct GcCoalescedReadCtx {
 		GcIo *io;
-		size_t idx;
+		size_t coalesced_idx;
 	};
-	auto *ctx = static_cast<GcReadCtx *>(cb_arg);
+	auto *ctx = static_cast<GcCoalescedReadCtx *>(cb_arg);
 	GcIo *io = ctx->io;
-	size_t read_idx = ctx->idx;
+	size_t coalesced_idx = ctx->coalesced_idx;
 	delete ctx;
 
 	if (status != 0) {
-		SPDK_ERRLOG("GC: read_done failed for idx=%zu, status=%d\n", read_idx, status);
+		SPDK_ERRLOG("GC: coalesced_read_done failed for idx=%zu, status=%d\n", coalesced_idx, status);
 		if (io->last_status == 0) {
 			io->last_status = status;
 		}
 	}
 
-	io->completed_reads++;
+	io->completed_coalesced_reads++;
 
-	auto &blocks = io->prepare_result.blocks_to_copy;
+	// Check if all coalesced reads are done
+	if (io->completed_coalesced_reads >= io->coalesced_reads.size()) {
+		// Record read time
+		io->read_ticks += spdk_get_ticks() - io->read_start;
 
-	// Check if current batch reads are done
-	if (io->completed_reads >= io->batch_count) {
-		SPDK_NOTICELOG("GC: All %zu reads done, last_status=%d\n", io->batch_count, io->last_status);
-		// Current batch reads done, start writes for this batch
+		// All reads done, start writes for this batch
 		if (io->last_status != 0) {
 			io->ctx->cache->set_gc_in_progress(false);
 			gc_io_complete(io, io->last_status);
 			return;
 		}
+		gc_start_writes(io);
+	}
+}
 
-		// Start writes for current batch
-		// ZNS rule: 16KB aligned writes can be parallel within 1MB window
-		//           Leftover (non-aligned) must be sequential at WP
-		io->state = GcIoState::WRITE_GC_SUBMIT;
+// Start 64KB writes for current batch after all reads complete
+static void gc_start_writes(GcIo *io)
+{
+	auto &blocks = io->prepare_result.blocks_to_copy;
+	uint32_t block_size = io->ctx->block_size;
 
-		uint32_t block_size = io->ctx->block_size;
-		constexpr size_t BLOCKS_PER_16K = 4;  // 16KB / 4KB
+	// ZNS rule: 64KB aligned writes can be parallel within 1MB window
+	//           Leftover (non-aligned) must be sequential at WP
+	io->state = GcIoState::WRITE_GC_SUBMIT;
+	io->write_start = spdk_get_ticks();  // Start write timing
 
-		// Calculate and store 16KB chunks and leftover counts
-		io->num_16k_chunks = io->batch_count / BLOCKS_PER_16K;
-		io->leftover_blocks = io->batch_count % BLOCKS_PER_16K;
-		io->completed_16k_writes = 0;
-		io->current_leftover_idx = 0;
-		io->completed_writes = 0;
+	// Calculate and store 64KB chunks and leftover counts
+	io->num_64k_chunks = io->batch_count / GcIo::BLOCKS_PER_64K;
+	io->leftover_blocks = io->batch_count % GcIo::BLOCKS_PER_64K;
+	io->completed_64k_writes = 0;
+	io->current_leftover_idx = 0;
+	io->completed_writes = 0;
 
-		// Pre-calculate expected writes (accounting for stripe boundary splits)
-		// STRIPE_CHUNK_BLOCKS is defined as 32 in log_cache_segment.h
-		io->expected_16k_writes = 0;
-		for (size_t chunk = 0; chunk < io->num_16k_chunks; ++chunk) {
-			size_t chunk_start = chunk * BLOCKS_PER_16K;
-			size_t first_block_idx = io->batch_start + chunk_start;
-			size_t last_block_in_chunk = first_block_idx + BLOCKS_PER_16K - 1;
+	// Pre-calculate expected writes (accounting for stripe boundary splits)
+	// STRIPE_CHUNK_BLOCKS is defined as 32 in log_cache_segment.h
+	io->expected_64k_writes = 0;
+	for (size_t chunk = 0; chunk < io->num_64k_chunks; ++chunk) {
+		size_t chunk_start = chunk * GcIo::BLOCKS_PER_64K;
+		size_t first_block_idx = io->batch_start + chunk_start;
+		size_t last_block_in_chunk = first_block_idx + GcIo::BLOCKS_PER_64K - 1;
 
-			// Bounds check to prevent out-of-range access
-			if (last_block_in_chunk >= blocks.size()) {
-				SPDK_ERRLOG("GC: bounds error in pre-calc: last_block_in_chunk=%zu >= blocks.size()=%zu\n",
-					    last_block_in_chunk, blocks.size());
-				io->expected_16k_writes += 1;  // Safe fallback
-				continue;
-			}
-
-			size_t first_dst_idx = blocks[first_block_idx].dst_idx;
-			size_t last_dst_idx = blocks[last_block_in_chunk].dst_idx;
-			bool crosses_stripe = (first_dst_idx / STRIPE_CHUNK_BLOCKS) != (last_dst_idx / STRIPE_CHUNK_BLOCKS);
-			io->expected_16k_writes += crosses_stripe ? BLOCKS_PER_16K : 1;
+		// Bounds check to prevent out-of-range access
+		if (last_block_in_chunk >= blocks.size()) {
+			io->expected_64k_writes += 1;  // Safe fallback
+			continue;
 		}
 
-		SPDK_NOTICELOG("GC: Starting writes - 16K_chunks=%zu, expected_writes=%zu, leftover_blocks=%zu\n",
-			       io->num_16k_chunks, io->expected_16k_writes, io->leftover_blocks);
+		size_t first_dst_idx = blocks[first_block_idx].dst_idx;
+		size_t last_dst_idx = blocks[last_block_in_chunk].dst_idx;
+		bool crosses_stripe = (first_dst_idx / STRIPE_CHUNK_BLOCKS) != (last_dst_idx / STRIPE_CHUNK_BLOCKS);
+		io->expected_64k_writes += crosses_stripe ? GcIo::BLOCKS_PER_64K : 1;
+	}
 
-		// If no 16KB chunks, start leftover immediately (sequential)
-		if (io->num_16k_chunks == 0) {
-			if (io->leftover_blocks > 0) {
-				gc_submit_next_leftover(io);
-			} else {
-				// No writes needed, move to next batch
-				io->state = GcIoState::WRITE_GC_DONE;
-				io->batch_start += io->batch_count;
-				gc_start_batch(io);
-			}
-			return;
+	// If no 64KB chunks, start leftover immediately (sequential)
+	if (io->num_64k_chunks == 0) {
+		if (io->leftover_blocks > 0) {
+			gc_submit_next_leftover(io);
+		} else {
+			// No writes needed, move to next batch
+			io->state = GcIoState::WRITE_GC_DONE;
+			io->batch_start += io->batch_count;
+			gc_start_batch(io);
+		}
+		return;
+	}
+
+	// Submit 64KB aligned chunks using scatter-gather (parallel, within 1MB window)
+	// Check stripe boundary: STRIPE_CHUNK_BLOCKS=32, don't batch across stripe chunks
+	for (size_t chunk = 0; chunk < io->num_64k_chunks; ++chunk) {
+		size_t chunk_start = chunk * GcIo::BLOCKS_PER_64K;
+		size_t first_block_idx = io->batch_start + chunk_start;
+		size_t last_block_in_chunk = first_block_idx + GcIo::BLOCKS_PER_64K - 1;
+
+		// Bounds check to prevent out-of-range access
+		if (last_block_in_chunk >= blocks.size()) {
+			io->completed_64k_writes++;  // Skip this chunk
+			continue;
 		}
 
-		// Submit 16KB aligned chunks using scatter-gather (parallel, within 1MB window)
-		// Check stripe boundary: STRIPE_CHUNK_BLOCKS=32, don't batch across stripe chunks
-		for (size_t chunk = 0; chunk < io->num_16k_chunks; ++chunk) {
-			size_t chunk_start = chunk * BLOCKS_PER_16K;
-			size_t first_block_idx = io->batch_start + chunk_start;
-			size_t last_block_in_chunk = first_block_idx + BLOCKS_PER_16K - 1;
+		// Get dst_idx for first and last block in this 64KB chunk
+		size_t first_dst_idx = blocks[first_block_idx].dst_idx;
+		size_t last_dst_idx = blocks[last_block_in_chunk].dst_idx;
 
-			// Bounds check to prevent out-of-range access
-			if (last_block_in_chunk >= blocks.size()) {
-				SPDK_ERRLOG("GC: bounds error in write loop: last_block_in_chunk=%zu >= blocks.size()=%zu\n",
-					    last_block_in_chunk, blocks.size());
-				io->completed_16k_writes++;  // Skip this chunk
-				continue;
-			}
+		// Check if they're in the same stripe chunk (STRIPE_CHUNK_BLOCKS = 32)
+		bool crosses_stripe = (first_dst_idx / STRIPE_CHUNK_BLOCKS) != (last_dst_idx / STRIPE_CHUNK_BLOCKS);
 
-			// Get dst_idx for first and last block in this 16KB chunk
-			size_t first_dst_idx = blocks[first_block_idx].dst_idx;
-			size_t last_dst_idx = blocks[last_block_in_chunk].dst_idx;
-
-			// Check if they're in the same stripe chunk (STRIPE_CHUNK_BLOCKS = 32)
-			bool crosses_stripe = (first_dst_idx / STRIPE_CHUNK_BLOCKS) != (last_dst_idx / STRIPE_CHUNK_BLOCKS);
-
-			if (crosses_stripe) {
-				// Stripe boundary crossed - write each block individually
-				SPDK_NOTICELOG("GC: 16K chunk %zu crosses stripe boundary (dst_idx %zu-%zu), writing individually\n",
-					       chunk, first_dst_idx, last_dst_idx);
-				int gc_placement_handle = io->prepare_result.gc_stream_id % FDP_NUM_PLACEMENT_HANDLES;
-				for (size_t i = 0; i < BLOCKS_PER_16K; ++i) {
-					size_t block_idx = first_block_idx + i;
-					uint8_t *src = static_cast<uint8_t*>(io->staging) + (chunk_start + i) * block_size;
-					uint64_t dst_offset = blocks[block_idx].dst_offset;
-
-					// Allocate single iovec for this block
-					struct iovec *single_iov = static_cast<struct iovec*>(malloc(sizeof(struct iovec)));
-					if (!single_iov) {
-						io->last_status = -ENOMEM;
-						io->completed_16k_writes++;
-						continue;
-					}
-					single_iov->iov_base = src;
-					single_iov->iov_len = block_size;
-
-					struct GcWriteCtx {
-						GcIo *io;
-						struct iovec *iovs;
-					};
-					auto *write_ctx = new (std::nothrow) GcWriteCtx{io, single_iov};
-					if (!write_ctx) {
-						free(single_iov);
-						io->last_status = -ENOMEM;
-						io->completed_16k_writes++;
-						continue;
-					}
-
-					// Use writev with single iovec to pass placement handle
-					int rc = io->ctx->device->writev_cache_async(dst_offset, single_iov, 1,
-										     block_size, gc_write_done,
-										     write_ctx, gc_placement_handle);
-					if (rc == 0) {
-						io->ctx->cache->add_gc_write_bytes(block_size);
-					} else {
-						free(single_iov);
-						delete write_ctx;
-						io->last_status = rc;
-						io->completed_16k_writes++;
-					}
-				}
-				continue;
-			}
-
-			// Allocate iovec for this chunk
-			struct iovec *iovs = static_cast<struct iovec*>(calloc(BLOCKS_PER_16K, sizeof(struct iovec)));
-			if (!iovs) {
-				io->last_status = -ENOMEM;
-				io->completed_16k_writes++;
-				continue;
-			}
-
-			// Setup iovecs
-			uint64_t first_dst_offset = blocks[first_block_idx].dst_offset;
-			for (size_t i = 0; i < BLOCKS_PER_16K; ++i) {
-				uint8_t *src = static_cast<uint8_t*>(io->staging) + (chunk_start + i) * block_size;
-				iovs[i].iov_base = src;
-				iovs[i].iov_len = block_size;
-			}
-
-			struct GcWriteCtx {
-				GcIo *io;
-				struct iovec *iovs;
-			};
-			auto *write_ctx = new (std::nothrow) GcWriteCtx{io, iovs};
-			if (!write_ctx) {
-				free(iovs);
-				io->last_status = -ENOMEM;
-				io->completed_16k_writes++;
-				continue;
-			}
-
-			// 16KB scatter-gather write with FDP placement handle
+		if (crosses_stripe) {
+			// Stripe boundary crossed - write each block individually
 			int gc_placement_handle = io->prepare_result.gc_stream_id % FDP_NUM_PLACEMENT_HANDLES;
-			int rc = io->ctx->device->writev_cache_async(first_dst_offset, iovs, BLOCKS_PER_16K,
-								     BLOCKS_PER_16K * block_size,
-								     gc_write_done, write_ctx, gc_placement_handle);
-			if (rc == 0) {
-				// Track GC write bytes for WAF calculation
-				io->ctx->cache->add_gc_write_bytes(BLOCKS_PER_16K * block_size);
-			} else {
-				free(iovs);
-				delete write_ctx;
-				io->last_status = rc;
-				io->completed_16k_writes++;
+			for (size_t i = 0; i < GcIo::BLOCKS_PER_64K; ++i) {
+				size_t block_idx = first_block_idx + i;
+				uint8_t *src = static_cast<uint8_t*>(io->staging) + (chunk_start + i) * block_size;
+				uint64_t dst_offset = blocks[block_idx].dst_offset;
+
+				// Allocate single iovec for this block
+				struct iovec *single_iov = static_cast<struct iovec*>(malloc(sizeof(struct iovec)));
+				if (!single_iov) {
+					io->last_status = -ENOMEM;
+					io->completed_64k_writes++;
+					continue;
+				}
+				single_iov->iov_base = src;
+				single_iov->iov_len = block_size;
+
+				struct GcWriteCtx {
+					GcIo *io;
+					struct iovec *iovs;
+				};
+				auto *write_ctx = new (std::nothrow) GcWriteCtx{io, single_iov};
+				if (!write_ctx) {
+					free(single_iov);
+					io->last_status = -ENOMEM;
+					io->completed_64k_writes++;
+					continue;
+				}
+
+				// Use writev with single iovec to pass placement handle
+				int rc = io->ctx->device->writev_cache_async(dst_offset, single_iov, 1,
+									     block_size, gc_write_done,
+									     write_ctx, gc_placement_handle);
+				if (rc == 0) {
+					io->ctx->cache->add_gc_write_bytes(block_size);
+				} else {
+					free(single_iov);
+					delete write_ctx;
+					io->last_status = rc;
+					io->completed_64k_writes++;
+				}
 			}
+			continue;
 		}
 
-		SPDK_NOTICELOG("GC: All 16K writes submitted, completed_16k=%zu, expected=%zu\n",
-			       io->completed_16k_writes, io->expected_16k_writes);
+		// Allocate iovec for this 64KB chunk
+		struct iovec *iovs = static_cast<struct iovec*>(calloc(GcIo::BLOCKS_PER_64K, sizeof(struct iovec)));
+		if (!iovs) {
+			io->last_status = -ENOMEM;
+			io->completed_64k_writes++;
+			continue;
+		}
 
-		// Check if all 16KB writes completed synchronously (error case)
-		if (io->completed_16k_writes >= io->expected_16k_writes) {
-			SPDK_NOTICELOG("GC: All 16K writes done synchronously (error case?)\n");
-			if (io->leftover_blocks > 0) {
-				gc_submit_next_leftover(io);
-			} else {
-				io->state = GcIoState::WRITE_GC_DONE;
-				io->batch_start += io->batch_count;
-				gc_start_batch(io);
-			}
+		// Setup iovecs
+		uint64_t first_dst_offset = blocks[first_block_idx].dst_offset;
+		for (size_t i = 0; i < GcIo::BLOCKS_PER_64K; ++i) {
+			uint8_t *src = static_cast<uint8_t*>(io->staging) + (chunk_start + i) * block_size;
+			iovs[i].iov_base = src;
+			iovs[i].iov_len = block_size;
+		}
+
+		struct GcWriteCtx {
+			GcIo *io;
+			struct iovec *iovs;
+		};
+		auto *write_ctx = new (std::nothrow) GcWriteCtx{io, iovs};
+		if (!write_ctx) {
+			free(iovs);
+			io->last_status = -ENOMEM;
+			io->completed_64k_writes++;
+			continue;
+		}
+
+		// 64KB scatter-gather write with FDP placement handle
+		int gc_placement_handle = io->prepare_result.gc_stream_id % FDP_NUM_PLACEMENT_HANDLES;
+		int rc = io->ctx->device->writev_cache_async(first_dst_offset, iovs, GcIo::BLOCKS_PER_64K,
+							     GcIo::BLOCKS_PER_64K * block_size,
+							     gc_write_done, write_ctx, gc_placement_handle);
+		if (rc == 0) {
+			// Track GC write bytes for WAF calculation
+			io->ctx->cache->add_gc_write_bytes(GcIo::BLOCKS_PER_64K * block_size);
+		} else {
+			free(iovs);
+			delete write_ctx;
+			io->last_status = rc;
+			io->completed_64k_writes++;
+		}
+	}
+
+	// Check if all 64KB writes completed synchronously (error case)
+	if (io->completed_64k_writes >= io->expected_64k_writes) {
+		if (io->leftover_blocks > 0) {
+			gc_submit_next_leftover(io);
+		} else {
+			io->state = GcIoState::WRITE_GC_DONE;
+			io->batch_start += io->batch_count;
+			gc_start_batch(io);
 		}
 	}
 }
@@ -2968,7 +3307,6 @@ static void gc_submit_next_leftover(GcIo *io)
 {
 	auto &blocks = io->prepare_result.blocks_to_copy;
 	uint32_t block_size = io->ctx->block_size;
-	constexpr size_t BLOCKS_PER_16K = 4;
 
 	// Check if all leftovers done
 	if (io->current_leftover_idx >= io->leftover_blocks) {
@@ -2980,7 +3318,7 @@ static void gc_submit_next_leftover(GcIo *io)
 	}
 
 	// Calculate leftover block position
-	size_t leftover_start = io->num_16k_chunks * BLOCKS_PER_16K;
+	size_t leftover_start = io->num_64k_chunks * GcIo::BLOCKS_PER_64K;
 	size_t block_idx = io->batch_start + leftover_start + io->current_leftover_idx;
 	auto &blk = blocks[block_idx];
 	uint8_t *src = static_cast<uint8_t*>(io->staging) +
@@ -3022,8 +3360,8 @@ static void gc_write_done(void *cb_arg, int status)
 	GcIo *io = ctx->io;
 
 	// iovs == nullptr means leftover write
-	// iovs != nullptr means 16KB-type write (normal batch or stripe-split individual)
-	bool is_16k_write = (ctx->iovs != nullptr);
+	// iovs != nullptr means 64KB-type write (normal batch or stripe-split individual)
+	bool is_64k_write = (ctx->iovs != nullptr);
 
 	// Free iovec array if it was a scatter-gather write
 	if (ctx->iovs) {
@@ -3032,26 +3370,23 @@ static void gc_write_done(void *cb_arg, int status)
 	delete ctx;
 
 	if (status != 0) {
-		SPDK_ERRLOG("GC: write_done failed, is_16k=%d, status=%d\n", is_16k_write, status);
+		SPDK_ERRLOG("GC: write_done failed, is_64k=%d, status=%d\n", is_64k_write, status);
 		if (io->last_status == 0) {
 			io->last_status = status;
 		}
 	}
 
-	if (is_16k_write) {
-		// 16KB-type write completed (normal batch or stripe-split individual)
-		io->completed_16k_writes++;
+	if (is_64k_write) {
+		// 64KB-type write completed (normal batch or stripe-split individual)
+		io->completed_64k_writes++;
 
 		// Check if all expected writes done (including stripe-split individual writes)
-		if (io->completed_16k_writes >= io->expected_16k_writes) {
-			SPDK_NOTICELOG("GC: All 16K writes done (completed=%zu/%zu), starting leftovers\n",
-				       io->completed_16k_writes, io->expected_16k_writes);
+		if (io->completed_64k_writes >= io->expected_64k_writes) {
 			// Start leftover sequential writes (if any)
 			if (io->leftover_blocks > 0) {
 				gc_submit_next_leftover(io);
 			} else {
 				// No leftovers, move to next batch
-				SPDK_NOTICELOG("GC: No leftovers, moving to next batch\n");
 				io->state = GcIoState::WRITE_GC_DONE;
 				io->batch_start += io->batch_count;
 				gc_start_batch(io);
@@ -3065,10 +3400,187 @@ static void gc_write_done(void *cb_arg, int status)
 }
 
 //==============================================================================
+// GC Sequential Read Mode (128k chunks, pipeline read->write)
+//==============================================================================
+
+// Context for sequential read - includes chunk index
+struct GcSeqReadCtx {
+	GcIo *io;
+	size_t batch_idx;  // Which chunk in current parallel batch
+};
+
+static void gc_start_seq_batch(GcIo *io)
+{
+	// Record previous batch timing
+	if (io->seq_current_chunk > 0 && io->write_start > 0) {
+		io->write_ticks += spdk_get_ticks() - io->write_start;
+	}
+
+	// Check if all chunks done
+	if (io->seq_current_chunk >= io->seq_chunks.size()) {
+		io->state = GcIoState::GC_SEGMENT_DONE;
+		io->ctx->cache->cache()->finalize_gc_async(io->prepare_result, gc_finalize_done, io);
+		return;
+	}
+
+	uint32_t block_size = io->ctx->block_size;
+	constexpr size_t CHUNK_SIZE = GcIo::SEQ_CHUNK_BLOCKS * 4096;  // 128KB
+
+	// Calculate batch size (up to SEQ_PARALLEL_CHUNKS = 8)
+	size_t remaining = io->seq_chunks.size() - io->seq_current_chunk;
+	io->seq_parallel_start = io->seq_current_chunk;
+	io->seq_parallel_count = std::min(remaining, GcIo::SEQ_PARALLEL_CHUNKS);
+
+	// Free previous staging buffer
+	if (io->staging) {
+		icache::dma_pool_free(io->staging, io->staging_size);
+		io->staging = nullptr;
+	}
+
+	// Allocate staging for parallel chunks (8 * 128KB = 1MB)
+	io->staging_size = io->seq_parallel_count * CHUNK_SIZE;
+	io->staging = icache::dma_pool_alloc(io->staging_size);
+	if (!io->staging) {
+		io->ctx->cache->set_gc_in_progress(false);
+		gc_io_complete(io, -ENOMEM);
+		return;
+	}
+
+	// Count total writes expected
+	io->seq_total_writes = 0;
+	for (size_t i = 0; i < io->seq_parallel_count; ++i) {
+		io->seq_total_writes += io->seq_chunks[io->seq_parallel_start + i].valid_block_indices.size();
+	}
+
+	io->seq_reads_done.store(0);
+	io->seq_writes_done.store(0);
+	io->read_start = spdk_get_ticks();
+
+	LogCacheSegment *victim = io->prepare_result.victim_seg;
+
+	// Issue parallel 128k reads
+	for (size_t batch_idx = 0; batch_idx < io->seq_parallel_count; ++batch_idx) {
+		auto &sc = io->seq_chunks[io->seq_parallel_start + batch_idx];
+		void *buf = static_cast<uint8_t*>(io->staging) + batch_idx * CHUNK_SIZE;
+
+		// Calculate cache offset for this 128k chunk
+		uint64_t cache_offset = victim->get_block_offset(sc.chunk_idx * GcIo::SEQ_CHUNK_BLOCKS, block_size);
+
+		auto *read_ctx = new (std::nothrow) GcSeqReadCtx{io, batch_idx};
+		if (!read_ctx) {
+			io->last_status = -ENOMEM;
+			io->seq_reads_done++;
+			io->seq_writes_done.fetch_add(sc.valid_block_indices.size());
+			continue;
+		}
+
+		int rc = io->ctx->device->read_cache_async(cache_offset, buf, CHUNK_SIZE,
+							   gc_seq_read_done, read_ctx);
+		if (rc != 0) {
+			delete read_ctx;
+			io->last_status = rc;
+			io->seq_reads_done++;
+			io->seq_writes_done.fetch_add(sc.valid_block_indices.size());
+		}
+	}
+
+	// Check if all completed synchronously
+	if (io->seq_writes_done.load() >= io->seq_total_writes) {
+		io->seq_current_chunk += io->seq_parallel_count;
+		gc_start_seq_batch(io);
+	}
+}
+
+static void gc_seq_read_done(void *cb_arg, int status)
+{
+	auto *ctx = static_cast<GcSeqReadCtx *>(cb_arg);
+	GcIo *io = ctx->io;
+	size_t batch_idx = ctx->batch_idx;
+	delete ctx;
+
+	if (status != 0) {
+		io->last_status = status;
+		// Mark all writes from this chunk as done
+		auto &sc = io->seq_chunks[io->seq_parallel_start + batch_idx];
+		size_t done = io->seq_writes_done.fetch_add(sc.valid_block_indices.size()) + sc.valid_block_indices.size();
+		if (done >= io->seq_total_writes) {
+			io->read_ticks += spdk_get_ticks() - io->read_start;
+			io->seq_current_chunk += io->seq_parallel_count;
+			gc_start_seq_batch(io);
+		}
+		return;
+	}
+
+	size_t reads_done = ++io->seq_reads_done;
+	if (reads_done == io->seq_parallel_count) {
+		io->read_ticks += spdk_get_ticks() - io->read_start;
+		io->write_start = spdk_get_ticks();
+	}
+
+	// Immediately start writing valid blocks from this chunk
+	auto &sc = io->seq_chunks[io->seq_parallel_start + batch_idx];
+	auto &blocks = io->prepare_result.blocks_to_copy;
+	uint32_t block_size = io->ctx->block_size;
+	constexpr size_t CHUNK_SIZE = GcIo::SEQ_CHUNK_BLOCKS * 4096;
+
+	int gc_placement_handle = io->prepare_result.gc_stream_id % FDP_NUM_PLACEMENT_HANDLES;
+
+	for (size_t idx : sc.valid_block_indices) {
+		auto &blk = blocks[idx];
+		// Calculate offset within the 128k staging buffer
+		size_t block_in_chunk = blk.src_idx % GcIo::SEQ_CHUNK_BLOCKS;
+		uint8_t *src = static_cast<uint8_t*>(io->staging) + batch_idx * CHUNK_SIZE + block_in_chunk * block_size;
+
+		auto *write_ctx = new (std::nothrow) GcSeqReadCtx{io, batch_idx};
+		if (!write_ctx) {
+			io->last_status = -ENOMEM;
+			size_t done = ++io->seq_writes_done;
+			if (done >= io->seq_total_writes) {
+				io->seq_current_chunk += io->seq_parallel_count;
+				gc_start_seq_batch(io);
+			}
+			continue;
+		}
+
+		int rc = io->ctx->device->write_cache_async(blk.dst_offset, src, block_size,
+							    gc_seq_write_done, write_ctx);
+		if (rc == 0) {
+			io->ctx->cache->add_gc_write_bytes(block_size);
+		} else {
+			delete write_ctx;
+			io->last_status = rc;
+			size_t done = ++io->seq_writes_done;
+			if (done >= io->seq_total_writes) {
+				io->seq_current_chunk += io->seq_parallel_count;
+				gc_start_seq_batch(io);
+			}
+		}
+	}
+}
+
+static void gc_seq_write_done(void *cb_arg, int status)
+{
+	auto *ctx = static_cast<GcSeqReadCtx *>(cb_arg);
+	GcIo *io = ctx->io;
+	delete ctx;
+
+	if (status != 0 && io->last_status == 0) {
+		io->last_status = status;
+	}
+
+	size_t done = ++io->seq_writes_done;
+	if (done >= io->seq_total_writes) {
+		io->write_ticks += spdk_get_ticks() - io->write_start;
+		io->seq_current_chunk += io->seq_parallel_count;
+		gc_start_seq_batch(io);
+	}
+}
+
+//==============================================================================
 // Evict State Machine (128k chunk reads + pipelined 4k writes)
 //==============================================================================
 
-// Callback for async finalize_evict completion
+// Callback for async finalize_evict completion (zone reset done)
 static void evict_finalize_done(void *cb_arg, int status)
 {
 	EvictIo *io = static_cast<EvictIo *>(cb_arg);
@@ -3318,9 +3830,6 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 {
 	LogCacheAsync *cache = ctx->cache.get();
 
-	SPDK_NOTICELOG("start_gc_or_evict: entering, gc_in_progress=%d, evict_in_progress=%d, free_segs=%zu\n",
-		       cache->gc_in_progress(), cache->evict_in_progress(), cache->free_segment_count());
-
 	if (cache->gc_in_progress() || cache->evict_in_progress()) {
 		// Already running
 		if (on_complete) on_complete(0);
@@ -3335,15 +3844,11 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 
 
 	// Try GC first (compaction)
-	SPDK_NOTICELOG("start_gc_or_evict: calling prepare_gc\n");
 	LogCache::GcPrepareResult gc_result;
 	bool gc_prepared = cache->cache()->prepare_gc(gc_result);
-	SPDK_NOTICELOG("GC: prepare_gc returned %d, do_evict_only=%d, blocks_to_copy=%zu\n",
-	       gc_prepared, gc_result.do_evict_only, gc_result.blocks_to_copy.size());
 	if (gc_prepared) {
 		if (!gc_result.do_evict_only && !gc_result.blocks_to_copy.empty()) {
 			// Do GC (compaction)
-			SPDK_NOTICELOG("GC: Starting compaction with %zu blocks\n", gc_result.blocks_to_copy.size());
 			cache->set_gc_in_progress(true);
 
 			auto *gc_io = new (std::nothrow) GcIo();
@@ -3360,6 +3865,18 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 			gc_io->completed_writes = 0;
 			gc_io->last_status = 0;
 			gc_io->on_complete = std::move(on_complete);
+			gc_io->start_ticks = spdk_get_ticks();
+			gc_io->total_gc_bytes = gc_io->prepare_result.blocks_to_copy.size() * ctx->block_size;
+
+			// Calculate valid ratio for read strategy
+			auto *victim = gc_io->prepare_result.victim_seg;
+			gc_io->segment_size_blocks = victim->blocks.size();
+			gc_io->segment_base_offset = victim->physical_bases[0];
+			gc_io->valid_ratio = (double)victim->valid_cnt / gc_io->segment_size_blocks;
+			gc_io->use_sequential_read = (gc_io->valid_ratio >= 0.5);
+
+			SPDK_NOTICELOG("GC: valid_ratio=%.1f%%, use_sequential_read=%d\n",
+				       gc_io->valid_ratio * 100, gc_io->use_sequential_read);
 
 			gc_io_state_machine(gc_io);
 			return;
@@ -3436,11 +3953,6 @@ static void process_pending_writes(log_cache_ctx *ctx)
 {
 	LogCacheAsync *cache = ctx->cache.get();
 
-	SPDK_NOTICELOG("process_pending_writes: pending=%zu, need_gc_or_evict=%d, gc_in_progress=%d, evict_in_progress=%d, flush_pending=%d, free_segs=%zu\n",
-		       cache->pending_writes().size(), cache->need_gc_or_evict(),
-		       cache->gc_in_progress(), cache->evict_in_progress(),
-		       cache->flush_pending(), cache->cache()->free_segment_count());
-
 	// Retry pending flush_write_buffer if needed
 	if (cache->flush_pending() && !cache->need_gc_or_evict()) {
 		cache->set_flush_pending(false);
@@ -3448,9 +3960,20 @@ static void process_pending_writes(log_cache_ctx *ctx)
 	}
 
 	while (!cache->pending_writes().empty()) {
+		// Check GC requirement first (segment space)
 		if (cache->need_gc_or_evict()) {
 			// Need more GC/Evict
-			SPDK_NOTICELOG("process_pending_writes: need more gc/evict\n");
+			if (!cache->gc_in_progress() && !cache->evict_in_progress()) {
+				start_gc_or_evict(ctx, [ctx](int status) {
+					process_pending_writes(ctx);
+				});
+			}
+			return;
+		}
+
+		// Check QoS throttle (rate limit)
+		if (cache->throttle_should_block()) {
+			// Rate limited - trigger GC to unblock
 			if (!cache->gc_in_progress() && !cache->evict_in_progress()) {
 				start_gc_or_evict(ctx, [ctx](int status) {
 					process_pending_writes(ctx);
@@ -3464,9 +3987,14 @@ static void process_pending_writes(log_cache_ctx *ctx)
 
 		// Resume write
 		io->state = CacheIoState::HOST_WRITE_SUBMIT;
+
+		// If IO was blocked at start (not mid-write), record blocks now
+		if (io->current_block_idx == 0) {
+			cache->throttle_record_host_write(io->total_blocks);
+		}
+
 		host_write_next_block(io);
 	}
-	SPDK_NOTICELOG("process_pending_writes: done, pending=%zu\n", cache->pending_writes().size());
 }
 
 //==============================================================================

@@ -488,6 +488,14 @@ LogCacheSegment* LogCache::alloc_segment(bool shrink)
     LogCacheSegment* s = free_pool.front();
     free_pool.pop_front();
     s->reset();
+
+    // Log when free segments drop to critical level
+    size_t remaining = free_pool.size();
+    if (remaining <= ASYNC_RESERVE_SEGMENTS) {
+        SPDK_WARNLOG("LOW FREE SEGMENTS: %zu remaining (shrink=%d, async=%d)\n",
+                     remaining, shrink, async_mode_);
+    }
+
     return s;
 }
 
@@ -743,6 +751,7 @@ void LogCache::complete_segment_reset(LogCacheSegment* s)
 {
     if (s) {
         free_pool.push_back(s);
+        SPDK_NOTICELOG("SEGMENT FREED: free_pool=%zu\n", free_pool.size());
     }
 }
 
@@ -1243,7 +1252,9 @@ void LogCache::finalize_evict(EvictPrepareResult &result)
 
             long key = chunk.backend_keys[i];
             auto it = mapping.find(key);
-            if (it != mapping.end()) {
+            // Only invalidate if mapping still points to victim segment
+            // If host write came during evict, new data wins - don't touch it
+            if (it != mapping.end() && it->second.seg == victim) {
                 auto &blk = it->second.seg->blocks[it->second.idx];
                 if (blk.valid) {
                     if (is_ghost_cache) {
@@ -1342,7 +1353,9 @@ void LogCache::finalize_evict_async(EvictPrepareResult &result, cache_device_io_
 
             long key = chunk.backend_keys[i];
             auto it = mapping.find(key);
-            if (it != mapping.end()) {
+            // Only invalidate if mapping still points to victim segment
+            // If host write came during evict, new data wins - don't touch it
+            if (it != mapping.end() && it->second.seg == victim) {
                 auto &blk = it->second.seg->blocks[it->second.idx];
                 if (blk.valid) {
                     if (is_ghost_cache) {
