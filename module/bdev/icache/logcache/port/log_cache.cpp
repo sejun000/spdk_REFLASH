@@ -994,10 +994,31 @@ bool LogCache::get_cache_location(long key, uint64_t *offset)
     if (it == mapping.end()) {
         return false;
     }
-    if (!it->second.seg->blocks[it->second.idx].valid) {
+
+    LogCacheSegment *seg = it->second.seg;
+    size_t idx = it->second.idx;
+
+    // Validation: check segment and index are valid
+    if (!seg) {
+        fprintf(stderr, "ERROR: get_cache_location key=%ld has NULL segment!\n", key);
         return false;
     }
-    *offset = block_offset(it->second.seg, it->second.idx);
+    if (idx >= seg->blocks.size()) {
+        fprintf(stderr, "ERROR: get_cache_location key=%ld has idx=%zu >= blocks.size=%zu!\n",
+                key, idx, seg->blocks.size());
+        return false;
+    }
+    if (!seg->blocks[idx].valid) {
+        return false;
+    }
+    // Validation: check that the block's key matches our lookup key
+    if (seg->blocks[idx].key != key) {
+        fprintf(stderr, "ERROR: get_cache_location key=%ld but block.key=%ld (mismatch)!\n",
+                key, seg->blocks[idx].key);
+        return false;
+    }
+
+    *offset = block_offset(seg, idx);
     return true;
 }
 
@@ -1095,6 +1116,7 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
             info.key = blk.key;
             info.src_idx = i;
             info.create_timestamp = blk.create_timestamp;
+            info.dst_seg = result.target_seg;  // CRITICAL: Store per-block target segment
             result.blocks_to_copy.push_back(info);
 
             // Reserve slot in target segment
@@ -1171,11 +1193,17 @@ bool LogCache::prepare_evict(EvictPrepareResult &result)
 void LogCache::finalize_gc(GcPrepareResult &result)
 {
     LogCacheSegment *victim = result.victim_seg;
-    LogCacheSegment *target = result.target_seg;
 
     // Update mapping for copied blocks
     for (auto &info : result.blocks_to_copy) {
         auto &src_blk = victim->blocks[info.src_idx];
+
+        // CRITICAL: Use per-block target segment, NOT result.target_seg
+        LogCacheSegment *dst_seg = info.dst_seg;
+        if (!dst_seg) {
+            src_blk.valid = false;
+            continue;
+        }
 
         // Check if mapping still points to victim segment
         // If not, a new write came in during GC - discard GC copy result
@@ -1189,25 +1217,31 @@ void LogCache::finalize_gc(GcPrepareResult &result)
         // Use stored destination index (needed for striping)
         size_t dst_idx = info.dst_idx;
 
+        // Validate dst_idx is within bounds
+        if (dst_idx >= dst_seg->blocks.size()) {
+            src_blk.valid = false;
+            continue;
+        }
+
         // Update target block metadata
-        auto &dst_blk = target->blocks[dst_idx];
+        auto &dst_blk = dst_seg->blocks[dst_idx];
         dst_blk.key = info.key;
         dst_blk.valid = true;
         dst_blk.create_timestamp = info.create_timestamp;
 
-        // Update mapping
-        mapping[info.key] = {target, dst_idx};
+        // Update mapping to point to CORRECT target segment
+        mapping[info.key] = {dst_seg, dst_idx};
 
         // Update target segment
-        target->valid_cnt++;
+        dst_seg->valid_cnt++;
         compacted_blocks++;
 
         // Invalidate source
         src_blk.valid = false;
 
         // Update target segment create_timestamp
-        if (target->create_timestamp > info.create_timestamp) {
-            target->create_timestamp = info.create_timestamp;
+        if (dst_seg->create_timestamp > info.create_timestamp) {
+            dst_seg->create_timestamp = info.create_timestamp;
         }
     }
 
@@ -1227,10 +1261,7 @@ void LogCache::finalize_gc(GcPrepareResult &result)
         global_valid_blocks--;
     }
 
-    // Add target to evict policy if it has blocks
-    if (target && target->valid_cnt > 0 && !result.blocks_to_copy.empty()) {
-        // Don't add to evict policy here - it will be added when full
-    }
+    // Note: target segments will be added to evict policy when they become full
 
     // Reset victim segment
     reset_segment(victim);
@@ -1277,11 +1308,20 @@ void LogCache::finalize_evict(EvictPrepareResult &result)
 void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb, void *cb_arg)
 {
     LogCacheSegment *victim = result.victim_seg;
-    LogCacheSegment *target = result.target_seg;
 
     // Update mapping for copied blocks
     for (auto &info : result.blocks_to_copy) {
         auto &src_blk = victim->blocks[info.src_idx];
+
+        // CRITICAL: Use per-block target segment, NOT result.target_seg
+        // result.target_seg only points to the LAST segment used, which is wrong
+        // when prepare_gc had to allocate multiple target segments
+        LogCacheSegment *dst_seg = info.dst_seg;
+        if (!dst_seg) {
+            SPDK_ERRLOG("GC finalize: dst_seg is NULL for key=%ld, src_idx=%zu\n", info.key, info.src_idx);
+            src_blk.valid = false;
+            continue;
+        }
 
         // Check if mapping still points to victim segment
         // If not, a new write came in during GC - discard GC copy result
@@ -1295,25 +1335,33 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
         // Use stored destination index (needed for striping)
         size_t dst_idx = info.dst_idx;
 
+        // Validate dst_idx is within bounds
+        if (dst_idx >= dst_seg->blocks.size()) {
+            SPDK_ERRLOG("GC finalize: dst_idx=%zu out of bounds (size=%zu) for key=%ld\n",
+                        dst_idx, dst_seg->blocks.size(), info.key);
+            src_blk.valid = false;
+            continue;
+        }
+
         // Update target block metadata
-        auto &dst_blk = target->blocks[dst_idx];
+        auto &dst_blk = dst_seg->blocks[dst_idx];
         dst_blk.key = info.key;
         dst_blk.valid = true;
         dst_blk.create_timestamp = info.create_timestamp;
 
-        // Update mapping
-        mapping[info.key] = {target, dst_idx};
+        // Update mapping to point to CORRECT target segment
+        mapping[info.key] = {dst_seg, dst_idx};
 
         // Update target segment
-        target->valid_cnt++;
+        dst_seg->valid_cnt++;
         compacted_blocks++;
 
         // Invalidate source
         src_blk.valid = false;
 
         // Update target segment create_timestamp
-        if (target->create_timestamp > info.create_timestamp) {
-            target->create_timestamp = info.create_timestamp;
+        if (dst_seg->create_timestamp > info.create_timestamp) {
+            dst_seg->create_timestamp = info.create_timestamp;
         }
     }
 
@@ -1373,4 +1421,28 @@ void LogCache::finalize_evict_async(EvictPrepareResult &result, cache_device_io_
 
     // Reset victim segment asynchronously
     reset_segment_async(victim, cb, cb_arg);
+}
+
+void LogCache::abort_gc(GcPrepareResult &result)
+{
+    // Called when GC writes failed - return victim to evictor so it can be retried
+    LogCacheSegment *victim = result.victim_seg;
+    if (victim) {
+        // Return victim to evictor for retry
+        evictor->add(victim, log_cache_timestamp);
+    }
+
+    // Note: target_seg may have some write_ptr advanced but blocks are not marked valid
+    // This creates "holes" in the segment but is safe - they'll be reclaimed later
+    // We don't return target to free_pool because it may still be in gc_active_seg
+}
+
+void LogCache::abort_evict(EvictPrepareResult &result)
+{
+    // Called when evict writes failed - return victim to evictor so it can be retried
+    LogCacheSegment *victim = result.victim_seg;
+    if (victim) {
+        // Return victim to evictor for retry
+        evictor->add(victim, log_cache_timestamp);
+    }
 }

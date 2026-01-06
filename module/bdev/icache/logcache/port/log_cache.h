@@ -65,6 +65,7 @@ public:
         size_t src_idx;           // Source index in victim segment
         size_t dst_idx;           // Destination index in target segment (for striping)
         uint64_t create_timestamp;
+        LogCacheSegment *dst_seg; // Target segment for this block (may differ from result.target_seg when segment fills)
     };
 
     struct GcPrepareResult {
@@ -154,6 +155,8 @@ public:
     void finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb, void *cb_arg);
     void finalize_evict(EvictPrepareResult &result);
     void finalize_evict_async(EvictPrepareResult &result, cache_device_io_cb cb, void *cb_arg);
+    void abort_gc(GcPrepareResult &result);      // Returns victim to evictor when GC fails
+    void abort_evict(EvictPrepareResult &result); // Returns victim to evictor when evict fails
     uint64_t block_offset(const LogCacheSegment *seg, std::size_t idx) const;
 
     // Mapping access for async read
