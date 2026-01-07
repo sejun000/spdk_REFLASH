@@ -1821,7 +1821,7 @@ public:
 		// Zone configuration for ZNS vs FDP
 		static constexpr uint64_t ZNS_ZONE_SIZE_BLOCKS = 0x80000;      // 524288 blocks = 2GB
 		static constexpr uint64_t ZNS_ZONE_CAPACITY_BLOCKS = 0x43500;  // 275712 blocks = ~1.07GB
-		static constexpr uint64_t FDP_ZONE_SIZE_BLOCKS = 0x4000;       // 16384 blocks = 64MB
+		static constexpr uint64_t FDP_ZONE_SIZE_BLOCKS = 0x40000;      // 262144 blocks = 1GB
 
 #if FDP
 		// FDP mode: zone_size == zone_capacity (no holes in address space)
@@ -4016,6 +4016,9 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 
 			gc_io_state_machine(gc_io);
 			return;
+		} else {
+			// GC 불가 (do_evict_only 또는 blocks_to_copy 비어있음) - victim을 evictor에 반환
+			cache->cache()->abort_gc(gc_result);
 		}
 	}
 

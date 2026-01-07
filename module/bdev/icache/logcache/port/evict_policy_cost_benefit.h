@@ -38,6 +38,7 @@ public:
     void add   (Segment* seg) override;
     void remove(Segment* seg) override;
     void update(Segment* seg) override;
+    bool empty() const override { return heap_.empty(); }
 private:
     /* 실제 점수 계산: age/u  (u==0 → ∞) */
     inline double score(Segment* s) const {

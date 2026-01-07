@@ -1,4 +1,5 @@
 #include "log_cache.h"
+#include "../log_cache_config.h"
 
 #include <cassert>
 #include <cmath>
@@ -286,27 +287,34 @@ void LogCache::evict_policy_update(LogCacheSegment *s) {
 
 void LogCache::periodic() {
     if (is_ghost_cache){
-        if (log_cache_timestamp % segment_size_blocks == 0) {
+        if (log_cache_timestamp % (segment_size_blocks / 32) == 0) {
             compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
             eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
             uint64_t evicted_in_ghost = ghost_cache.evictCount();
             eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
         }
-        if (log_cache_timestamp % (segment_size_blocks * 64) == 0) {
+        if (log_cache_timestamp % (segment_size_blocks * 2) == 0) {
             if (compaction_ratio.has_value() &&
-                eviction_ratio.has_value() && 
+                eviction_ratio.has_value() &&
                 eviction_ratio_in_ghost_cache.has_value()){
-                if (6.73 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()) > compaction_ratio.value()) {
+                // eviction_ratio > 1.3이면 무조건 LOWER (full random workload → eviction-heavy)
+                if (compaction_ratio.value() > 1.3) {
+                    target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.02);
+                    SPDK_NOTICELOG("periodic: LOWER (evict>30%%) target=%.4f, evict_val=%.6f, compact_val=%.6f, evict_ratio=%.6f\n",
+                                   target_valid_blk_rate, 6.73 * eviction_ratio.value(),
+                                   compaction_ratio.value(), eviction_ratio.value());
+                }
+                else if (6.73 * eviction_ratio.value() > compaction_ratio.value()) {
                     target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + 0.02);
-                    SPDK_NOTICELOG("periodic: RISE target=%.4f, evict_val=%.6f, compact_val=%.6f, evict_ratio=%.6f, evict_ghost=%.6f\n",
-                                   target_valid_blk_rate, 6.73 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()),
-                                   compaction_ratio.value(), eviction_ratio.value(), eviction_ratio_in_ghost_cache.value());
+                    SPDK_NOTICELOG("periodic: RISE target=%.4f, evict_val=%.6f, compact_val=%.6f, evict_ratio=%.6f\n",
+                                   target_valid_blk_rate, 6.73 * eviction_ratio.value(),
+                                   compaction_ratio.value(), eviction_ratio.value());
                 }
                 else {
                     target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.02);
-                    SPDK_NOTICELOG("periodic: LOWER target=%.4f, evict_val=%.6f, compact_val=%.6f, evict_ratio=%.6f, evict_ghost=%.6f\n",
-                                   target_valid_blk_rate, 6.73 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()),
-                                   compaction_ratio.value(), eviction_ratio.value(), eviction_ratio_in_ghost_cache.value());
+                    SPDK_NOTICELOG("periodic: LOWER target=%.4f, evict_val=%.6f, compact_val=%.6f, evict_ratio=%.6f\n",
+                                   target_valid_blk_rate, 6.73 * eviction_ratio.value(),
+                                   compaction_ratio.value(), eviction_ratio.value());
                 }
             }
         }
@@ -1056,26 +1064,22 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
 
     LogCacheSegment* victim = nullptr;
     uint64_t threshold = 0;
-
+    victim = (LogCacheSegment *)evictor->choose_segment();
+    if (!victim) {
+        return false;
+    }
+    threshold = log_cache_timestamp - victim->create_timestamp + 1;
+    evictor->add(victim, log_cache_timestamp);
     if (compact) {
-        victim = (LogCacheSegment *)evictor->choose_segment();
-        threshold = log_cache_timestamp - victim->create_timestamp + 1;
-
-        if (additional_free_blks_ratio_by_gc < 0.01 ||
-            log_cache_timestamp - victim->create_timestamp < threshold) {
-            evictor->add(victim, log_cache_timestamp);
-            victim = (LogCacheSegment *)compactor->choose_segment();
-        } else {
-            compact = false;
+        victim = (LogCacheSegment *)compactor->choose_segment();
+        if (victim->valid_cnt >= 0.8 * victim->blocks.size()) {
+            return false;
+        }
+        if (!victim) {
+            return false;
         }
     }
-
-    if (!compact) {
-        victim = (LogCacheSegment *)evictor->choose_segment();
-        threshold = log_cache_timestamp - victim->create_timestamp;
-    }
-
-    if (!victim) {
+    else {
         return false;
     }
 
