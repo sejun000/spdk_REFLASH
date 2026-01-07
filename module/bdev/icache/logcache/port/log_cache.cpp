@@ -298,19 +298,15 @@ void LogCache::periodic() {
                 eviction_ratio_in_ghost_cache.has_value()){
                 if (6.73 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()) > compaction_ratio.value()) {
                     target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + 0.02);
-                    /*printf("rise cache !!!!!!!! %.2f\n", target_valid_blk_rate);
-                    printf ("eviction value : %.6f\n", 2.34 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()));
-                    printf ("compaction value : %.6f\n", compaction_ratio.value());
-                    printf ("eviction_ratio : %.6f\n", eviction_ratio.value());
-                    printf ("eviction_ratio_in_ghost_cache : %.6f\n", eviction_ratio_in_ghost_cache.value());*/
+                    SPDK_NOTICELOG("periodic: RISE target=%.4f, evict_val=%.6f, compact_val=%.6f, evict_ratio=%.6f, evict_ghost=%.6f\n",
+                                   target_valid_blk_rate, 6.73 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()),
+                                   compaction_ratio.value(), eviction_ratio.value(), eviction_ratio_in_ghost_cache.value());
                 }
                 else {
                     target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.02);
-                    /*printf("lower cache !!!!!!!! %.2f\n", target_valid_blk_rate);
-                    printf ("eviction value : %.6f\n", 2.34 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()));
-                    printf ("compaction value : %.6f\n", compaction_ratio.value());
-                    printf ("eviction_ratio : %.6f\n", eviction_ratio.value());
-                    printf ("eviction_ratio_in_ghost_cache : %.6f\n", eviction_ratio_in_ghost_cache.value());*/
+                    SPDK_NOTICELOG("periodic: LOWER target=%.4f, evict_val=%.6f, compact_val=%.6f, evict_ratio=%.6f, evict_ghost=%.6f\n",
+                                   target_valid_blk_rate, 6.73 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()),
+                                   compaction_ratio.value(), eviction_ratio.value(), eviction_ratio_in_ghost_cache.value());
                 }
             }
         }
@@ -476,7 +472,11 @@ LogCacheSegment* LogCache::alloc_segment(bool shrink)
     // In async mode, keep segments reserved for GC/Evict to have room to work
     // shrink=true means host write, shrink=false means GC
     // Only block host writes when low on segments, GC must always be able to allocate
+#if FDP
+    constexpr size_t ASYNC_RESERVE_SEGMENTS = 10;  // FDP: smaller segments, need more reserve
+#else
     constexpr size_t ASYNC_RESERVE_SEGMENTS = 5;
+#endif
     if (async_mode_ && shrink && free_pool.size() <= ASYNC_RESERVE_SEGMENTS) {
         return nullptr;  // Host write blocked - caller should trigger async GC/Evict
     }
@@ -679,7 +679,11 @@ bool LogCache::is_cache_filled() {
                                            cfg_.free_ratio_low));
 
     // In async mode, trigger GC early
+#if FDP
+    constexpr size_t ASYNC_GC_TRIGGER_SEGMENTS = 50;  // FDP: smaller segments, trigger earlier
+#else
     constexpr size_t ASYNC_GC_TRIGGER_SEGMENTS = 10;
+#endif
     if (async_mode_ && free_pool.size() <= ASYNC_GC_TRIGGER_SEGMENTS) {
         return true;
     }
@@ -972,7 +976,11 @@ bool LogCache::need_gc_or_evict() const
     // In async mode, trigger GC early (before blocking host IO)
     // GC_TRIGGER: start GC while host IO continues
     // BLOCK threshold (in get_free_segment): stop host IO
+#if FDP
+    constexpr size_t ASYNC_GC_TRIGGER_SEGMENTS = 50;  // FDP: smaller segments, trigger earlier
+#else
     constexpr size_t ASYNC_GC_TRIGGER_SEGMENTS = 10;  // Start GC at <= 10 free segments
+#endif
     if (async_mode_ && free_pool.size() <= ASYNC_GC_TRIGGER_SEGMENTS) {
         // Don't trigger GC if evictor is empty (nothing to evict)
         if (evictor->empty()) {
@@ -1036,6 +1044,16 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
         }
     }
 
+    // Debug: show target_valid_blk_rate and related values
+    double current_valid_rate = (double)global_valid_blocks / total_cache_block_count;
+    SPDK_NOTICELOG("prepare_gc: compact=%d, target_valid_rate=%.4f, current_valid_rate=%.4f, "
+                   "global_valid=%lu, total_blocks=%lu, evict_ratio=%.6f, evict_ghost=%.6f, compact_ratio=%.6f\n",
+                   compact, target_valid_blk_rate, current_valid_rate,
+                   global_valid_blocks, total_cache_block_count,
+                   eviction_ratio.has_value() ? eviction_ratio.value() : -1.0,
+                   eviction_ratio_in_ghost_cache.has_value() ? eviction_ratio_in_ghost_cache.value() : -1.0,
+                   compaction_ratio.has_value() ? compaction_ratio.value() : -1.0);
+
     LogCacheSegment* victim = nullptr;
     uint64_t threshold = 0;
 
@@ -1065,6 +1083,10 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
     result.threshold = threshold;
     result.gc_stream_id = victim->get_class_num();
     result.do_evict_only = !compact;
+
+    // Set global variables for score_warm_first (async mode)
+    g_timestamp = log_cache_timestamp;
+    g_threshold = threshold;
 
     if (victim->valid_cnt == 0) {
         // No valid blocks, just reset

@@ -33,6 +33,8 @@ extern "C" {
 #include "port/evict_policy_greedy.h"
 #include "port/evict_policy_cost_benefit.h"
 #include "port/istream.h"
+#include "port/log_cache.h"
+#include "port/log_cache_segment.h"
 
 // Score functions for CbEvictPolicy (same as icache.cpp)
 static double score_age_evict(Segment *seg) {
@@ -42,20 +44,19 @@ static double score_age_evict(Segment *seg) {
 // Global variables for score_warm_first (set by LogCache during GC)
 extern uint64_t g_threshold;
 extern uint64_t g_timestamp;
-static constexpr double segments = 8192.0;
 
 static double score_warm_first(Segment *seg) {
     if (g_threshold <= 0 || g_timestamp <= 0) {
         // Fallback to simple age-based score if globals not set
         return -static_cast<double>(seg->create_timestamp);
     }
-    double u = seg->valid_cnt / segments;
+    // Use actual segment size from LogCacheSegment::blocks
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
     if (u < 0.0001) u = 0.0001;  // Avoid division by zero
     return std::min(g_threshold - (g_timestamp - seg->create_timestamp),
                     g_timestamp - seg->create_timestamp) * (1 - u) / u;
 }
-#include "port/log_cache.h"
-#include "port/log_cache_segment.h"
 
 namespace icache {
 
@@ -1820,7 +1821,7 @@ public:
 		// Zone configuration for ZNS vs FDP
 		static constexpr uint64_t ZNS_ZONE_SIZE_BLOCKS = 0x80000;      // 524288 blocks = 2GB
 		static constexpr uint64_t ZNS_ZONE_CAPACITY_BLOCKS = 0x43500;  // 275712 blocks = ~1.07GB
-		static constexpr uint64_t FDP_ZONE_SIZE_BLOCKS = 0x80000;      // 524288 blocks = 2GB
+		static constexpr uint64_t FDP_ZONE_SIZE_BLOCKS = 0x4000;       // 16384 blocks = 64MB
 
 #if FDP
 		// FDP mode: zone_size == zone_capacity (no holes in address space)
@@ -2508,13 +2509,12 @@ static int write_buffer_timeout_poller(void *arg)
 
 	LogCacheAsync *cache = ctx->cache.get();
 
-	// Proactive GC/Evict: trigger when needed, regardless of flush_pending
+	// Proactive GC/Evict: trigger when needed (but don't block flush!)
 	if (cache->need_gc_or_evict() &&
 	    !cache->gc_in_progress() && !cache->evict_in_progress()) {
 		start_gc_or_evict(ctx, [ctx](int status) {
 			process_pending_writes(ctx);
 		});
-		return SPDK_POLLER_BUSY;
 	}
 
 	if (!cache->buffer_empty()) {
@@ -4003,8 +4003,16 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 			gc_io->valid_ratio = (double)victim->valid_cnt / gc_io->segment_size_blocks;
 			gc_io->use_sequential_read = (gc_io->valid_ratio >= 0.5);
 
-			SPDK_NOTICELOG("GC: valid_ratio=%.1f%%, use_sequential_read=%d\n",
-				       gc_io->valid_ratio * 100, gc_io->use_sequential_read);
+			// Calculate score for debugging
+			double u = (double)victim->valid_cnt / victim->blocks.size();
+			if (u < 0.0001) u = 0.0001;
+			double score = (g_threshold > 0 && g_timestamp > 0) ?
+				std::min(g_threshold - (g_timestamp - victim->create_timestamp),
+				         g_timestamp - victim->create_timestamp) * (1 - u) / u : 0.0;
+			SPDK_NOTICELOG("GC: valid_ratio=%.1f%%, use_sequential_read=%d, g_threshold=%lu, g_timestamp=%lu, create_ts=%lu, age=%lu, score=%.2f\n",
+				       gc_io->valid_ratio * 100, gc_io->use_sequential_read,
+				       g_threshold, g_timestamp, victim->create_timestamp,
+				       g_timestamp - victim->create_timestamp, score);
 
 			gc_io_state_machine(gc_io);
 			return;
@@ -4087,26 +4095,16 @@ static void process_pending_writes(log_cache_ctx *ctx)
 		cache->flush_write_buffer();
 	}
 
-	while (!cache->pending_writes().empty()) {
-		// Check GC requirement first (segment space)
-		if (cache->need_gc_or_evict()) {
-			// Need more GC/Evict
-			if (!cache->gc_in_progress() && !cache->evict_in_progress()) {
-				start_gc_or_evict(ctx, [ctx](int status) {
-					process_pending_writes(ctx);
-				});
-			}
-			return;
-		}
+	// Start GC/Evict if needed (but don't block writes!)
+	if (cache->need_gc_or_evict() && !cache->gc_in_progress() && !cache->evict_in_progress()) {
+		start_gc_or_evict(ctx, [ctx](int status) {
+			process_pending_writes(ctx);
+		});
+	}
 
+	while (!cache->pending_writes().empty()) {
 		// Check QoS throttle (rate limit)
 		if (cache->throttle_should_block()) {
-			// Rate limited - trigger GC to unblock
-			if (!cache->gc_in_progress() && !cache->evict_in_progress()) {
-				start_gc_or_evict(ctx, [ctx](int status) {
-					process_pending_writes(ctx);
-				});
-			}
 			return;
 		}
 

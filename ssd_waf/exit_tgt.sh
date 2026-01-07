@@ -14,10 +14,10 @@ RPC=("$RPC_BIN" "-s" "$RPC_SOCKET")
 pids=$(pgrep -f spdk_tgt || true)
 
 # Exit early if spdk_tgt not running
-if [[ -z "$pids" ]]; then
-    echo "[exit_tgt] spdk_tgt not running"
-    exit 0
-fi
+#if [[ -z "$pids" ]]; then
+#    echo "[exit_tgt] spdk_tgt not running"
+#    exit 0
+#fi
 
 # Disconnect NVMe-oF sessions first (primary method)
 if command -v nvme >/dev/null 2>&1; then

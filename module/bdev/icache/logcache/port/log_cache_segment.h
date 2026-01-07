@@ -5,7 +5,11 @@
 #include "segment.h"
 
 // Stripe width: number of zones per segment for parallel writes
-#define STRIPE_WIDTH 2
+#if FDP
+#define STRIPE_WIDTH 1          // FDP: single zone per segment (no striping)
+#else
+#define STRIPE_WIDTH 2          // ZNS: 2 zones per segment for parallel writes
+#endif
 // Stripe chunk size in blocks (128KB = 32 * 4KB blocks)
 #define STRIPE_CHUNK_BLOCKS 32
 

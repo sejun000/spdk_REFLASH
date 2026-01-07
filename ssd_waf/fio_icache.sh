@@ -5,11 +5,42 @@
 
 UBLK_DEV_ID=${UBLK_DEV_ID:-0}
 UBLK_DEVICE="/dev/ublkb${UBLK_DEV_ID}"
-RUNTIME=${RUNTIME:-180}  # Default 2 minutes
-TEST_SIZE=${TEST_SIZE:-100G}  # 검증용 테스트 크기
+RUNTIME=${RUNTIME:-200}  # Default 2 minutes
+TEST_SIZE=${TEST_SIZE:-800G}  # 검증용 테스트 크기
 VERIFY_ONLY=${VERIFY_ONLY:-0}  # 1이면 검증만 수행
 SKIP_VERIFY=${SKIP_VERIFY:-0}  # 1이면 검증 스킵
 LOG_PREFIX="fio_bw_$(date +%Y%m%d_%H%M%S)"
+
+# Workload type: uniform (default), zipf, hotcold
+# uniform: 균등 분포 random write
+# zipf: Zipf 분포 (theta=1.2, 일부 영역에 집중)
+# hotcold: 90% writes → 10% 영역 (hot), 10% writes → 90% 영역 (cold)
+WORKLOAD=${WORKLOAD:-uniform}
+
+# Zipf theta parameter (higher = more skewed, 1.2 is typical)
+ZIPF_THETA=${ZIPF_THETA:-1.2}
+
+# Get random distribution option based on workload type
+get_random_distribution() {
+    case "$WORKLOAD" in
+        zipf)
+            echo "--random_distribution=zipf:${ZIPF_THETA}"
+            ;;
+        hotcold)
+            # 90% of IO goes to first 10% of space, 10% of IO goes to remaining 90%
+            echo "--random_distribution=zoned:90/10:10/90"
+            ;;
+        uniform|*)
+            echo ""  # Default uniform distribution
+            ;;
+    esac
+}
+
+RANDOM_DIST=$(get_random_distribution)
+echo "Workload type: ${WORKLOAD}"
+if [ -n "$RANDOM_DIST" ]; then
+    echo "Random distribution: ${RANDOM_DIST}"
+fi
 
 # Verify 모드에서는 single thread 사용 (multi-job race condition 방지)
 # multi-job으로 같은 offset에 쓰면 header는 A job, data는 B job 데이터가 될 수 있음
@@ -65,8 +96,17 @@ fi
 
 echo "=========================================="
 echo "  Phase 1: Write with verification pattern"
+echo "  Workload: ${WORKLOAD}"
 echo "=========================================="
-echo "fio random 4k write ${RUNTIME}s (with crc32c verify pattern)..."
+
+# SKIP_VERIFY일 때만 runtime/time_based 사용 (verify 시에는 size만큼 한번만 write)
+if [ "${SKIP_VERIFY}" == "1" ]; then
+    TIME_OPTS="--runtime=${RUNTIME} --time_based"
+    echo "fio random 4k write ${RUNTIME}s (${WORKLOAD} distribution)..."
+else
+    TIME_OPTS=""
+    echo "fio random 4k write ${TEST_SIZE} (${WORKLOAD} distribution, no time limit for verify)..."
+fi
 echo "BW log: ${LOG_PREFIX}_bw.*.log"
 
 sudo fio --name=random_test \
@@ -76,15 +116,15 @@ sudo fio --name=random_test \
     --bs=4k \
     --rw=randwrite \
     --size=${TEST_SIZE} \
-    --runtime=${RUNTIME} \
-    --time_based \
+    ${TIME_OPTS} \
     --numjobs=${NUMJOBS} \
     --iodepth=${IODEPTH} \
     --verify=crc32c \
     --do_verify=0 \
     --group_reporting \
     --write_bw_log=${LOG_PREFIX} \
-    --log_avg_msec=1000
+    --log_avg_msec=1000 \
+    ${RANDOM_DIST}
 
 WRITE_STATUS=$?
 
