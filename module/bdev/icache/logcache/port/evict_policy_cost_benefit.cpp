@@ -11,6 +11,7 @@ CbEvictPolicy::CbEvictPolicy(double (*func)(Segment* )) {
 void CbEvictPolicy::add(Segment* s)
 {
     assert(s);
+    if (h_.count(s)) return;  // Already in heap, skip duplicate add
     auto h = heap_.push({ score(s), s });
     h_[s]  = h;
 }

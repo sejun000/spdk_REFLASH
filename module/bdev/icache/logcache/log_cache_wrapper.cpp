@@ -36,6 +36,9 @@ extern "C" {
 #include "port/log_cache.h"
 #include "port/log_cache_segment.h"
 
+// Debug flag for offset tracking - enable to trace write/read/GC/evict offsets
+#define OFFSET_DEBUG 0
+
 // Score functions for CbEvictPolicy (same as icache.cpp)
 static double score_age_evict(Segment *seg) {
     return -static_cast<double>(seg->create_timestamp);
@@ -197,6 +200,10 @@ struct IoWaitCtx {
 struct AsyncIoCtx {
 	cache_device_io_cb user_cb;
 	void *user_cb_arg;
+	uint64_t offset;      // For error logging
+	size_t len;           // For error logging
+	bool is_read;         // true = read, false = write
+	bool is_cache;        // true = cache device, false = backend device
 };
 
 // Forward declaration
@@ -372,8 +379,10 @@ async_io_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	int status = success ? 0 : -EIO;
 	spdk_bdev_free_io(bdev_io);
 	if (!success) {
-		SPDK_ERRLOG("async_io_completion: IO failed!\n");
-		assert(false && "Async IO failed");
+		SPDK_ERRLOG("async_io_completion: IO FAILED! %s %s offset=0x%lx len=%zu\n",
+			    ctx->is_read ? "READ" : "WRITE",
+			    ctx->is_cache ? "CACHE" : "BACKEND",
+			    ctx->offset, ctx->len);
 	}
 	if (ctx->user_cb) {
 		ctx->user_cb(ctx->user_cb_arg, status);
@@ -1063,6 +1072,10 @@ private:
 		}
 		async_ctx->user_cb = cb;
 		async_ctx->user_cb_arg = cb_arg;
+		async_ctx->offset = byte_offset;
+		async_ctx->len = len;
+		async_ctx->is_read = !write;
+		async_ctx->is_cache = (desc == m_cache_desc);
 
 		int rc;
 		if (write) {
@@ -1937,15 +1950,17 @@ public:
 	// Free segment count for watermark checks
 	size_t free_segment_count() const { return cache_->free_segment_count(); }
 
+	// Returns true if free segments <= CRITICAL threshold (caller should block)
+	bool is_free_critical() const { return cache_->free_segment_count() <= CRITICAL_FREE_SEGMENTS; }
+
 	// Segment capacity for throttle calculation (freed capacity per GC/Evict)
 	uint64_t segment_capacity() const { return segment_capacity_bytes_; }
 
-	// Critical threshold - block host writes only when below this
-	static constexpr size_t CRITICAL_FREE_SEGMENTS = 5;
-
-	// 128KB Write Buffer - reduced for lower latency
-	static constexpr size_t WRITE_BUFFER_SIZE = 128 * 1024;  // 128KB
-	static constexpr uint64_t WRITE_BUFFER_TIMEOUT_US = 1000;  // 1ms
+	// 16KB Write Buffer - flush when this size is reached
+	static constexpr size_t WRITE_BUFFER_SIZE = 16 * 1024;  // 16KB
+	static constexpr uint64_t WRITE_BUFFER_TIMEOUT_US = 300;  // 300us
+	// Set to false to bypass write buffer and write directly per-block
+	static constexpr bool WRITE_BUFFER_ENABLED = true;
 	static constexpr int MAX_IN_FLIGHT_FLUSHES = 4;  // Allow 4 concurrent zone writes
 
 	struct BufferedBlock {
@@ -2223,6 +2238,8 @@ struct WriteBufferFlushCtx {
 	std::vector<LogCacheAsync::BufferedBlock> blocks;
 	std::vector<uint64_t> cache_offsets;
 	std::vector<int> stream_ids;  // For FDP placement handle
+	std::vector<long> keys;       // Keys for pending write completion
+	LogCache *cache = nullptr;    // For complete_block_writes
 	// Track IOs and their block counts in this flush
 	std::unordered_map<CacheIo*, size_t> io_block_counts;
 	// For split writes: track outstanding write count
@@ -2316,6 +2333,10 @@ void LogCacheAsync::flush_write_buffer()
 		if (!cache_->append_block_metadata(0, static_cast<long>(blk.key),
 						   static_cast<int>(block_size), &cache_offset, &stream_id)) {
 			// No free segments - need GC/Evict
+			// Clear keys that were already added to pending_writes_ before this failure
+			if (!flush_ctx->keys.empty()) {
+				cache_->complete_block_writes(flush_ctx->keys);
+			}
 			if (flush_block_count == 0) {
 				block_start_tsc = spdk_get_ticks();
 			}
@@ -2329,8 +2350,12 @@ void LogCacheAsync::flush_write_buffer()
 		}
 		flush_ctx->cache_offsets.push_back(cache_offset);
 		flush_ctx->stream_ids.push_back(stream_id);
+		flush_ctx->keys.push_back(static_cast<long>(blk.key));
 		buf_ptrs.push_back(blk.buf);
 	}
+
+	// Store cache pointer for completion
+	flush_ctx->cache = cache_.get();
 
 	// Log if we were blocked and now succeeded
 	if (flush_block_count > 0) {
@@ -2455,6 +2480,13 @@ void LogCacheAsync::flush_write_buffer()
 		// Track outstanding IO
 		g_outstanding_bytes.fetch_add(group_len);
 
+#if OFFSET_DEBUG
+		for (size_t j = 0; j < group.count; j++) {
+			size_t blk_idx = group.start_idx + j;
+			SPDK_NOTICELOG("BUFFER_WRITE_SUBMIT: key=%lu cache_offset=0x%lx\n",
+				       flush_ctx->keys[blk_idx], flush_ctx->cache_offsets[blk_idx]);
+		}
+#endif
 		int rc = device_->writev_cache_async(group.first_offset, iovs, zctx->iovcnt,
 						     group_len, zone_write_done, zctx, placement_handle);
 		if (rc != 0) {
@@ -2474,6 +2506,10 @@ static void write_buffer_flush_done(void *cb_arg, int status)
 {
 	auto *flush_ctx = static_cast<WriteBufferFlushCtx*>(cb_arg);
 
+	// Mark all blocks as write complete (clear pending)
+	if (flush_ctx->cache && !flush_ctx->keys.empty()) {
+		flush_ctx->cache->complete_block_writes(flush_ctx->keys);
+	}
 
 	// Update flushed block counts and complete IOs that are fully flushed
 	for (auto &pair : flush_ctx->io_block_counts) {
@@ -2622,6 +2658,9 @@ static uint8_t *get_iov_buf_for_block(const struct iovec *iovs, int iovcnt,
 struct ReadBlockCtx {
 	CacheIo *io;
 	size_t block_idx;
+	uint64_t key;           // LBA key for error logging
+	uint64_t read_offset;   // Actual read offset (cache or backend)
+	bool is_cache;          // true = read from cache, false = read from backend
 };
 
 static void host_read_block_done(void *cb_arg, int status);
@@ -2653,7 +2692,7 @@ static void host_read_next_block(CacheIo *io)
 		return;
 	}
 
-	auto *read_ctx = new (std::nothrow) ReadBlockCtx{io, io->current_block_idx};
+	auto *read_ctx = new (std::nothrow) ReadBlockCtx{io, io->current_block_idx, key, 0, false};
 	if (!read_ctx) {
 		SPDK_ERRLOG("READ_NEXT: failed to alloc ReadBlockCtx\n");
 		cache_io_complete(io, -ENOMEM);
@@ -2667,27 +2706,31 @@ static void host_read_next_block(CacheIo *io)
 		// Read from cache async
 		uint64_t cache_offset;
 		if (!cache->cache()->get_cache_location(static_cast<long>(key), &cache_offset)) {
-			SPDK_ERRLOG("READ_NEXT: failed to get cache location for key=%lu\n", key);
+			SPDK_ERRLOG("READ_NEXT: get_cache_location FAILED for key=%lu (exists=true but no location!)\n", key);
 			delete read_ctx;
 			cache_io_complete(io, -EIO);
 			return;
 		}
+		read_ctx->read_offset = cache_offset;
+		read_ctx->is_cache = true;
 		io->state = CacheIoState::HOST_READ_CACHE_READ;
 		int rc = cache->device()->read_cache_async(cache_offset, dest, block_size,
 							   host_read_block_done, read_ctx);
 		if (rc != 0) {
-			SPDK_ERRLOG("READ_NEXT: read_cache_async failed rc=%d\n", rc);
+			SPDK_ERRLOG("READ_NEXT: read_cache_async submit failed key=%lu offset=0x%lx rc=%d\n", key, cache_offset, rc);
 			delete read_ctx;
 			cache_io_complete(io, rc);
 		}
 	} else {
 		// Read from backend
 		uint64_t backend_offset = key * block_size;
+		read_ctx->read_offset = backend_offset;
+		read_ctx->is_cache = false;
 		io->state = CacheIoState::HOST_READ_BACKEND_READ;
 		int rc = cache->device()->read_backend_async(backend_offset, dest, block_size,
 							     host_read_block_done, read_ctx);
 		if (rc != 0) {
-			SPDK_ERRLOG("READ_NEXT: read_backend_async failed rc=%d\n", rc);
+			SPDK_ERRLOG("READ_NEXT: read_backend_async submit failed key=%lu offset=0x%lx rc=%d\n", key, backend_offset, rc);
 			delete read_ctx;
 			cache_io_complete(io, rc);
 		}
@@ -2699,10 +2742,14 @@ static void host_read_block_done(void *cb_arg, int status)
 	auto *ctx = static_cast<ReadBlockCtx *>(cb_arg);
 	CacheIo *io = ctx->io;
 	uint64_t blk_idx = ctx->block_idx;
+	uint64_t key = ctx->key;
+	uint64_t read_offset = ctx->read_offset;
+	bool is_cache = ctx->is_cache;
 	delete ctx;
 
 	if (status != 0) {
-		SPDK_ERRLOG("READ_DONE: error status=%d for blk=%lu\n", status, blk_idx);
+		SPDK_ERRLOG("READ_DONE: FAILED! key=%lu blk_idx=%lu %s offset=0x%lx status=%d\n",
+			    key, blk_idx, is_cache ? "CACHE" : "BACKEND", read_offset, status);
 		io->last_status = status;
 	}
 
@@ -2755,7 +2802,7 @@ static void cache_io_run_host_read(CacheIo *io)
 			continue;
 		}
 
-		auto *read_ctx = new (std::nothrow) ReadBlockCtx{io, blk_idx};
+		auto *read_ctx = new (std::nothrow) ReadBlockCtx{io, blk_idx, key, 0, false};
 		if (!read_ctx) {
 			io->last_status = -ENOMEM;
 			size_t done = ++io->parallel_reads_done;
@@ -2770,6 +2817,7 @@ static void cache_io_run_host_read(CacheIo *io)
 		if (cache->exists(static_cast<long>(key))) {
 			uint64_t cache_offset;
 			if (!cache->cache()->get_cache_location(static_cast<long>(key), &cache_offset)) {
+				SPDK_ERRLOG("READ_PARALLEL: get_cache_location FAILED key=%lu (exists=true but no location!)\n", key);
 				delete read_ctx;
 				io->last_status = -EIO;
 				size_t done = ++io->parallel_reads_done;
@@ -2779,15 +2827,21 @@ static void cache_io_run_host_read(CacheIo *io)
 				}
 				continue;
 			}
+			read_ctx->read_offset = cache_offset;
+			read_ctx->is_cache = true;
 			rc = cache->device()->read_cache_async(cache_offset, dest, block_size,
 							       host_read_block_done, read_ctx);
 		} else {
 			uint64_t backend_offset = key * block_size;
+			read_ctx->read_offset = backend_offset;
+			read_ctx->is_cache = false;
 			rc = cache->device()->read_backend_async(backend_offset, dest, block_size,
 								 host_read_block_done, read_ctx);
 		}
 
 		if (rc != 0) {
+			SPDK_ERRLOG("READ_PARALLEL: submit failed key=%lu %s offset=0x%lx rc=%d\n",
+				    key, read_ctx->is_cache ? "CACHE" : "BACKEND", read_ctx->read_offset, rc);
 			delete read_ctx;
 			io->last_status = rc;
 			size_t done = ++io->parallel_reads_done;
@@ -2860,9 +2914,16 @@ static void host_write_next_block(CacheIo *io)
 	}
 
 	if (io->current_block_idx >= io->total_blocks) {
-		// All blocks buffered for this IO
-		// Don't complete here - completion will be called after flush_write_buffer completes
-		return;
+		// All blocks done
+		if (LogCacheAsync::WRITE_BUFFER_ENABLED) {
+			// Buffer mode: completion will be called after flush_write_buffer completes
+			return;
+		} else {
+			// Direct mode: complete now
+			io->state = CacheIoState::HOST_WRITE_DONE;
+			cache_io_complete(io, io->last_status);
+			return;
+		}
 	}
 
 	uint32_t block_size = io->ctx->block_size;
@@ -2882,12 +2943,89 @@ static void host_write_next_block(CacheIo *io)
 		return;
 	}
 
-	// Add to 16KB write buffer instead of writing directly
-	cache->buffer_add_block(io, io->current_block_idx, key, src);
+	if (LogCacheAsync::WRITE_BUFFER_ENABLED) {
+		// Add to write buffer (batched writes)
+		cache->buffer_add_block(io, io->current_block_idx, key, src);
 
-	// Move to next block
-	io->current_block_idx++;
-	host_write_next_block(io);
+		// Move to next block
+		io->current_block_idx++;
+		host_write_next_block(io);
+	} else {
+		// Direct write path - bypass buffer
+		uint64_t cache_offset;
+		int stream_id = 0;
+		if (!cache->cache()->append_block_metadata(0, static_cast<long>(key),
+							   static_cast<int>(block_size), &cache_offset, &stream_id)) {
+			// No free segments - check if we should block or just trigger GC
+			size_t critical = cache->is_free_critical();
+
+			if (true) {
+				// Critical - block and wait for GC
+				static uint64_t direct_gc_wait_count = 0;
+				if (++direct_gc_wait_count % 1000 == 1) {
+					SPDK_WARNLOG("WRITE_DIRECT: no free segment for key=%lu, blocking for GC (waited %lu times)\n",
+						     key, direct_gc_wait_count);
+				}
+
+				io->state = CacheIoState::HOST_WRITE_WAIT_GC_EVICT;
+				cache->pending_writes().push_back(io);
+
+				if (!cache->gc_in_progress() && !cache->evict_in_progress()) {
+					start_gc_or_evict(ctx, [ctx](int status) {
+						process_pending_writes(ctx);
+					});
+				}
+				return;
+			}
+
+			SPDK_WARNLOG("WRITE_DIRECT: no free segment for key=%lu", key);
+			io->last_status = -ENOSPC;
+			cache_io_complete(io, -ENOSPC);
+			return;
+		}
+		// Not critical but low - trigger GC in background and return error
+		if (!cache->gc_in_progress() && !cache->evict_in_progress()) {
+			start_gc_or_evict(ctx, nullptr);
+		}
+
+		// Track host write for WAF
+		cache->add_host_write_bytes(block_size);
+
+		// FDP placement handle from stream_id
+		int placement_handle = stream_id % FDP_NUM_PLACEMENT_HANDLES;
+
+		// Issue async write with FDP placement handle using writev
+		struct iovec iov;
+		iov.iov_base = reinterpret_cast<void*>(const_cast<uint8_t*>(src));
+		iov.iov_len = block_size;
+
+#if OFFSET_DEBUG
+		SPDK_NOTICELOG("WRITE_SUBMIT: key=%lu cache_offset=0x%lx\n", key, cache_offset);
+#endif
+		int rc = cache->device()->writev_cache_async(cache_offset, &iov, 1, block_size,
+							     [](void *cb_arg, int status) {
+								     CacheIo *io = static_cast<CacheIo *>(cb_arg);
+								     // Mark block write complete (clear pending)
+								     long completed_key = static_cast<long>(io->lba + io->current_block_idx);
+								     io->ctx->cache->cache()->complete_block_write(completed_key);
+#if OFFSET_DEBUG
+								     SPDK_NOTICELOG("WRITE_DONE: key=%ld status=%d\n", completed_key, status);
+#endif
+								     if (status != 0) {
+									     io->last_status = status;
+								     }
+								     io->current_block_idx++;
+								     host_write_next_block(io);
+							     }, io, placement_handle);
+		if (rc != 0) {
+			SPDK_ERRLOG("WRITE_DIRECT: writev_cache_async failed rc=%d\n", rc);
+			// Clear pending even on error to avoid stuck state
+			cache->cache()->complete_block_write(static_cast<long>(key));
+			io->last_status = rc;
+			cache_io_complete(io, rc);
+			return;
+		}
+	}
 }
 
 static void cache_io_run_host_write(CacheIo *io)
@@ -2909,18 +3047,23 @@ static void cache_io_run_host_write(CacheIo *io)
 	io->completed_blocks = 0;
 	io->last_status = 0;
 
-	// QoS throttle check - block host writes when GC pressure is high
-	if (cache->throttle_should_block()) {
+	// Block host writes when free segments are critically low
+	if (cache->is_free_critical() || cache->throttle_should_block()) {
 		io->state = CacheIoState::HOST_WRITE_WAIT_GC_EVICT;
 		cache->pending_writes().push_back(io);
 
-		// Trigger GC if not already running
+		// Always trigger GC if not already running
 		if (!cache->gc_in_progress() && !cache->evict_in_progress()) {
 			start_gc_or_evict(io->ctx, [ctx = io->ctx](int status) {
 				process_pending_writes(ctx);
 			});
 		}
 		return;
+	}
+	if (!cache->gc_in_progress() && !cache->evict_in_progress()) {
+		start_gc_or_evict(io->ctx, [ctx = io->ctx](int status) {
+			process_pending_writes(ctx);
+		});
 	}
 
 	// Start write directly - blocks will be buffered for 16KB alignment
@@ -2947,12 +3090,40 @@ static void gc_seq_write_done(void *cb_arg, int status);
 static void gc_dispatch_writes(GcIo *io);
 static void gc_dispatch_writes_msg(void *arg);
 
-// Callback for async finalize_gc completion (zone reset done)
+// Forward declaration for incremental GC
+static void gc_start_reads(GcIo *io);
+
+// Callback for async finalize_gc completion (zone reset done or chunk done)
 static void gc_finalize_done(void *cb_arg, int status)
 {
 	GcIo *io = static_cast<GcIo *>(cb_arg);
+
+	if (status != 0) {
+		io->last_status = status;
+	}
+
+	// Check if this was the final chunk (only when incremental mode is enabled)
+	if (INCREMENTAL_GC_ENABLED && !io->prepare_result.is_final_chunk) {
+		// More chunks to process - prepare next chunk
+		bool prepared = io->ctx->cache->cache()->prepare_gc(io->prepare_result);
+		if (!prepared) {
+			// No more work or error - treat as done
+			io->ctx->cache->set_gc_in_progress(false);
+			gc_io_complete(io, io->last_status);
+			return;
+		}
+
+		// Continue with next chunk
+		io->completed_reads = 0;
+		io->completed_writes = 0;
+		io->total_gc_bytes += io->prepare_result.blocks_to_copy.size() * io->ctx->block_size;
+		gc_start_reads(io);
+		return;
+	}
+
+	// Final chunk done (or incremental disabled) - GC complete
 	io->ctx->cache->set_gc_in_progress(false);
-	gc_io_complete(io, status != 0 ? status : io->last_status);
+	gc_io_complete(io, io->last_status);
 }
 
 static void gc_start_reads(GcIo *io)
@@ -3656,12 +3827,41 @@ static void gc_dispatch_writes_msg(void *arg)
 // Evict State Machine (128k chunk reads + pipelined 4k writes)
 //==============================================================================
 
-// Callback for async finalize_evict completion (zone reset done)
+// Forward declaration for incremental evict
+static void evict_start_chunk(EvictIo *io);
+
+// Callback for async finalize_evict completion (zone reset done or chunk done)
 static void evict_finalize_done(void *cb_arg, int status)
 {
 	EvictIo *io = static_cast<EvictIo *>(cb_arg);
+
+	if (status != 0) {
+		io->last_status = status;
+	}
+
+	// Check if this was the final chunk (only when incremental mode is enabled)
+	if (INCREMENTAL_GC_ENABLED && !io->prepare_result.is_final_chunk) {
+		// More chunks to process - prepare next chunk
+		bool prepared = io->ctx->cache->cache()->prepare_evict(io->prepare_result);
+		if (!prepared) {
+			// No more work or error - treat as done
+			io->ctx->cache->set_evict_in_progress(false);
+			evict_io_complete(io, io->last_status);
+			return;
+		}
+
+		// Accumulate total_bytes for accurate throughput calculation
+		io->total_bytes += io->prepare_result.chunks.size() * 32 * io->ctx->block_size;
+
+		// Continue with next chunk
+		io->current_chunk_idx = 0;  // Reset chunk index for new batch
+		evict_start_chunk(io);
+		return;
+	}
+
+	// Final chunk done (or incremental disabled) - evict complete
 	io->ctx->cache->set_evict_in_progress(false);
-	evict_io_complete(io, status != 0 ? status : io->last_status);
+	evict_io_complete(io, io->last_status);
 }
 
 // Context for cache read - includes batch_idx for immediate write after read
@@ -3943,11 +4143,16 @@ static void evict_dispatch_writes_msg(void *arg)
 // Context for simple reset segment async callback
 struct SimpleResetCtx {
 	std::function<void(int)> on_complete;
+	LogCacheAsync *cache;  // To clear evict_in_progress flag
 };
 
 static void simple_reset_done(void *cb_arg, int status)
 {
 	auto *ctx = static_cast<SimpleResetCtx *>(cb_arg);
+	// Clear evict_in_progress flag since we set it before async reset
+	if (ctx->cache) {
+		ctx->cache->set_evict_in_progress(false);
+	}
 	if (ctx->on_complete) {
 		ctx->on_complete(status);
 	}
@@ -3959,13 +4164,11 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 	LogCacheAsync *cache = ctx->cache.get();
 
 	if (cache->gc_in_progress() || cache->evict_in_progress()) {
-		// Already running
-		if (on_complete) on_complete(0);
 		return;
 	}
 
+	// Check if GC/evict is actually needed
 	if (!cache->cache()->need_gc_or_evict()) {
-		// No need to GC/Evict
 		if (on_complete) on_complete(0);
 		return;
 	}
@@ -4016,9 +4219,6 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 
 			gc_io_state_machine(gc_io);
 			return;
-		} else {
-			// GC 불가 (do_evict_only 또는 blocks_to_copy 비어있음) - victim을 evictor에 반환
-			cache->cache()->abort_gc(gc_result);
 		}
 	}
 
@@ -4041,6 +4241,8 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 				return;
 			}
 			reset_ctx->on_complete = std::move(on_complete);
+			reset_ctx->cache = cache;
+			cache->set_evict_in_progress(true);
 			cache->cache()->reset_segment_async(evict_result.victim_seg, simple_reset_done, reset_ctx);
 			return;
 		}
@@ -4106,6 +4308,11 @@ static void process_pending_writes(log_cache_ctx *ctx)
 	}
 
 	while (!cache->pending_writes().empty()) {
+		// If still critical, can't make progress - wait for next GC completion
+		if (cache->is_free_critical()) {
+			return;
+		}
+
 		// Check QoS throttle (rate limit)
 		if (cache->throttle_should_block()) {
 			return;
@@ -4247,6 +4454,11 @@ extern "C" void
 log_cache_ctx_move_poller_to_current_thread(struct log_cache_ctx *ctx)
 {
 	if (!ctx) {
+		return;
+	}
+	// Skip poller registration if write buffer is disabled
+	if (!LogCacheAsync::WRITE_BUFFER_ENABLED) {
+		SPDK_NOTICELOG("Write buffer disabled - skipping poller registration\n");
 		return;
 	}
 	// Register poller on worker thread (poller는 create 시 등록 안함)
