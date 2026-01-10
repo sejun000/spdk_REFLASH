@@ -6,7 +6,7 @@
 UBLK_DEV_ID=${UBLK_DEV_ID:-0}
 UBLK_DEVICE="/dev/ublkb${UBLK_DEV_ID}"
 RUNTIME=${RUNTIME:-200}  # Default 2 minutes
-TEST_SIZE=${TEST_SIZE:-800G}  # 검증용 테스트 크기
+TEST_SIZE=${TEST_SIZE:-70G}  # 검증용 테스트 크기
 VERIFY_ONLY=${VERIFY_ONLY:-0}  # 1이면 검증만 수행
 SKIP_VERIFY=${SKIP_VERIFY:-0}  # 1이면 검증 스킵
 LOG_PREFIX="fio_bw_$(date +%Y%m%d_%H%M%S)"

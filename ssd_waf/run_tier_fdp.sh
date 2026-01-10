@@ -99,6 +99,57 @@ pre_format_devices() {
     sleep 2
 }
 
+# Prefill: Cache 디바이스 (CACHE_BDF)를 전체 sequential write로 채움
+# SPDK 바인딩 전에 kernel driver로 수행
+PREFILL=${PREFILL:-0}
+
+prefill_cache() {
+    if [[ "${PREFILL}" != "1" ]]; then
+        return 0
+    fi
+
+    local cache_dev=$(ls -d /sys/bus/pci/devices/${CACHE_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
+
+    if [[ -z "$cache_dev" ]] || [[ ! -e "/dev/${cache_dev}n1" ]]; then
+        log "Cache device not found at ${CACHE_BDF}, skipping prefill"
+        return 0
+    fi
+
+    local device="/dev/${cache_dev}n1"
+    local device_size=$(sudo blockdev --getsize64 "$device")
+    local device_size_gb=$((device_size / 1024 / 1024 / 1024))
+
+    echo ""
+    echo "=========================================="
+    echo "  Prefill: Sequential write to cache"
+    echo "  Device: ${device} (${CACHE_BDF})"
+    echo "  Size: ${device_size_gb} GB"
+    echo "=========================================="
+    echo "예상 시간: ~$((device_size_gb / 2000))-$((device_size_gb / 1500))분 (1.5-2 GB/s 기준)"
+    echo ""
+
+    sudo fio --name=prefill \
+        --filename="${device}" \
+        --ioengine=libaio \
+        --direct=1 \
+        --offset="${CACHE_SPLIT_GB}g" \
+        --bs=1M \
+        --rw=write \
+        --iodepth=32 \
+        --numjobs=1 \
+        --group_reporting \
+        --status-interval=10
+
+    if [[ $? -ne 0 ]]; then
+        log "Prefill failed!"
+        exit 1
+    fi
+
+    echo ""
+    log "Prefill completed!"
+    echo ""
+}
+
 wait_for_rpc() {
     local timeout=${1:-30}
     local waited=0
@@ -177,6 +228,7 @@ log "Resetting SPDK binding (scripts/setup.sh reset)..."
 sudo "${ROOT_DIR}/scripts/setup.sh" reset
 
 pre_format_devices
+prefill_cache
 
 # Bind devices to SPDK (vfio-pci/uio) so spdk_tgt can use them
 # HUGEMEM=8192 allocates 4096 x 2MB hugepages = 8GB for DMA buffers
