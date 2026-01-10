@@ -10,6 +10,7 @@
 #include "cache_device.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <deque>
 #include <list>
 #include <memory>
@@ -42,6 +43,14 @@ struct Config
     int         evicted_blk_size = 1;    // 4k eviction
     uint64_t         print_stats_interval = 10 * 1024ull * 1024 * 1024; // 10 GB
 };
+// Incremental GC/Evict: process 1GB segment in 16MB chunks
+// Set to false to bypass and process entire segment at once
+static constexpr bool INCREMENTAL_GC_ENABLED = false;
+
+// Free segment thresholds for GC triggering
+static constexpr size_t CRITICAL_FREE_SEGMENTS = 5;   // Block host IO if <= this
+static constexpr size_t LOW_FREE_SEGMENTS = 50;       // Trigger GC if <= this
+
 class LogCache final : public ICache
 {
 public:
@@ -69,12 +78,17 @@ public:
     };
 
     struct GcPrepareResult {
-        LogCacheSegment *victim_seg;
-        LogCacheSegment *target_seg;
+        LogCacheSegment *victim_seg = nullptr;
+        LogCacheSegment *target_seg = nullptr;
         std::vector<GcBlockInfo> blocks_to_copy;
-        uint64_t threshold;
-        int gc_stream_id;
-        bool do_evict_only;       // true if all blocks should be evicted (no GC copy)
+        uint64_t threshold = 0;
+        int gc_stream_id = 0;
+        bool do_evict_only = false;       // true if all blocks should be evicted (no GC copy)
+        // Incremental GC support (16MB chunks)
+        size_t chunk_start = 0;           // Start of current chunk (for finalize)
+        size_t scan_offset = 0;           // End of current chunk / start of next
+        bool is_final_chunk = false;      // true if this is the last chunk
+        static constexpr size_t CHUNK_BLOCKS = 4096;  // 16MB = 4096 * 4KB
     };
 
     struct EvictBlockInfo {
@@ -86,8 +100,13 @@ public:
     };
 
     struct EvictPrepareResult {
-        LogCacheSegment *victim_seg;
+        LogCacheSegment *victim_seg = nullptr;
         std::vector<EvictBlockInfo> chunks;
+        // Incremental Evict support (16MB chunks)
+        size_t chunk_start = 0;           // Start of current chunk (for finalize)
+        size_t scan_offset = 0;           // End of current chunk / start of next
+        bool is_final_chunk = false;      // true if this is the last chunk
+        static constexpr size_t CHUNK_BLOCKS = 4096;  // 16MB = 4096 * 4KB
     };
 
     LogCache(uint64_t              cold_capacity,
@@ -134,7 +153,11 @@ public:
     void complete_segment_reset(LogCacheSegment *seg);  // Called by async callback
     // Append block metadata only, returns cache offset for async write
     // out_stream_id: optional output for the actual stream_id assigned (for FDP placement handle)
+    // Adds key to pending_writes_; call complete_block_write() after write completes
     bool append_block_metadata(int stream_id, long key, int lba_sz, uint64_t *cache_offset, int *out_stream_id = nullptr);
+    // Mark block write as complete (removes from pending_writes_)
+    void complete_block_write(long key);
+    void complete_block_writes(const std::vector<long>& keys);  // batch version
     void dummy_fill_segment(LogCacheSegment* s);
     void set_device_io(CacheDeviceInterface *io) { device_io_ = io; }
     //void do_evict_and_compaction_with_same_policy();
@@ -177,8 +200,9 @@ private:
     std::unordered_map<int, LogCacheSegment*>   gc_active_seg;   // stream→seg
 
     /* page lookup ********************************************************/
-    struct Loc { LogCacheSegment* seg; std::size_t idx;};
+    struct Loc { LogCacheSegment* seg; std::size_t idx; };
     std::unordered_map<long, Loc>                mapping;
+    std::unordered_set<long>                     pending_writes_;  // keys with write in progress
     std::unordered_map<long, uint64_t>                evicted_timestamp; // for GC
 
     /* helpers ************************************************************/

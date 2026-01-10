@@ -70,6 +70,8 @@ public:
     {
         write_ptr = 0;
         valid_cnt = 0;
+        class_num = -1;  // Mark as unassigned (will be set by get_segment_to_active_stream)
+        create_timestamp = 0;
         for (auto &b : blocks) {
             b.valid = false;
             b.create_timestamp = UINT64_MAX;

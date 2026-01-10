@@ -9,6 +9,7 @@ SO_VER := 1
 SO_MINOR := 0
 
 PORT_DIR := logcache/port
+LOGGING_DIR := logcache/logging
 
 C_SRCS += vbdev_icache.c vbdev_icache_rpc.c
 CXX_SRCS += \
@@ -31,13 +32,14 @@ CXX_SRCS += \
 	$(PORT_DIR)/hot_cold_midas.cpp \
 	$(PORT_DIR)/multi_hot_cold.cpp \
 	$(PORT_DIR)/sepbit.cpp \
-	$(PORT_DIR)/istream.cpp
+	$(PORT_DIR)/istream.cpp \
+	$(LOGGING_DIR)/stats_logger.cpp
 LIBNAME = bdev_icache
 
 SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
 
 CFLAGS += -I$(SPDK_ROOT_DIR)/module/bdev/icache/logcache -I$(SPDK_ROOT_DIR)/module/bdev/icache/logcache/port
-CXXFLAGS += -I$(SPDK_ROOT_DIR)/module/bdev/icache/logcache -I$(SPDK_ROOT_DIR)/module/bdev/icache/logcache/port -DSPDK_ICACHE_ONLY_LOGCACHE
+CXXFLAGS += -I$(SPDK_ROOT_DIR)/module/bdev/icache/logcache -I$(SPDK_ROOT_DIR)/module/bdev/icache/logcache/port -I$(SPDK_ROOT_DIR)/module/bdev/icache/logcache/logging -DSPDK_ICACHE_ONLY_LOGCACHE
 LOCAL_SYS_LIBS += -lstdc++
 
 ICACHE_EXTRA_SYS_LIBS = -lstdc++

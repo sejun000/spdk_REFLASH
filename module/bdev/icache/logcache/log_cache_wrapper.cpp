@@ -27,7 +27,11 @@ extern "C" {
 #include "spdk/log.h"
 #include "spdk/thread.h"
 #include "spdk/nvme_spec.h"
+#include "spdk/nvme.h"
 }
+
+// Forward declaration for bdev_nvme_get_ctrlr (defined in module/bdev/nvme/bdev_nvme.h)
+extern "C" struct spdk_nvme_ctrlr *bdev_nvme_get_ctrlr(struct spdk_bdev *bdev);
 
 #include "port/cache_device.h"
 #include "port/evict_policy_greedy.h"
@@ -35,6 +39,7 @@ extern "C" {
 #include "port/istream.h"
 #include "port/log_cache.h"
 #include "port/log_cache_segment.h"
+#include "logging/stats_logger.h"
 
 // Debug flag for offset tracking - enable to trace write/read/GC/evict offsets
 #define OFFSET_DEBUG 0
@@ -688,6 +693,9 @@ public:
 		}
 		return 0;
 	}
+
+	// Get cache bdev for NVMe controller access
+	struct spdk_bdev *get_cache_bdev() const { return m_cache_bdev; }
 
 	// Async API implementations
 	// Zone-aware write: QD1 per zone
@@ -1818,7 +1826,8 @@ public:
 		  device_(device),
 		  gc_in_progress_(false),
 		  evict_in_progress_(false),
-		  zone_size_bytes_(zone_size_bytes)
+		  zone_size_bytes_(zone_size_bytes),
+		  cache_type_(cache_type)
 	{
 		std::string waf_path = waf_log_path;
 
@@ -1830,6 +1839,9 @@ public:
 				fflush(waf_fp_);
 			}
 		}
+
+		// Create stats logger with policy name
+		stats_logger_ = std::make_unique<StatsLogger>(cache_type_, "logging");
 
 		// Zone configuration for ZNS vs FDP
 		static constexpr uint64_t ZNS_ZONE_SIZE_BLOCKS = 0x80000;      // 524288 blocks = 2GB
@@ -1997,11 +2009,65 @@ public:
 	// WAF statistics
 	void add_host_write_bytes(uint64_t bytes) {
 		host_write_bytes_ += bytes;
+		if (stats_logger_) {
+			stats_logger_->add_host_write(bytes);
+		}
 		maybe_log_waf();
 	}
 
 	void add_gc_write_bytes(uint64_t bytes) {
 		gc_write_bytes_ += bytes;
+		if (stats_logger_) {
+			stats_logger_->add_gc_write(bytes);
+		}
+	}
+
+	// Cache device write tracking (host writes + GC writes)
+	void add_cache_write_bytes(uint64_t bytes) {
+		if (stats_logger_) {
+			stats_logger_->add_cache_write(bytes);
+		}
+	}
+
+	// Backend device write tracking (eviction writes)
+	void add_backend_write_bytes(uint64_t bytes) {
+		if (stats_logger_) {
+			stats_logger_->add_backend_write(bytes);
+		}
+	}
+
+	// Read tracking
+	void add_cache_read_bytes(uint64_t bytes) {
+		if (stats_logger_) {
+			stats_logger_->add_cache_read(bytes);
+		}
+	}
+
+	void add_backend_read_bytes(uint64_t bytes) {
+		if (stats_logger_) {
+			stats_logger_->add_backend_read(bytes);
+		}
+	}
+
+	// Set NVMe controller for stats logger (for reading endurance group log page)
+	void set_stats_nvme_ctrlr(struct spdk_nvme_ctrlr *ctrlr) {
+		if (stats_logger_) {
+			stats_logger_->set_nvme_ctrlr(ctrlr);
+		}
+	}
+
+	// Start the stats logger (call from worker thread after channels set)
+	void start_stats_logger() {
+		if (stats_logger_) {
+			stats_logger_->start();
+		}
+	}
+
+	// Stop the stats logger
+	void stop_stats_logger() {
+		if (stats_logger_) {
+			stats_logger_->stop();
+		}
 	}
 
 	double get_waf() const {
@@ -2046,6 +2112,10 @@ private:
 	uint64_t host_write_bytes_ = 0;
 	uint64_t gc_write_bytes_ = 0;
 	uint64_t next_waf_log_threshold_ = WAF_LOG_INTERVAL;
+
+	// Stats Logger for detailed IO statistics
+	std::string cache_type_;
+	std::unique_ptr<StatsLogger> stats_logger_;
 
 	//==========================================================================
 	// QoS Throttle (free segment change based)
@@ -2489,7 +2559,10 @@ void LogCacheAsync::flush_write_buffer()
 #endif
 		int rc = device_->writev_cache_async(group.first_offset, iovs, zctx->iovcnt,
 						     group_len, zone_write_done, zctx, placement_handle);
-		if (rc != 0) {
+		if (rc == 0) {
+			// Track cache write bytes for stats
+			add_cache_write_bytes(group_len);
+		} else {
 			SPDK_ERRLOG("writev_cache_async failed for group: %d\n", rc);
 			g_outstanding_bytes -= group_len;  // Rollback on error
 			free(iovs);
@@ -3017,7 +3090,10 @@ static void host_write_next_block(CacheIo *io)
 								     io->current_block_idx++;
 								     host_write_next_block(io);
 							     }, io, placement_handle);
-		if (rc != 0) {
+		if (rc == 0) {
+			// Track cache write bytes for stats
+			cache->add_cache_write_bytes(block_size);
+		} else {
 			SPDK_ERRLOG("WRITE_DIRECT: writev_cache_async failed rc=%d\n", rc);
 			// Clear pending even on error to avoid stuck state
 			cache->cache()->complete_block_write(static_cast<long>(key));
@@ -3427,6 +3503,7 @@ static void gc_start_writes(GcIo *io)
 									     write_ctx, gc_placement_handle);
 				if (rc == 0) {
 					io->ctx->cache->add_gc_write_bytes(block_size);
+					io->ctx->cache->add_cache_write_bytes(block_size);
 				} else {
 					free(single_iov);
 					delete write_ctx;
@@ -3473,6 +3550,7 @@ static void gc_start_writes(GcIo *io)
 		if (rc == 0) {
 			// Track GC write bytes for WAF calculation
 			io->ctx->cache->add_gc_write_bytes(GcIo::BLOCKS_PER_64K * block_size);
+			io->ctx->cache->add_cache_write_bytes(GcIo::BLOCKS_PER_64K * block_size);
 		} else {
 			free(iovs);
 			delete write_ctx;
@@ -3533,6 +3611,7 @@ static void gc_submit_next_leftover(GcIo *io)
 	if (rc == 0) {
 		// Track GC write bytes for WAF calculation
 		io->ctx->cache->add_gc_write_bytes(block_size);
+		io->ctx->cache->add_cache_write_bytes(block_size);
 	} else {
 		delete write_ctx;
 		io->last_status = rc;
@@ -3803,6 +3882,7 @@ static void gc_dispatch_writes(GcIo *io)
 							    gc_seq_write_done, write_ctx);
 		if (rc == 0) {
 			io->ctx->cache->add_gc_write_bytes(w.block_size);
+			io->ctx->cache->add_cache_write_bytes(w.block_size);
 			++submitted;
 		} else {
 			delete write_ctx;
@@ -4112,6 +4192,8 @@ static void evict_dispatch_writes(EvictIo *io)
 		int rc = io->ctx->device->write_backend_async(w.backend_offset, w.src, w.block_size,
 							      pipelined_write_done, write_ctx);
 		if (rc == 0) {
+			// Track backend write bytes for stats
+			io->ctx->cache->add_backend_write_bytes(w.block_size);
 			++submitted;
 		} else {
 			delete write_ctx;
@@ -4442,6 +4524,10 @@ log_cache_ctx_destroy(struct log_cache_ctx *ctx)
 	if (ctx->write_buffer_poller) {
 		spdk_poller_unregister(&ctx->write_buffer_poller);
 	}
+	// Stop stats logger
+	if (ctx->cache) {
+		ctx->cache->stop_stats_logger();
+	}
 	// Flush remaining buffer before destroy
 	if (ctx->cache && !ctx->cache->buffer_empty()) {
 		ctx->cache->flush_write_buffer();
@@ -4456,6 +4542,12 @@ log_cache_ctx_move_poller_to_current_thread(struct log_cache_ctx *ctx)
 	if (!ctx) {
 		return;
 	}
+
+	// Start stats logger (always enabled)
+	if (ctx->cache) {
+		ctx->cache->start_stats_logger();
+	}
+
 	// Skip poller registration if write buffer is disabled
 	if (!LogCacheAsync::WRITE_BUFFER_ENABLED) {
 		SPDK_NOTICELOG("Write buffer disabled - skipping poller registration\n");
@@ -4480,6 +4572,19 @@ log_cache_ctx_set_channels(struct log_cache_ctx *ctx,
 	ctx->device->set_channels(cache_ch, backend_ch);
 	ctx->cache_ch = cache_ch;
 	ctx->backend_ch = backend_ch;
+
+	// Get NVMe controller from cache bdev for stats logger
+	struct spdk_bdev *cache_bdev = ctx->device->get_cache_bdev();
+	if (cache_bdev && ctx->cache) {
+		struct spdk_nvme_ctrlr *nvme_ctrlr = bdev_nvme_get_ctrlr(cache_bdev);
+		if (nvme_ctrlr) {
+			ctx->cache->set_stats_nvme_ctrlr(nvme_ctrlr);
+			SPDK_NOTICELOG("Set NVMe controller for stats logger: %p\n", nvme_ctrlr);
+		} else {
+			SPDK_NOTICELOG("No NVMe controller for cache bdev (not an NVMe bdev?)\n");
+		}
+	}
+
 	SPDK_NOTICELOG("Set io_channels: cache_ch=%p, backend_ch=%p\n", cache_ch, backend_ch);
 }
 

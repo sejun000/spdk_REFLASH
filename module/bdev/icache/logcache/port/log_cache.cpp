@@ -231,6 +231,14 @@ void LogCache::invalidate(long key, int lba_sz) {
     if (exists(key))
     {
         auto loc = mapping[key];
+        // DEBUG: track mapping changes for low keys
+        if (key < 100) {
+            SPDK_NOTICELOG("DEBUG invalidate: key=%ld, old_seg=%p, old_idx=%zu, "
+                    "old_block.key=%ld, old_block.valid=%d, ts=%lu\n",
+                    key, (void*)loc.seg, loc.idx,
+                    loc.seg->blocks[loc.idx].key, loc.seg->blocks[loc.idx].valid,
+                    log_cache_timestamp);
+        }
         if (loc.seg->blocks[loc.idx].valid)
         {
             print_objects("invalidate", log_cache_timestamp - loc.seg->blocks[loc.idx].create_timestamp);
@@ -405,12 +413,27 @@ bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64
 
     invalidate(key, lba_sz);
 
+    // Verify class_num is valid (should be set by get_segment_to_active_stream)
+    if (seg->get_class_num() < 0) {
+        SPDK_ERRLOG("BUG! append_block: seg=%p has invalid class_num=%d (uninitialized?)\n",
+                (void*)seg, seg->get_class_num());
+    }
+
     auto &blk = seg->blocks[seg->write_ptr];
     uint64_t dst_offset = block_offset(seg, seg->write_ptr);
     blk.key = key;
     blk.valid = true;
     blk.create_timestamp = log_cache_timestamp;
     mapping[key] = { seg, seg->write_ptr };
+    pending_writes_.insert(key);  // Mark as write in progress
+
+    // DEBUG: track mapping changes for low keys
+    if (key < 100) {
+        SPDK_NOTICELOG("DEBUG append_block: key=%ld, seg=%p, idx=%zu, "
+                "seg->class_num=%d, ts=%lu\n",
+                key, (void*)seg, seg->write_ptr, seg->get_class_num(),
+                log_cache_timestamp);
+    }
 
     ++seg->write_ptr;
     ++seg->valid_cnt;
@@ -426,7 +449,27 @@ bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64
     if (out_stream_id) {
         *out_stream_id = seg->get_class_num();
     }
+
+    // Check if segment became full after this write - add to evictor immediately
+    // This prevents full segments from staying in active_seg when next write goes to different stream
+    if (seg->full()) {
+        evict_policy_add(seg);
+        active_seg.erase(seg->get_class_num());
+    }
+
     return true;
+}
+
+void LogCache::complete_block_write(long key)
+{
+    pending_writes_.erase(key);
+}
+
+void LogCache::complete_block_writes(const std::vector<long>& keys)
+{
+    for (long key : keys) {
+        pending_writes_.erase(key);
+    }
 }
 
 void LogCache::ingest_payload(int stream_id, const std::vector<BlockPayload>& payloads)
@@ -472,18 +515,13 @@ int LogCache::read_blocks(const std::vector<BlockReadRequest>& reqs)
 /* ------------------------------------------------------------------ */
 LogCacheSegment* LogCache::alloc_segment(bool shrink)
 {
-
-    if (shrink == true) {
-        check_and_evict_if_needed();     // proactive (no-op in async mode)
-    }
-
     // In async mode, keep segments reserved for GC/Evict to have room to work
     // shrink=true means host write, shrink=false means GC
     // Only block host writes when low on segments, GC must always be able to allocate
 #if FDP
-    constexpr size_t ASYNC_RESERVE_SEGMENTS = 10;  // FDP: smaller segments, need more reserve
+    constexpr size_t ASYNC_RESERVE_SEGMENTS = CRITICAL_FREE_SEGMENTS;  // FDP: smaller segments, need more reserve
 #else
-    constexpr size_t ASYNC_RESERVE_SEGMENTS = 5;
+    constexpr size_t ASYNC_RESERVE_SEGMENTS = CRITICAL_FREE_SEGMENTS;
 #endif
     if (async_mode_ && shrink && free_pool.size() <= ASYNC_RESERVE_SEGMENTS) {
         return nullptr;  // Host write blocked - caller should trigger async GC/Evict
@@ -495,7 +533,35 @@ LogCacheSegment* LogCache::alloc_segment(bool shrink)
 
     LogCacheSegment* s = free_pool.front();
     free_pool.pop_front();
+
+    // DEBUG: check class_num BEFORE reset
+    int class_num_before = s->get_class_num();
+
     s->reset();
+
+    // DEBUG: check class_num AFTER reset - should be -1 now
+    if (s->get_class_num() != -1) {
+        SPDK_ERRLOG("BUG! alloc_segment: after reset(), class_num=%d (expected -1), before=%d\n",
+                s->get_class_num(), class_num_before);
+    }
+
+    // DEBUG: check if segment is already in use (active_seg or gc_active_seg)
+    for (auto &kv : active_seg) {
+        if (kv.second == s) {
+            SPDK_ERRLOG("BUG! alloc_segment: seg=%p ALREADY IN active_seg[%d]!\n",
+                    (void*)s, kv.first);
+        }
+    }
+    for (auto &kv : gc_active_seg) {
+        if (kv.second == s) {
+            SPDK_ERRLOG("BUG! alloc_segment: seg=%p ALREADY IN gc_active_seg[%d]!\n",
+                    (void*)s, kv.first);
+        }
+    }
+
+    // DEBUG: log segment allocation with class_num
+    SPDK_NOTICELOG("DEBUG alloc_segment: seg=%p, class_num=%d, shrink=%d, free_pool=%zu\n",
+            (void*)s, s->get_class_num(), shrink, free_pool.size());
 
     // Log when free segments drop to critical level
     size_t remaining = free_pool.size();
@@ -511,7 +577,7 @@ LogCacheSegment* LogCache::alloc_segment(bool shrink)
 LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key, bool check_only)
 {
     LogCacheSegment *seg = nullptr;
-    uint64_t previous_blk_create_timestamp = UINT64_MAX;
+    uint64_t previous_blk_create_timestamp = log_cache_timestamp;  // Default to current timestamp for new keys
     if (exists(key))
     {
         auto loc = mapping[key];
@@ -538,9 +604,18 @@ LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key,
         if (!seg) {
             return nullptr;  // No free segment (async mode needs GC/Evict)
         }
+        int old_class_num = seg->get_class_num();
         seg->class_num = stream_id; // stream id로 class num 설정
         seg->create_timestamp = log_cache_timestamp; // 초기화
         (*active_table)[stream_id] = seg;
+        // DEBUG: always log class_num assignment
+        SPDK_NOTICELOG("DEBUG get_segment_with_stream_policy: seg=%p, old_class=%d, new_class=%d, stream_id=%d\n",
+                (void*)seg, old_class_num, seg->get_class_num(), stream_id);
+        // DEBUG: verify class_num was set correctly
+        if (seg->get_class_num() != stream_id) {
+            SPDK_ERRLOG("BUG! get_segment_with_stream_policy: class_num=%d after setting to %d, old=%d\n",
+                    seg->get_class_num(), stream_id, old_class_num);
+        }
     }
     else
     {
@@ -571,9 +646,15 @@ LogCacheSegment* LogCache::get_segment_to_active_stream(bool gc, int stream_id, 
         if (!seg) {
             return nullptr;  // No free segment (async mode needs GC/Evict)
         }
+        int old_class_num = seg->get_class_num();
         seg->class_num = stream_id; // stream id로 class num 설정
         seg->create_timestamp = log_cache_timestamp; // 초기화
         (*active_table)[stream_id] = seg;
+        // DEBUG: verify class_num was set correctly
+        if (seg->get_class_num() != stream_id) {
+            SPDK_ERRLOG("BUG! get_segment_to_active_stream: class_num=%d after setting to %d, old=%d\n",
+                    seg->get_class_num(), stream_id, old_class_num);
+        }
     }
     else
     {
@@ -702,10 +783,24 @@ bool LogCache::is_cache_filled() {
 
 void LogCache::reset_segment(LogCacheSegment* s)
 {
-       // erase old segment
+    // DEBUG: log segment reset
+    SPDK_NOTICELOG("DEBUG reset_segment: seg=%p, class_num=%d, old_write_ptr=%zu, "
+            "old_valid_cnt=%ld, create_ts=%lu\n",
+            (void*)s, s->get_class_num(), s->write_ptr, s->valid_cnt, s->create_timestamp);
+
+    // erase old segment
     s->valid_cnt = 0;
     s->write_ptr = 0;
     reset_cache_region(s);
+
+    // DEBUG: check for duplicate in free_pool before adding
+    for (auto *seg : free_pool) {
+        if (seg == s) {
+            SPDK_ERRLOG("BUG! reset_segment: seg=%p ALREADY IN free_pool! "
+                    "free_pool_size=%zu\n", (void*)s, free_pool.size());
+        }
+    }
+
     free_pool.push_back(s);
     evict_policy_remove(s);
 }
@@ -742,6 +837,12 @@ void LogCache::reset_segment_async(LogCacheSegment* s, cache_device_io_cb cb, vo
 
     if (!device_io_) {
         // No device, just add to free pool directly
+        // DEBUG: check for duplicate
+        for (auto *seg : free_pool) {
+            if (seg == s) {
+                SPDK_ERRLOG("BUG! reset_segment_async(no device): seg=%p ALREADY IN free_pool!\n", (void*)s);
+            }
+        }
         free_pool.push_back(s);
         if (cb) cb(cb_arg, 0);
         return;
@@ -762,8 +863,15 @@ void LogCache::reset_segment_async(LogCacheSegment* s, cache_device_io_cb cb, vo
 void LogCache::complete_segment_reset(LogCacheSegment* s)
 {
     if (s) {
+        // DEBUG: check for duplicate
+        for (auto *seg : free_pool) {
+            if (seg == s) {
+                SPDK_ERRLOG("BUG! complete_segment_reset: seg=%p ALREADY IN free_pool!\n", (void*)s);
+            }
+        }
         free_pool.push_back(s);
-        SPDK_NOTICELOG("SEGMENT FREED: free_pool=%zu\n", free_pool.size());
+        SPDK_NOTICELOG("DEBUG complete_segment_reset: seg=%p, free_pool=%zu\n",
+                (void*)s, free_pool.size());
     }
 }
 
@@ -1008,7 +1116,7 @@ bool LogCache::get_cache_location(long key, uint64_t *offset)
 {
     auto it = mapping.find(key);
     if (it == mapping.end()) {
-        return false;
+        return false;  // Not in cache - caller should try backend
     }
 
     LogCacheSegment *seg = it->second.seg;
@@ -1016,21 +1124,30 @@ bool LogCache::get_cache_location(long key, uint64_t *offset)
 
     // Validation: check segment and index are valid
     if (!seg) {
-        fprintf(stderr, "ERROR: get_cache_location key=%ld has NULL segment!\n", key);
+        SPDK_ERRLOG("get_cache_location: key=%ld has NULL segment!\n", key);
         return false;
     }
     if (idx >= seg->blocks.size()) {
-        fprintf(stderr, "ERROR: get_cache_location key=%ld has idx=%zu >= blocks.size=%zu!\n",
+        SPDK_ERRLOG("get_cache_location: key=%ld idx=%zu >= blocks.size=%zu!\n",
                 key, idx, seg->blocks.size());
         return false;
     }
     if (!seg->blocks[idx].valid) {
+        SPDK_ERRLOG("get_cache_location: key=%ld MAPPING BUT VALID=FALSE! "
+                "seg=%p, idx=%zu, block.key=%ld, seg->create_ts=%lu\n",
+                key, (void*)seg, idx, seg->blocks[idx].key, seg->create_timestamp);
         return false;
     }
     // Validation: check that the block's key matches our lookup key
     if (seg->blocks[idx].key != key) {
-        fprintf(stderr, "ERROR: get_cache_location key=%ld but block.key=%ld (mismatch)!\n",
-                key, seg->blocks[idx].key);
+        SPDK_ERRLOG("get_cache_location: key=%ld but block.key=%ld MISMATCH! "
+                "seg=%p, idx=%zu, seg->write_ptr=%zu, seg->valid_cnt=%ld, "
+                "seg->create_ts=%lu, block.create_ts=%lu, seg->class_num=%d, "
+                "block.valid=%d, log_cache_ts=%lu\n",
+                key, seg->blocks[idx].key, (void*)seg, idx,
+                seg->write_ptr, seg->valid_cnt,
+                seg->create_timestamp, seg->blocks[idx].create_timestamp,
+                seg->get_class_num(), seg->blocks[idx].valid, log_cache_timestamp);
         return false;
     }
 
@@ -1040,79 +1157,103 @@ bool LogCache::get_cache_location(long key, uint64_t *offset)
 
 bool LogCache::prepare_gc(GcPrepareResult &result)
 {
-    if (!need_gc_or_evict()) {
-        return false;
-    }
+    // Incremental GC: check if continuing from previous chunk
+    bool is_continuation = (result.victim_seg != nullptr && result.scan_offset > 0);
 
-    // Determine if we should compact or just evict
-    bool compact = false;
-    if (target_valid_blk_rate >= 0.1) {
-        if (compactor && (double)target_valid_blk_rate * total_cache_block_count > global_valid_blocks) {
-            compact = true;
-        }
-    }
-
-    // Debug: show target_valid_blk_rate and related values
-    double current_valid_rate = (double)global_valid_blocks / total_cache_block_count;
-    SPDK_NOTICELOG("prepare_gc: compact=%d, target_valid_rate=%.4f, current_valid_rate=%.4f, "
-                   "global_valid=%lu, total_blocks=%lu, evict_ratio=%.6f, evict_ghost=%.6f, compact_ratio=%.6f\n",
-                   compact, target_valid_blk_rate, current_valid_rate,
-                   global_valid_blocks, total_cache_block_count,
-                   eviction_ratio.has_value() ? eviction_ratio.value() : -1.0,
-                   eviction_ratio_in_ghost_cache.has_value() ? eviction_ratio_in_ghost_cache.value() : -1.0,
-                   compaction_ratio.has_value() ? compaction_ratio.value() : -1.0);
-
-    LogCacheSegment* victim = nullptr;
-    uint64_t threshold = 0;
-    victim = (LogCacheSegment *)evictor->choose_segment();
-    if (!victim) {
-        return false;
-    }
-    threshold = log_cache_timestamp - victim->create_timestamp + 1;
-    evictor->add(victim, log_cache_timestamp);
-    if (compact) {
-        victim = (LogCacheSegment *)compactor->choose_segment();
-        if (victim->valid_cnt >= 0.8 * victim->blocks.size()) {
+    if (!is_continuation) {
+        // New GC - select victim
+        if (!need_gc_or_evict()) {
             return false;
         }
+
+        // Determine if we should compact or just evict
+        bool compact = false;
+        if (target_valid_blk_rate >= 0.1) {
+            if (compactor && (double)target_valid_blk_rate * total_cache_block_count > global_valid_blocks) {
+                compact = true;
+            }
+        }
+
+        // Debug: show target_valid_blk_rate and related values
+        double current_valid_rate = (double)global_valid_blocks / total_cache_block_count;
+        SPDK_NOTICELOG("prepare_gc: compact=%d, target_valid_rate=%.4f, current_valid_rate=%.4f, "
+                       "global_valid=%lu, total_blocks=%lu, evict_ratio=%.6f, evict_ghost=%.6f, compact_ratio=%.6f\n",
+                       compact, target_valid_blk_rate, current_valid_rate,
+                       global_valid_blocks, total_cache_block_count,
+                       eviction_ratio.has_value() ? eviction_ratio.value() : -1.0,
+                       eviction_ratio_in_ghost_cache.has_value() ? eviction_ratio_in_ghost_cache.value() : -1.0,
+                       compaction_ratio.has_value() ? compaction_ratio.value() : -1.0);
+
+        LogCacheSegment* victim = nullptr;
+        uint64_t threshold = 0;
+        victim = (LogCacheSegment *)evictor->choose_segment();
         if (!victim) {
             return false;
         }
-    }
-    else {
-        return false;
-    }
+        threshold = log_cache_timestamp - victim->create_timestamp + 1;
+        evictor->add(victim, log_cache_timestamp);
+        if (compact) {
+            victim = (LogCacheSegment *)compactor->choose_segment();
+            if (victim->valid_cnt >= 0.8 * victim->blocks.size()) {
+                return false;
+            }
+            if (!victim) {
+                return false;
+            }
+        }
+        else {
+            return false;
+        }
 
-    result.victim_seg = victim;
-    result.threshold = threshold;
-    result.gc_stream_id = victim->get_class_num();
-    result.do_evict_only = !compact;
+        result.victim_seg = victim;
+        result.threshold = threshold;
+        result.gc_stream_id = victim->get_class_num();
+        result.do_evict_only = !compact;
+        result.scan_offset = 0;
 
-    // Set global variables for score_warm_first (async mode)
-    g_timestamp = log_cache_timestamp;
-    g_threshold = threshold;
+        // Set global variables for score_warm_first (async mode)
+        g_timestamp = log_cache_timestamp;
+        g_threshold = threshold;
 
-    if (victim->valid_cnt == 0) {
-        // No valid blocks, just reset
-        result.blocks_to_copy.clear();
-        result.target_seg = nullptr;
-        return true;
-    }
+        if (victim->valid_cnt == 0) {
+            // No valid blocks, just reset
+            result.blocks_to_copy.clear();
+            result.target_seg = nullptr;
+            result.is_final_chunk = true;
+            return true;
+        }
 
-    if (compact) {
-        // Prepare GC - collect valid blocks to copy
+        // Prepare GC - get target segment for compaction
         result.target_seg = get_segment_to_active_stream(true, result.gc_stream_id);
 
         // If no target segment available, fall back to evict-only
         if (!result.target_seg) {
             result.do_evict_only = true;
             result.blocks_to_copy.clear();
+            result.is_final_chunk = true;
             return true;
         }
+    }
 
-        for (std::size_t i = 0; i < victim->blocks.size(); ++i) {
+    // Incremental scan: process CHUNK_BLOCKS at a time (or full segment if disabled)
+    LogCacheSegment* victim = result.victim_seg;
+    uint64_t threshold = result.threshold;
+    result.blocks_to_copy.clear();
+
+    size_t start = result.scan_offset;
+    size_t chunk_size = INCREMENTAL_GC_ENABLED ? GcPrepareResult::CHUNK_BLOCKS : victim->blocks.size();
+    size_t end = std::min(start + chunk_size, victim->blocks.size());
+    result.chunk_start = start;
+    result.scan_offset = end;  // Update now for finalize to use
+    result.is_final_chunk = (end >= victim->blocks.size());
+
+    if (result.target_seg) {
+        for (std::size_t i = start; i < end; ++i) {
             auto &blk = victim->blocks[i];
             if (!blk.valid) continue;
+
+            // Skip blocks with pending host writes
+            if (pending_writes_.count(blk.key)) continue;
 
             // Check if should evict or copy based on threshold
             if (threshold > 0 && log_cache_timestamp - blk.create_timestamp >= threshold) {
@@ -1148,9 +1289,6 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
             // Reserve slot in target segment
             result.target_seg->write_ptr++;
         }
-    } else {
-        result.target_seg = nullptr;
-        result.blocks_to_copy.clear();
     }
 
     return true;
@@ -1158,59 +1296,88 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
 
 bool LogCache::prepare_evict(EvictPrepareResult &result)
 {
-    if (!need_gc_or_evict()) {
-        return false;
+    // Incremental evict: check if continuing from previous chunk
+    bool is_continuation = (result.victim_seg != nullptr && result.scan_offset > 0);
+
+    if (!is_continuation) {
+        // New evict - select victim
+        if (!need_gc_or_evict()) {
+            return false;
+        }
+
+        LogCacheSegment* victim = (LogCacheSegment *)evictor->choose_segment();
+        if (!victim) {
+            return false;
+        }
+
+        result.victim_seg = victim;
+        result.scan_offset = 0;
+
+        if (victim->valid_cnt == 0) {
+            result.is_final_chunk = true;
+            result.chunks.clear();
+            return true;
+        }
     }
 
-    LogCacheSegment* victim = (LogCacheSegment *)evictor->choose_segment();
-    if (!victim) {
-        return false;
-    }
-
-    result.victim_seg = victim;
+    // Incremental scan: process CHUNK_BLOCKS (16MB) at a time (or full segment if disabled)
+    LogCacheSegment* victim = result.victim_seg;
     result.chunks.clear();
 
-    if (victim->valid_cnt == 0) {
-        return true;
-    }
+    size_t scan_start = result.scan_offset;
+    size_t chunk_size = INCREMENTAL_GC_ENABLED ? EvictPrepareResult::CHUNK_BLOCKS : victim->blocks.size();
+    size_t scan_end = std::min(scan_start + chunk_size, victim->blocks.size());
+    result.chunk_start = scan_start;
+    result.scan_offset = scan_end;  // Update now for finalize to use
+    result.is_final_chunk = (scan_end >= victim->blocks.size());
 
-    // Group blocks into 128k chunks (32 * 4k)
-    // Only create chunk if at least one block is valid
-    constexpr size_t CHUNK_BLOCKS = EvictBlockInfo::CHUNK_BLOCKS;  // 32
-    size_t num_chunks = (victim->blocks.size() + CHUNK_BLOCKS - 1) / CHUNK_BLOCKS;
+    // Group blocks into 128k chunks (32 * 4k) within the 16MB scan range
+    constexpr size_t SMALL_CHUNK_BLOCKS = EvictBlockInfo::CHUNK_BLOCKS;  // 32
 
-    for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
-        size_t start_blk = chunk_idx * CHUNK_BLOCKS;
-        size_t end_blk = std::min(start_blk + CHUNK_BLOCKS, victim->blocks.size());
+    for (size_t blk_idx = scan_start; blk_idx < scan_end; ) {
+        // Calculate chunk boundary (32-block aligned)
+        size_t chunk_start = blk_idx;
+        size_t chunk_end = std::min(chunk_start + SMALL_CHUNK_BLOCKS, scan_end);
 
-        // Check if any valid block in this chunk
+        // Align to 32-block boundary if not at start
+        if (chunk_start % SMALL_CHUNK_BLOCKS != 0) {
+            chunk_end = std::min(((chunk_start / SMALL_CHUNK_BLOCKS) + 1) * SMALL_CHUNK_BLOCKS, scan_end);
+        }
+
+        // Check if any valid block in this chunk (skip pending writes)
         bool has_valid = false;
-        for (size_t i = start_blk; i < end_blk; ++i) {
-            if (victim->blocks[i].valid) {
-                has_valid = true;
-                break;
-            }
-        }
-
-        if (!has_valid) continue;  // Skip chunk with no valid blocks
-
-        EvictBlockInfo info;
-        info.cache_chunk_idx = chunk_idx;
-        info.valid_mask.resize(CHUNK_BLOCKS, false);
-        info.backend_keys.resize(CHUNK_BLOCKS, 0);
-        info.seg_indices.resize(CHUNK_BLOCKS, 0);
-
-        for (size_t i = start_blk; i < end_blk; ++i) {
-            size_t offset_in_chunk = i - start_blk;
+        for (size_t i = chunk_start; i < chunk_end; ++i) {
             auto &blk = victim->blocks[i];
-            info.seg_indices[offset_in_chunk] = i;
-            if (blk.valid) {
-                info.valid_mask[offset_in_chunk] = true;
-                info.backend_keys[offset_in_chunk] = blk.key;
-            }
+            if (!blk.valid) continue;
+            // Skip blocks with pending host writes
+            if (pending_writes_.count(blk.key)) continue;
+            has_valid = true;
+            break;
         }
 
-        result.chunks.push_back(std::move(info));
+        if (has_valid) {
+            EvictBlockInfo info;
+            info.cache_chunk_idx = chunk_start / SMALL_CHUNK_BLOCKS;
+            info.valid_mask.resize(SMALL_CHUNK_BLOCKS, false);
+            info.backend_keys.resize(SMALL_CHUNK_BLOCKS, 0);
+            info.seg_indices.resize(SMALL_CHUNK_BLOCKS, 0);
+
+            for (size_t i = chunk_start; i < chunk_end; ++i) {
+                size_t offset_in_chunk = i % SMALL_CHUNK_BLOCKS;
+                auto &blk = victim->blocks[i];
+                info.seg_indices[offset_in_chunk] = i;
+                if (blk.valid) {
+                    // Skip blocks with pending host writes
+                    if (pending_writes_.count(blk.key)) continue;
+                    info.valid_mask[offset_in_chunk] = true;
+                    info.backend_keys[offset_in_chunk] = blk.key;
+                }
+            }
+
+            result.chunks.push_back(std::move(info));
+        }
+
+        blk_idx = chunk_end;
     }
 
     return true;
@@ -1227,7 +1394,12 @@ void LogCache::finalize_gc(GcPrepareResult &result)
         // CRITICAL: Use per-block target segment, NOT result.target_seg
         LogCacheSegment *dst_seg = info.dst_seg;
         if (!dst_seg) {
+            fprintf(stderr, "BUG: finalize_gc dst_seg=NULL for key=%ld, src_idx=%zu! "
+                    "This should never happen - check prepare_gc\n", info.key, info.src_idx);
+            // Must erase mapping to avoid mapping->invalid block state
+            mapping.erase(info.key);
             src_blk.valid = false;
+            global_valid_blocks--;
             continue;
         }
 
@@ -1236,6 +1408,15 @@ void LogCache::finalize_gc(GcPrepareResult &result)
         auto it = mapping.find(info.key);
         if (it == mapping.end() || it->second.seg != victim || it->second.idx != info.src_idx) {
             // New write occurred during GC - skip this block (log-structured: new data wins)
+            // DEBUG: track skipped blocks for low keys
+            if (info.key < 100) {
+                SPDK_NOTICELOG("DEBUG finalize_gc SKIP: key=%ld, victim=%p, src_idx=%zu, "
+                        "mapping_exists=%d, mapping_seg=%p, mapping_idx=%zu\n",
+                        info.key, (void*)victim, info.src_idx,
+                        (it != mapping.end()),
+                        (it != mapping.end()) ? (void*)it->second.seg : nullptr,
+                        (it != mapping.end()) ? it->second.idx : 0);
+            }
             src_blk.valid = false;  // Still invalidate source
             continue;
         }
@@ -1245,7 +1426,13 @@ void LogCache::finalize_gc(GcPrepareResult &result)
 
         // Validate dst_idx is within bounds
         if (dst_idx >= dst_seg->blocks.size()) {
+            fprintf(stderr, "BUG: finalize_gc dst_idx=%zu >= blocks.size=%zu for key=%ld! "
+                    "This should never happen - check prepare_gc\n",
+                    dst_idx, dst_seg->blocks.size(), info.key);
+            // Must erase mapping to avoid mapping->invalid block state
+            mapping.erase(info.key);
             src_blk.valid = false;
+            global_valid_blocks--;
             continue;
         }
 
@@ -1257,6 +1444,14 @@ void LogCache::finalize_gc(GcPrepareResult &result)
 
         // Update mapping to point to CORRECT target segment
         mapping[info.key] = {dst_seg, dst_idx};
+
+        // DEBUG: track mapping changes for low keys
+        if (info.key < 100) {
+            SPDK_NOTICELOG("DEBUG finalize_gc COPY: key=%ld, victim=%p, src_idx=%zu -> "
+                    "dst_seg=%p, dst_idx=%zu, dst_seg->class_num=%d\n",
+                    info.key, (void*)victim, info.src_idx,
+                    (void*)dst_seg, dst_idx, dst_seg->get_class_num());
+        }
 
         // Update target segment
         dst_seg->valid_cnt++;
@@ -1271,8 +1466,8 @@ void LogCache::finalize_gc(GcPrepareResult &result)
         }
     }
 
-    // Handle blocks that should be evicted (not copied)
-    for (std::size_t i = 0; i < victim->blocks.size(); ++i) {
+    // Handle blocks that should be evicted (not copied) - only in current chunk range
+    for (std::size_t i = result.chunk_start; i < result.scan_offset; ++i) {
         auto &blk = victim->blocks[i];
         if (!blk.valid) continue;
 
@@ -1289,12 +1484,14 @@ void LogCache::finalize_gc(GcPrepareResult &result)
 
     // Note: target segments will be added to evict policy when they become full
 
-    // Reset victim segment
-    reset_segment(victim);
+    // Reset victim segment only on final chunk
+    if (result.is_final_chunk) {
+        reset_segment(victim);
 
-    // Handle stream policy
-    if (stream_policy) {
-        stream_policy->CollectSegment(victim, log_cache_timestamp);
+        // Handle stream policy
+        if (stream_policy) {
+            stream_policy->CollectSegment(victim, log_cache_timestamp);
+        }
     }
 }
 
@@ -1327,8 +1524,10 @@ void LogCache::finalize_evict(EvictPrepareResult &result)
         }
     }
 
-    // Reset victim segment
-    reset_segment(victim);
+    // Reset victim segment only on final chunk
+    if (result.is_final_chunk) {
+        reset_segment(victim);
+    }
 }
 
 void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb, void *cb_arg)
@@ -1344,8 +1543,11 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
         // when prepare_gc had to allocate multiple target segments
         LogCacheSegment *dst_seg = info.dst_seg;
         if (!dst_seg) {
-            SPDK_ERRLOG("GC finalize: dst_seg is NULL for key=%ld, src_idx=%zu\n", info.key, info.src_idx);
+            SPDK_ERRLOG("BUG: finalize_gc_async dst_seg=NULL for key=%ld, src_idx=%zu\n", info.key, info.src_idx);
+            // Must erase mapping to avoid mapping->invalid block state
+            mapping.erase(info.key);
             src_blk.valid = false;
+            global_valid_blocks--;
             continue;
         }
 
@@ -1354,6 +1556,17 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
         auto it = mapping.find(info.key);
         if (it == mapping.end() || it->second.seg != victim || it->second.idx != info.src_idx) {
             // New write occurred during GC - skip this block (log-structured: new data wins)
+            // DEBUG: track skipped blocks for low keys
+            if (info.key < 100) {
+                SPDK_NOTICELOG("DEBUG finalize_gc_async SKIP: key=%ld, victim=%p, src_idx=%zu, "
+                        "mapping_exists=%d, mapping_seg=%p, mapping_idx=%zu, "
+                        "dst_seg=%p, dst_idx=%zu\n",
+                        info.key, (void*)victim, info.src_idx,
+                        (it != mapping.end()),
+                        (it != mapping.end()) ? (void*)it->second.seg : nullptr,
+                        (it != mapping.end()) ? it->second.idx : 0,
+                        (void*)dst_seg, info.dst_idx);
+            }
             src_blk.valid = false;  // Still invalidate source
             continue;
         }
@@ -1363,9 +1576,12 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
 
         // Validate dst_idx is within bounds
         if (dst_idx >= dst_seg->blocks.size()) {
-            SPDK_ERRLOG("GC finalize: dst_idx=%zu out of bounds (size=%zu) for key=%ld\n",
+            SPDK_ERRLOG("BUG: finalize_gc_async dst_idx=%zu >= blocks.size=%zu for key=%ld\n",
                         dst_idx, dst_seg->blocks.size(), info.key);
+            // Must erase mapping to avoid mapping->invalid block state
+            mapping.erase(info.key);
             src_blk.valid = false;
+            global_valid_blocks--;
             continue;
         }
 
@@ -1377,6 +1593,14 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
 
         // Update mapping to point to CORRECT target segment
         mapping[info.key] = {dst_seg, dst_idx};
+
+        // DEBUG: track mapping changes for low keys
+        if (info.key < 100) {
+            SPDK_NOTICELOG("DEBUG finalize_gc COPY: key=%ld, victim=%p, src_idx=%zu -> "
+                    "dst_seg=%p, dst_idx=%zu, dst_seg->class_num=%d\n",
+                    info.key, (void*)victim, info.src_idx,
+                    (void*)dst_seg, dst_idx, dst_seg->get_class_num());
+        }
 
         // Update target segment
         dst_seg->valid_cnt++;
@@ -1391,8 +1615,8 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
         }
     }
 
-    // Handle blocks that should be evicted (not copied)
-    for (std::size_t i = 0; i < victim->blocks.size(); ++i) {
+    // Handle blocks that should be evicted (not copied) - only in current chunk range
+    for (std::size_t i = result.chunk_start; i < result.scan_offset; ++i) {
         auto &blk = victim->blocks[i];
         if (!blk.valid) continue;
 
@@ -1402,25 +1626,37 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
         }
         evicted_blocks += cfg_.evicted_blk_size;
         evicted_timestamp[blk.key] = log_cache_timestamp;
+        // DEBUG: track evict for low keys only
+        if (blk.key < 100) {
+            SPDK_NOTICELOG("DEBUG GC_ASYNC EVICT: key=%ld, victim=%p, victim_idx=%zu\n",
+                    blk.key, (void*)victim, i);
+        }
         mapping.erase(blk.key);
         blk.valid = false;
         global_valid_blocks--;
     }
 
-    // Handle stream policy before async reset
-    if (stream_policy) {
-        stream_policy->CollectSegment(victim, log_cache_timestamp);
-    }
+    // Reset victim segment only on final chunk
+    if (result.is_final_chunk) {
+        // Handle stream policy before async reset
+        if (stream_policy) {
+            stream_policy->CollectSegment(victim, log_cache_timestamp);
+        }
 
-    // Reset victim segment asynchronously
-    reset_segment_async(victim, cb, cb_arg);
+        SPDK_NOTICELOG("GC_ASYNC: Final chunk, resetting victim=%p\n", (void*)victim);
+        // Reset victim segment asynchronously
+        reset_segment_async(victim, cb, cb_arg);
+    } else {
+        // Not final chunk - callback immediately
+        if (cb) cb(cb_arg, 0);
+    }
 }
 
 void LogCache::finalize_evict_async(EvictPrepareResult &result, cache_device_io_cb cb, void *cb_arg)
 {
     LogCacheSegment *victim = result.victim_seg;
 
-    // Invalidate all blocks and update mapping
+    // Invalidate all blocks and update mapping (chunks already contain only current range)
     for (auto &chunk : result.chunks) {
         for (size_t i = 0; i < chunk.valid_mask.size(); ++i) {
             if (!chunk.valid_mask[i]) continue;
@@ -1445,8 +1681,13 @@ void LogCache::finalize_evict_async(EvictPrepareResult &result, cache_device_io_
         }
     }
 
-    // Reset victim segment asynchronously
-    reset_segment_async(victim, cb, cb_arg);
+    // Reset victim segment only on final chunk
+    if (result.is_final_chunk) {
+        reset_segment_async(victim, cb, cb_arg);
+    } else {
+        // Not final chunk - callback immediately
+        if (cb) cb(cb_arg, 0);
+    }
 }
 
 void LogCache::abort_gc(GcPrepareResult &result)
