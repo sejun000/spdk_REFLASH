@@ -24,6 +24,99 @@ log() {
     echo "[run_opencas] $*"
 }
 
+# Limit NVMe IRQ affinity to specific cores
+NVME_CPU_MASK=${NVME_CPU_MASK:-0x3}  # Core 0-1 (2 cores)
+
+set_nvme_irq_affinity() {
+    log "Setting NVMe IRQ affinity to CPU mask ${NVME_CPU_MASK}..."
+
+    # Find all NVMe IRQs for cache and backend devices
+    for bdf in ${CACHE_BDF} ${BACKEND_BDF}; do
+        local irqs=$(grep "PCI-MSIX-${bdf}" /proc/interrupts | awk -F: '{print $1}' | tr -d ' ')
+        for irq in $irqs; do
+            if [[ -f "/proc/irq/${irq}/smp_affinity" ]]; then
+                echo "${NVME_CPU_MASK}" | sudo tee "/proc/irq/${irq}/smp_affinity" > /dev/null 2>&1 || true
+            fi
+        done
+        local count=$(echo "$irqs" | wc -w)
+        log "Set affinity for ${count} IRQs on ${bdf}"
+    done
+}
+
+# Setup persistent NVMe device names via udev rules
+setup_udev_rules() {
+    local rules_file="/etc/udev/rules.d/99-nvme-persistent.rules"
+
+    if [[ -f "$rules_file" ]]; then
+        return 0
+    fi
+
+    log "Setting up persistent NVMe device names (udev rules)..."
+
+    sudo tee "$rules_file" > /dev/null << EOF
+# Persistent NVMe device names based on PCI BDF
+# Cache device (FDP SSD) - ${CACHE_BDF}
+SUBSYSTEM=="block", KERNEL=="nvme*n1", KERNELS=="${CACHE_BDF}", SYMLINK+="nvme_cache"
+SUBSYSTEM=="block", KERNEL=="nvme*n1p*", KERNELS=="${CACHE_BDF}", SYMLINK+="nvme_cache_part%n"
+
+# Backend device (regular SSD) - ${BACKEND_BDF}
+SUBSYSTEM=="block", KERNEL=="nvme*n1", KERNELS=="${BACKEND_BDF}", SYMLINK+="nvme_backend"
+SUBSYSTEM=="block", KERNEL=="nvme*n1p*", KERNELS=="${BACKEND_BDF}", SYMLINK+="nvme_backend_part%n"
+EOF
+
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=block
+    sudo udevadm settle --timeout=5
+
+    log "udev rules created: $rules_file"
+    log "Persistent symlinks: /dev/nvme_cache, /dev/nvme_backend"
+}
+
+# List available NVMe devices with BDF
+list_nvme_devices() {
+    echo ""
+    echo "Available NVMe devices:"
+    echo "========================"
+    for nvme in /sys/class/nvme/nvme*; do
+        if [[ -d "$nvme" ]]; then
+            local name=$(basename "$nvme")
+            local bdf=$(basename $(readlink -f "$nvme/device"))
+            local model=$(cat "$nvme/model" 2>/dev/null | tr -d '\n' | xargs)
+            # Find first available namespace
+            local ns_dev=""
+            for ns in n1 n2 n3 n4; do
+                if [[ -e "/sys/block/${name}${ns}" ]]; then
+                    ns_dev="${name}${ns}"
+                    break
+                fi
+            done
+            if [[ -n "$ns_dev" ]]; then
+                local size_bytes=$(cat "/sys/block/${ns_dev}/size" 2>/dev/null || echo 0)
+                local size_gb=$((size_bytes * 512 / 1024 / 1024 / 1024))
+                echo "  ${bdf}  /dev/${ns_dev}  ${size_gb}GB  ${model}"
+            fi
+        fi
+    done
+    echo ""
+}
+
+# Verify BDF exists and return device path
+verify_bdf() {
+    local bdf=$1
+    local role=$2  # "cache" or "backend"
+    local dev=$(get_device_from_bdf "$bdf")
+
+    if [[ -z "$dev" ]]; then
+        echo ""
+        echo "ERROR: ${role} device not found at BDF ${bdf}"
+        list_nvme_devices
+        echo "Set correct BDF with: ${role^^}_BDF=0000:XX:00.0 $0 --start"
+        echo ""
+        exit 1
+    fi
+    echo "$dev"
+}
+
 check_prerequisites() {
     log "Checking prerequisites..."
 
@@ -61,10 +154,86 @@ check_prerequisites() {
 
 get_device_from_bdf() {
     local bdf=$1
-    local dev=$(ls -d /sys/bus/pci/devices/${bdf}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
-    if [[ -n "$dev" ]] && [[ -e "/dev/${dev}n1" ]]; then
-        echo "/dev/${dev}n1"
+    local ctrl=$(ls -d /sys/bus/pci/devices/${bdf}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
+    if [[ -n "$ctrl" ]]; then
+        # Find first available namespace (n1, n2, etc.)
+        for ns in n1 n2 n3 n4; do
+            if [[ -e "/dev/${ctrl}${ns}" ]]; then
+                echo "/dev/${ctrl}${ns}"
+                return 0
+            fi
+        done
     fi
+}
+
+# Convert device path to by-id path (required by OpenCAS)
+get_by_id_path() {
+    local dev=$1
+    local dev_name=$(basename "$dev")
+
+    # Find by-id symlink that points to this device
+    local by_id=$(ls -la /dev/disk/by-id/ 2>/dev/null | grep -E "nvme-.*-> \.\./\.\./${dev_name}$" | grep -v "eui\." | head -1 | awk '{print $9}')
+
+    if [[ -n "$by_id" ]]; then
+        echo "/dev/disk/by-id/${by_id}"
+    else
+        # Fallback to original path if by-id not found
+        echo "$dev"
+    fi
+}
+
+# Safety check: ensure device is not boot/root device
+check_not_boot_device() {
+    local dev=$1
+    local role=$2
+
+    # Check if any partition is mounted
+    if mount | grep -q "^${dev}"; then
+        echo ""
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo "  CRITICAL ERROR: ${role} device is MOUNTED!"
+        echo "  Device: ${dev}"
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo ""
+        echo "Mounted partitions:"
+        mount | grep "^${dev}" || true
+        echo ""
+        echo "This could be your BOOT or ROOT device!"
+        echo "Aborting to prevent data loss."
+        echo ""
+        exit 1
+    fi
+
+    # Check if device contains root filesystem
+    local root_dev=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/p[0-9]*$//' | sed 's/[0-9]*$//')
+    if [[ "${dev}" == "${root_dev}"* ]]; then
+        echo ""
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo "  CRITICAL ERROR: ${role} device contains ROOT filesystem!"
+        echo "  Device: ${dev}"
+        echo "  Root: ${root_dev}"
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo ""
+        exit 1
+    fi
+
+    # Check /etc/fstab for this device
+    if grep -q "${dev}" /etc/fstab 2>/dev/null; then
+        echo ""
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo "  WARNING: ${role} device found in /etc/fstab!"
+        echo "  Device: ${dev}"
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        grep "${dev}" /etc/fstab
+        echo ""
+        read -p "Are you SURE this is not a system device? [yes/NO]: " confirm
+        if [[ "${confirm}" != "yes" ]]; then
+            echo "Aborting."
+            exit 1
+        fi
+    fi
+
+    log "Safety check passed for ${role}: ${dev}"
 }
 
 # Pre-format devices with 4K block size
@@ -76,6 +245,15 @@ pre_format_devices() {
 
     local cache_dev=$(get_device_from_bdf ${CACHE_BDF})
     local backend_dev=$(get_device_from_bdf ${BACKEND_BDF})
+
+    # SAFETY CHECK: Ensure devices are not boot/root devices
+    log "Running safety checks..."
+    if [[ -n "$cache_dev" ]]; then
+        check_not_boot_device "$cache_dev" "Cache"
+    fi
+    if [[ -n "$backend_dev" ]]; then
+        check_not_boot_device "$backend_dev" "Backend"
+    fi
 
     echo ""
     echo "========================================"
@@ -152,10 +330,10 @@ create_cache_partition() {
     fi
 
     # Remove existing partition table
-    log "Creating ${CACHE_SIZE_GB}GB partition on ${cache_dev} for cache..."
+    log "Creating ${CACHE_SIZE_GB}GB partition on ${cache_dev} for cache..." >&2
 
     # Delete all partitions first
-    sudo wipefs -a "${cache_dev}" 2>/dev/null || true
+    sudo wipefs -a "${cache_dev}" &>/dev/null || true
 
     # Create GPT partition table and partition
     # Partition 1: Cache (CACHE_SIZE_GB)
@@ -164,17 +342,20 @@ n
 1
 
 +${CACHE_SIZE_GB}G
-w" | sudo fdisk "${cache_dev}" 2>/dev/null || true
+w" | sudo fdisk "${cache_dev}" &>/dev/null || true
 
+    # Wait for partition to appear
     sleep 2
+    sudo partprobe "${cache_dev}" 2>/dev/null || true
+    sleep 1
 
     # Verify partition was created
     if [[ ! -e "${cache_dev}p1" ]] && [[ ! -e "${cache_dev}1" ]]; then
-        log "ERROR: Failed to create partition on ${cache_dev}"
+        log "ERROR: Failed to create partition on ${cache_dev}" >&2
         exit 1
     fi
 
-    # Return partition path
+    # Return partition path (only this goes to stdout)
     if [[ -e "${cache_dev}p1" ]]; then
         echo "${cache_dev}p1"
     else
@@ -226,60 +407,92 @@ stop_opencas() {
     log "Stopping existing OpenCAS configuration (if any)..."
 
     # List and stop all caches
-    if casadm -L 2>/dev/null | grep -q "cache"; then
+    if casadm --list-caches 2>/dev/null | grep -q "cache"; then
         log "Found existing cache configuration, stopping..."
 
         # Remove cores first
-        for cache_id in $(casadm -L -o csv 2>/dev/null | grep "^cache" | cut -d',' -f2); do
-            for core_id in $(casadm -L -C -i "$cache_id" -o csv 2>/dev/null | grep "^core" | cut -d',' -f2); do
+        for cache_id in $(casadm --list-caches -o csv 2>/dev/null | grep "^cache" | cut -d',' -f2); do
+            for core_id in $(casadm --list-caches -o csv 2>/dev/null | grep "^core" | grep ",$cache_id," | cut -d',' -f2); do
                 log "Removing core ${core_id} from cache ${cache_id}"
-                sudo casadm -R -i "$cache_id" -j "$core_id" 2>/dev/null || true
+                sudo casadm --remove-core --cache-id "$cache_id" --core-id "$core_id" --force 2>/dev/null || true
             done
             log "Stopping cache ${cache_id}"
-            sudo casadm -T -i "$cache_id" 2>/dev/null || true
+            sudo casadm --stop-cache --cache-id "$cache_id" --no-data-flush 2>/dev/null || true
         done
     fi
 
+    sleep 1
+
+    # Trigger udev to restore persistent device names
+    log "Triggering udev to restore device names..."
+    sudo udevadm trigger --subsystem-match=block
+    sudo udevadm settle --timeout=5
     sleep 1
 }
 
 # Start OpenCAS with write-back cache configuration
 start_opencas() {
-    local cache_dev=$(get_device_from_bdf ${CACHE_BDF})
-    local backend_dev=$(get_device_from_bdf ${BACKEND_BDF})
+    # Verify BDFs exist before proceeding
+    log "Verifying device BDFs..."
+    local cache_dev=$(verify_bdf ${CACHE_BDF} "cache")
+    local backend_dev=$(verify_bdf ${BACKEND_BDF} "backend")
 
-    if [[ -z "$cache_dev" ]]; then
-        log "ERROR: Cache device not found at ${CACHE_BDF}"
-        exit 1
-    fi
+    # SAFETY CHECK (even if pre_format was skipped)
+    check_not_boot_device "$cache_dev" "Cache"
+    check_not_boot_device "$backend_dev" "Backend"
 
-    if [[ -z "$backend_dev" ]]; then
-        log "ERROR: Backend device not found at ${BACKEND_BDF}"
-        exit 1
-    fi
+    log "Cache device:   ${cache_dev} (${CACHE_BDF})"
+    log "Backend device: ${backend_dev} (${BACKEND_BDF})"
 
     # Create partition for cache
     local cache_partition=$(create_cache_partition)
     log "Cache partition: ${cache_partition}"
 
+    # Verify partition exists
+    if [[ ! -b "${cache_partition}" ]]; then
+        log "ERROR: Cache partition not found: ${cache_partition}"
+        log "Checking available partitions..."
+        ls -la ${cache_dev}* 2>/dev/null || true
+        exit 1
+    fi
+
+    # Convert to by-id paths (required by OpenCAS)
+    local cache_by_id=$(get_by_id_path "${cache_partition}")
+    local backend_by_id=$(get_by_id_path "${backend_dev}")
+    log "Cache by-id:   ${cache_by_id}"
+    log "Backend by-id: ${backend_by_id}"
+
     log "Starting OpenCAS configuration..."
-    log "  Cache device: ${cache_partition} (${CACHE_SIZE_GB}GB)"
-    log "  Core device: ${backend_dev}"
+    log "  Cache device: ${cache_by_id} (${CACHE_SIZE_GB}GB)"
+    log "  Core device: ${backend_by_id}"
     log "  Cache mode: ${CACHE_MODE}"
     log "  Cache line size: ${CACHE_LINE_SIZE}KB"
 
-    # Start cache
+    # Clear any existing metadata on cache device
+    log "Clearing old metadata from cache device..."
+    sudo casadm --zero-metadata --device "${cache_by_id}" --force 2>/dev/null || true
+
+    # Start cache with --force flag
     log "Creating cache instance (ID=${CACHE_ID})..."
-    sudo casadm -S -d "${cache_partition}" -i ${CACHE_ID} -c ${CACHE_MODE} --cache-line-size ${CACHE_LINE_SIZE} || {
+    sudo casadm --start-cache \
+        --cache-device "${cache_by_id}" \
+        --cache-id ${CACHE_ID} \
+        --cache-mode ${CACHE_MODE} \
+        --cache-line-size ${CACHE_LINE_SIZE} \
+        --force || {
         log "ERROR: Failed to start cache"
+        log "Check: casadm --start-cache --help"
         exit 1
     }
 
     # Add core device
     log "Adding core device (ID=${CORE_ID})..."
-    sudo casadm -A -d "${backend_dev}" -i ${CACHE_ID} -j ${CORE_ID} || {
+    sudo casadm --add-core \
+        --cache-id ${CACHE_ID} \
+        --core-device "${backend_by_id}" \
+        --core-id ${CORE_ID} || {
         log "ERROR: Failed to add core device"
-        sudo casadm -T -i ${CACHE_ID}
+        sudo casadm --stop-cache --cache-id ${CACHE_ID} --no-data-flush 2>/dev/null || true
         exit 1
     }
 
@@ -290,7 +503,7 @@ start_opencas() {
     echo "=========================================="
     echo "  OpenCAS Configuration"
     echo "=========================================="
-    casadm -L
+    casadm --list-caches
     echo ""
     echo "Exported device: /dev/cas${CACHE_ID}-${CORE_ID}"
     echo ""
@@ -301,10 +514,10 @@ start_opencas() {
 show_status() {
     echo ""
     log "OpenCAS Status:"
-    casadm -L
+    casadm --list-caches
     echo ""
     log "Cache statistics:"
-    casadm -P -i ${CACHE_ID} 2>/dev/null || true
+    casadm --stats --cache-id ${CACHE_ID} 2>/dev/null || true
     echo ""
 }
 
@@ -365,10 +578,12 @@ main() {
     case "$action" in
         start)
             check_prerequisites
+            setup_udev_rules
             stop_opencas
             pre_format_devices
             prefill_cache
             start_opencas
+            set_nvme_irq_affinity
             show_status
             ;;
         stop)

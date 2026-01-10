@@ -5,6 +5,14 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SPDK_TGT_SCRIPT=${SPDK_TGT_SCRIPT:-"$ROOT_DIR/ssd_waf/spdk_tgt.sh"}
 CREATE_TIER_SCRIPT=${CREATE_TIER_SCRIPT:-"$ROOT_DIR/ssd_waf/create_tier_fdp.sh"}
 RPC_SOCKET=${SPDK_RPC_SOCKET:-/var/tmp/spdk.sock}
+
+# Export mode: nvmeof (default, stable) or ublk
+EXPORT_MODE=${EXPORT_MODE:-nvmeof}
+
+# ublk settings
+UBLK_DEV_ID=${UBLK_DEV_ID:-0}
+
+# NVMe-oF settings (used when EXPORT_MODE=nvmeof)
 NVMF_TRTYPE=${NVMF_TRTYPE:-tcp}
 NVMF_ADRFAM=${NVMF_ADRFAM:-ipv4}
 NVMF_TRADDR=${NVMF_TRADDR:-127.0.0.1}
@@ -25,6 +33,18 @@ log() {
     echo "[run_tier_fdp] $*"
 }
 
+# Find namespace device for NVMe controller (n1, n2, etc.)
+find_nvme_ns() {
+    local ctrl=$1
+    for ns in n1 n2 n3 n4; do
+        if [[ -e "/dev/${ctrl}${ns}" ]]; then
+            echo "${ctrl}${ns}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Pre-format devices before SPDK takes over (uses nvme-cli)
 # For FDP: no zone reset needed, just format normally
 pre_format_devices() {
@@ -34,8 +54,18 @@ pre_format_devices() {
     fi
 
     # Get NVMe controller name from BDF (e.g., nvme2)
-    local cache_dev=$(ls -d /sys/bus/pci/devices/${CACHE_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
-    local backend_dev=$(ls -d /sys/bus/pci/devices/${BACKEND_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
+    local cache_ctrl=$(ls -d /sys/bus/pci/devices/${CACHE_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
+    local backend_ctrl=$(ls -d /sys/bus/pci/devices/${BACKEND_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
+
+    # Find actual namespace (n1, n2, etc.)
+    local cache_dev=""
+    local backend_dev=""
+    if [[ -n "$cache_ctrl" ]]; then
+        cache_dev=$(find_nvme_ns "$cache_ctrl" || true)
+    fi
+    if [[ -n "$backend_ctrl" ]]; then
+        backend_dev=$(find_nvme_ns "$backend_ctrl" || true)
+    fi
 
     echo ""
     echo "========================================"
@@ -44,13 +74,13 @@ pre_format_devices() {
     echo ""
     echo "The following devices will be formatted:"
     echo ""
-    if [[ -n "$cache_dev" ]] && [[ -e "/dev/${cache_dev}n1" ]]; then
-        echo "  Cache (FDP):   /dev/${cache_dev}n1  [Format - 200GB limit]"
+    if [[ -n "$cache_dev" ]] && [[ -e "/dev/${cache_dev}" ]]; then
+        echo "  Cache (FDP):   /dev/${cache_dev}  [Format - 200GB limit]"
     else
         echo "  Cache (FDP):   Not found at ${CACHE_BDF}"
     fi
-    if [[ -n "$backend_dev" ]] && [[ -e "/dev/${backend_dev}n1" ]]; then
-        echo "  Backend:       /dev/${backend_dev}n1  [Format - Full capacity]"
+    if [[ -n "$backend_dev" ]] && [[ -e "/dev/${backend_dev}" ]]; then
+        echo "  Backend:       /dev/${backend_dev}  [Format - Full capacity]"
     else
         echo "  Backend:       Not found at ${BACKEND_BDF}"
     fi
@@ -67,31 +97,31 @@ pre_format_devices() {
     log "Pre-formatting devices before SPDK startup..."
 
     # Cache device (FDP) - format with 4K block size (no zone reset for FDP)
-    if [[ -n "$cache_dev" ]] && [[ -e "/dev/${cache_dev}n1" ]]; then
-        local lbaf_4k=$(sudo nvme id-ns "/dev/${cache_dev}n1" 2>/dev/null | \
+    if [[ -n "$cache_dev" ]] && [[ -e "/dev/${cache_dev}" ]]; then
+        local lbaf_4k=$(sudo nvme id-ns "/dev/${cache_dev}" 2>/dev/null | \
             grep -E "^lbaf\s+[0-9]+.*lbads:12" | head -1 | \
             sed -E 's/^lbaf\s+([0-9]+).*/\1/')
         if [[ -z "$lbaf_4k" ]]; then
             log "WARNING: No 4K LBA format found for cache, using default (lbaf 0)"
             lbaf_4k=0
         fi
-        log "Formatting FDP cache /dev/${cache_dev}n1 with lbaf=${lbaf_4k} (4K block size)"
-        sudo nvme format "/dev/${cache_dev}n1" -l "${lbaf_4k}" -f 2>/dev/null && \
+        log "Formatting FDP cache /dev/${cache_dev} with lbaf=${lbaf_4k} (4K block size)"
+        sudo nvme format "/dev/${cache_dev}" -l "${lbaf_4k}" -f 2>/dev/null && \
             log "Cache format completed" || \
             log "Cache format failed, continuing..."
     fi
 
     # Backend device (regular NVMe) - format with 4K block size
-    if [[ -n "$backend_dev" ]] && [[ -e "/dev/${backend_dev}n1" ]]; then
-        local lbaf_4k=$(sudo nvme id-ns "/dev/${backend_dev}n1" 2>/dev/null | \
+    if [[ -n "$backend_dev" ]] && [[ -e "/dev/${backend_dev}" ]]; then
+        local lbaf_4k=$(sudo nvme id-ns "/dev/${backend_dev}" 2>/dev/null | \
             grep -E "^lbaf\s+[0-9]+.*lbads:12" | head -1 | \
             sed -E 's/^lbaf\s+([0-9]+).*/\1/')
         if [[ -z "$lbaf_4k" ]]; then
             log "WARNING: No 4K LBA format found, using default (lbaf 0)"
             lbaf_4k=0
         fi
-        log "Formatting /dev/${backend_dev}n1 with lbaf=${lbaf_4k} (4K block size)"
-        sudo nvme format "/dev/${backend_dev}n1" -l "${lbaf_4k}" -f 2>/dev/null && \
+        log "Formatting /dev/${backend_dev} with lbaf=${lbaf_4k} (4K block size)"
+        sudo nvme format "/dev/${backend_dev}" -l "${lbaf_4k}" -f 2>/dev/null && \
             log "Format completed" || \
             log "Format failed, continuing..."
     fi
@@ -108,14 +138,18 @@ prefill_cache() {
         return 0
     fi
 
-    local cache_dev=$(ls -d /sys/bus/pci/devices/${CACHE_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
+    local cache_ctrl=$(ls -d /sys/bus/pci/devices/${CACHE_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
+    local cache_dev=""
+    if [[ -n "$cache_ctrl" ]]; then
+        cache_dev=$(find_nvme_ns "$cache_ctrl" || true)
+    fi
 
-    if [[ -z "$cache_dev" ]] || [[ ! -e "/dev/${cache_dev}n1" ]]; then
+    if [[ -z "$cache_dev" ]] || [[ ! -e "/dev/${cache_dev}" ]]; then
         log "Cache device not found at ${CACHE_BDF}, skipping prefill"
         return 0
     fi
 
-    local device="/dev/${cache_dev}n1"
+    local device="/dev/${cache_dev}"
     local device_size=$(sudo blockdev --getsize64 "$device")
     local device_size_gb=$((device_size / 1024 / 1024 / 1024))
 
@@ -187,7 +221,16 @@ start_spdk_tgt() {
 }
 
 create_tier() {
-    log "Running create_tier_fdp.sh"
+    # Set NVMF/UBLK enable based on EXPORT_MODE
+    if [[ "${EXPORT_MODE}" == "ublk" ]]; then
+        export NVMF_ENABLE=0
+        export UBLK_ENABLE=1
+    else
+        export NVMF_ENABLE=1
+        export UBLK_ENABLE=0
+    fi
+
+    log "Running create_tier_fdp.sh (NVMF_ENABLE=${NVMF_ENABLE}, UBLK_ENABLE=${UBLK_ENABLE})"
     sudo -E "${CREATE_TIER_SCRIPT}"
     log "Tier creation complete"
 }
@@ -209,7 +252,31 @@ set_qos_limit() {
         log "Failed to set QoS limit"
 }
 
-connect_host() {
+# Wait for ublk device (already created by create_tier_fdp.sh)
+setup_ublk() {
+    # ublk device is already created by create_tier_fdp.sh when UBLK_ENABLE=1
+    # Just wait for it to appear
+    local waited=0
+    while [[ ! -e "/dev/ublkb${UBLK_DEV_ID}" ]]; do
+        if (( waited >= 10 )); then
+            log "ERROR: /dev/ublkb${UBLK_DEV_ID} not found after 10s"
+            return 1
+        fi
+        sleep 1
+        ((waited++))
+    done
+
+    log "ublk device ready: /dev/ublkb${UBLK_DEV_ID}"
+    echo ""
+    echo "=========================================="
+    echo "  ublk Device Ready"
+    echo "  /dev/ublkb${UBLK_DEV_ID}"
+    echo "=========================================="
+    echo ""
+}
+
+# Connect via NVMe-oF (for remote or when ublk not available)
+connect_nvmeof() {
     if ! command -v nvme >/dev/null 2>&1; then
         log "'nvme' CLI not found; skipping connect step"
         return 0
@@ -221,6 +288,22 @@ connect_host() {
     else
         log "nvme connect failed (might already be connected); continuing"
     fi
+}
+
+# Export bdev to host (ublk or NVMe-oF based on EXPORT_MODE)
+export_to_host() {
+    case "${EXPORT_MODE}" in
+        ublk)
+            setup_ublk
+            ;;
+        nvmeof)
+            connect_nvmeof
+            ;;
+        *)
+            log "Unknown EXPORT_MODE: ${EXPORT_MODE}, using ublk"
+            setup_ublk
+            ;;
+    esac
 }
 
 # Reset SPDK binding so kernel driver can see devices for format
@@ -238,4 +321,6 @@ sudo HUGEMEM=8192 "${ROOT_DIR}/scripts/setup.sh"
 start_spdk_tgt
 create_tier
 set_qos_limit
-connect_host
+export_to_host
+
+log "=== Setup complete (EXPORT_MODE=${EXPORT_MODE}) ==="

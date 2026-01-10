@@ -156,17 +156,19 @@ if [[ "${NVMF_ENABLE}" != "0" ]]; then
 fi
 
 # Fallback: Expose icache bdev via ublk (if NVMF failed or UBLK_ENABLE=1)
-UBLK_CPUMASK=${UBLK_CPUMASK:-0x1}  # Core 0 only for ublk
+UBLK_CPUMASK=${UBLK_CPUMASK:-0xff}  # Core 0-7 for ublk (8 cores), Core 8 reserved for log_cache_wrapper
+UBLK_NUM_QUEUES=${UBLK_NUM_QUEUES:-8}  # Match number of cores
+UBLK_QUEUE_DEPTH=${UBLK_QUEUE_DEPTH:-512}
 
 if [[ "${DEVICE_EXPOSED}" == "0" ]] || [[ "${UBLK_ENABLE}" != "0" ]]; then
 	sleep 2
-	if ! rpc_call "create ublk target on core 0" ublk_create_target -m "${UBLK_CPUMASK}"; then
+	if ! rpc_call "create ublk target (cpumask=${UBLK_CPUMASK})" ublk_create_target -m "${UBLK_CPUMASK}"; then
 		log "ublk_create_target failed (may already exist), continuing"
 	fi
 	sleep 1
-	log "Starting ublk target for ${ICACHE_NAME} as /dev/ublkb${UBLK_DEV_ID}"
+	log "Starting ublk target for ${ICACHE_NAME} as /dev/ublkb${UBLK_DEV_ID} (queues=${UBLK_NUM_QUEUES}, depth=${UBLK_QUEUE_DEPTH})"
 	if rpc_call "start ublk for ${ICACHE_NAME}" \
-		ublk_start_disk "${ICACHE_NAME}" "${UBLK_DEV_ID}"; then
+		ublk_start_disk "${ICACHE_NAME}" "${UBLK_DEV_ID}" -q "${UBLK_NUM_QUEUES}" -d "${UBLK_QUEUE_DEPTH}"; then
 		log "ublk device ready: /dev/ublkb${UBLK_DEV_ID}"
 		DEVICE_EXPOSED=1
 	else
