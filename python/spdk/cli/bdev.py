@@ -104,7 +104,8 @@ def add_parser(subparsers):
                                             mode=args.mode,
                                             cache_line_size=args.cache_line_size,
                                             cache_bdev_name=args.cache_bdev_name,
-                                            core_bdev_name=args.core_bdev_name))
+                                            core_bdev_name=args.core_bdev_name,
+                                            stat_log_path=args.stat_log_path))
     p = subparsers.add_parser('bdev_ocf_create', help='Add an OCF block device')
     p.add_argument('name', help='Name of resulting OCF bdev')
     p.add_argument('mode', help='OCF cache mode', choices=['wb', 'wt', 'pt', 'wa', 'wi', 'wo'])
@@ -116,6 +117,7 @@ def add_parser(subparsers):
     )
     p.add_argument('cache_bdev_name', help='Name of underlying cache bdev')
     p.add_argument('core_bdev_name', help='Name of underlying core bdev')
+    p.add_argument('--stat-log-path', help='Directory for stats CSV log (optional)')
     p.set_defaults(func=bdev_ocf_create)
 
     def bdev_ocf_delete(args):

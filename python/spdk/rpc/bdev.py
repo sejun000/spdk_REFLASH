@@ -95,7 +95,7 @@ def bdev_crypto_delete(client, name):
 
 
 @deprecated_method
-def bdev_ocf_create(client, name, mode, cache_bdev_name, core_bdev_name, cache_line_size=None):
+def bdev_ocf_create(client, name, mode, cache_bdev_name, core_bdev_name, cache_line_size=None, stat_log_path=None):
     """Add an OCF block device
     Args:
         name: name of constructed OCF bdev
@@ -103,6 +103,7 @@ def bdev_ocf_create(client, name, mode, cache_bdev_name, core_bdev_name, cache_l
         cache_bdev_name: name of underlying cache bdev
         core_bdev_name: name of underlying core bdev
         cache_line_size: OCF cache line size. The unit is KiB: {4, 8, 16, 32, 64}
+        stat_log_path: optional directory for stats CSV log
     Returns:
         Name of created block device
     """
@@ -113,6 +114,8 @@ def bdev_ocf_create(client, name, mode, cache_bdev_name, core_bdev_name, cache_l
     params['core_bdev_name'] = core_bdev_name
     if cache_line_size is not None:
         params['cache_line_size'] = cache_line_size
+    if stat_log_path is not None:
+        params['stat_log_path'] = stat_log_path
     return client.call('bdev_ocf_create', params)
 
 

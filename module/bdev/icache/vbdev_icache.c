@@ -477,7 +477,11 @@ icache_host_io_done(void *cb_arg, int status)
 	}
 
 	if (status) {
-		SPDK_ERRLOG("icache: host io failed rc=%d\n", status);
+		SPDK_ERRLOG("icache: host io FAILED! type=%s lba=%lu num_blocks=%lu rc=%d\n",
+			    bdev_io->type == SPDK_BDEV_IO_TYPE_READ ? "READ" : "WRITE",
+			    bdev_io->u.bdev.offset_blocks,
+			    bdev_io->u.bdev.num_blocks,
+			    status);
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
@@ -841,10 +845,10 @@ vbdev_icache_create(const char *name, const char *cache_bdev_name,
 	}
 
 	// Limit cache size (TODO: make this configurable via RPC)
-	// Align to zone_size * STRIPE_WIDTH for proper segment boundaries
-	uint64_t cache_size_limit_gb = 200;
+	// 549,357,355,008 bytes = 25% of 2TB (2,174,461,292,544), aligned to 13079937024 (42 units)
+	uint64_t cache_size_limit_bytes = 549357355008ULL;
 	uint64_t cache_blockcnt = icache->cache_bdev->blockcnt;
-	uint64_t limit_blockcnt = (cache_size_limit_gb * 1024ULL * 1024 * 1024) / icache->cache_bdev->blocklen;
+	uint64_t limit_blockcnt = cache_size_limit_bytes / icache->cache_bdev->blocklen;
 
 	// Get zone size and align to stripe boundaries
 	uint64_t zone_size_blocks = spdk_bdev_get_zone_size(icache->cache_bdev);

@@ -142,10 +142,15 @@ int StatsLogger::poller_fn(void *arg)
 {
     auto *self = static_cast<StatsLogger*>(arg);
 
-    // First try to read NVMe log page (async)
+    // Process admin completions to receive FDP log page results
+    if (self->nvme_ctrlr_) {
+        spdk_nvme_ctrlr_process_admin_completions(self->nvme_ctrlr_);
+    }
+
+    // Try to read NVMe log page (async)
     self->read_nvme_log_page();
 
-    // Then log current stats
+    // Log current stats
     self->log_stats();
 
     return SPDK_POLLER_BUSY;

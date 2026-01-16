@@ -1865,6 +1865,9 @@ ftl_chunk_basic_rq_write(struct ftl_nv_cache_chunk *chunk, struct ftl_basic_rq *
 
 	chunk->md->write_pointer += brq->num_blocks;
 	dev->stats.io_activity_total += brq->num_blocks;
+
+	/* Track cache write bytes */
+	ftl_stats_logger_add_cache_write(dev->stats_logger, brq->num_blocks * FTL_BLOCK_SIZE);
 }
 
 static void

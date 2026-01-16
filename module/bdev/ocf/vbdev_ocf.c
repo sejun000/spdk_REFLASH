@@ -12,8 +12,10 @@
 #include "volume.h"
 #include "utils.h"
 #include "vbdev_ocf.h"
+#include "ocf_stats_logger.h"
 
 #include "spdk/bdev_module.h"
+#include "../nvme/bdev_nvme.h"  /* For bdev_nvme_get_ctrlr */
 #include "spdk/thread.h"
 #include "spdk/string.h"
 #include "spdk/log.h"
@@ -84,6 +86,13 @@ free_vbdev(struct vbdev_ocf *vbdev)
 		return;
 	}
 
+	/* Stop and destroy stats logger */
+	if (vbdev->stats_logger) {
+		ocf_stats_logger_destroy(vbdev->stats_logger);
+		vbdev->stats_logger = NULL;
+	}
+
+	free(vbdev->stat_log_path);
 	free(vbdev->name);
 	free(vbdev->cache.name);
 	free(vbdev->core.name);
@@ -962,6 +971,44 @@ finish_register(struct vbdev_ocf *vbdev)
 		vbdev->state.started = true;
 	}
 
+	/* Start stats logger if stat_log_path was provided */
+	if (vbdev->stat_log_path) {
+		vbdev->stats_logger = ocf_stats_logger_create(vbdev->name,
+							       vbdev->stat_log_path,
+							       2000000);
+		if (vbdev->stats_logger) {
+			ocf_stats_logger_set_cache(vbdev->stats_logger,
+						    vbdev->ocf_cache,
+						    vbdev->ocf_core,
+						    vbdev->core.name);
+			/* Set NVMe controller for FDP stats */
+			if (vbdev->cache.bdev) {
+				struct spdk_nvme_ctrlr *nvme_ctrlr = bdev_nvme_get_ctrlr(vbdev->cache.bdev);
+				if (!nvme_ctrlr) {
+					/* Split partition case: try parent bdev (strip "pN" suffix) */
+					const char *bdev_name = spdk_bdev_get_name(vbdev->cache.bdev);
+					if (bdev_name) {
+						char parent_name[256];
+						snprintf(parent_name, sizeof(parent_name), "%s", bdev_name);
+						char *p_pos = strrchr(parent_name, 'p');
+						if (p_pos && p_pos > parent_name) {
+							*p_pos = '\0';
+							struct spdk_bdev *parent_bdev = spdk_bdev_get_by_name(parent_name);
+							if (parent_bdev) {
+								nvme_ctrlr = bdev_nvme_get_ctrlr(parent_bdev);
+								SPDK_NOTICELOG("Got NVMe controller from parent bdev %s\n", parent_name);
+							}
+						}
+					}
+				}
+				if (nvme_ctrlr) {
+					ocf_stats_logger_set_nvme_ctrlr(vbdev->stats_logger, nvme_ctrlr);
+				}
+			}
+			ocf_stats_logger_start(vbdev->stats_logger);
+		}
+	}
+
 	vbdev_ocf_mngt_continue(vbdev, result);
 }
 
@@ -1473,6 +1520,7 @@ vbdev_ocf_construct(const char *vbdev_name,
 		    const char *cache_name,
 		    const char *core_name,
 		    bool loadq,
+		    const char *stat_log_path,
 		    void (*cb)(int, struct vbdev_ocf *, void *),
 		    void *cb_arg)
 {
@@ -1491,6 +1539,11 @@ vbdev_ocf_construct(const char *vbdev_name,
 	if (vbdev == NULL) {
 		cb(-ENODEV, NULL, cb_arg);
 		return;
+	}
+
+	/* Store stat log path if provided */
+	if (stat_log_path && strlen(stat_log_path) > 0) {
+		vbdev->stat_log_path = strdup(stat_log_path);
 	}
 
 	if (cache_bdev == NULL) {

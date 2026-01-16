@@ -24,6 +24,18 @@ log() {
     echo "[run_ftl] $*"
 }
 
+# Find namespace device for NVMe controller (n1, n2, etc.)
+find_nvme_ns() {
+    local ctrl=$1
+    for ns in n1 n2 n3 n4; do
+        if [[ -e "/dev/${ctrl}${ns}" ]]; then
+            echo "${ctrl}${ns}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Pre-format devices before SPDK takes over (uses nvme-cli)
 pre_format_devices() {
     if [[ "${SKIP_PRE_FORMAT}" == "1" ]]; then
@@ -32,8 +44,18 @@ pre_format_devices() {
     fi
 
     # Get NVMe controller name from BDF
-    local cache_dev=$(ls -d /sys/bus/pci/devices/${CACHE_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
-    local backend_dev=$(ls -d /sys/bus/pci/devices/${BACKEND_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
+    local cache_ctrl=$(ls -d /sys/bus/pci/devices/${CACHE_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
+    local backend_ctrl=$(ls -d /sys/bus/pci/devices/${BACKEND_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
+
+    # Find actual namespace (n1, n2, etc.)
+    local cache_dev=""
+    local backend_dev=""
+    if [[ -n "$cache_ctrl" ]]; then
+        cache_dev=$(find_nvme_ns "$cache_ctrl" || true)
+    fi
+    if [[ -n "$backend_ctrl" ]]; then
+        backend_dev=$(find_nvme_ns "$backend_ctrl" || true)
+    fi
 
     echo ""
     echo "========================================"
@@ -42,13 +64,13 @@ pre_format_devices() {
     echo ""
     echo "The following devices will be formatted:"
     echo ""
-    if [[ -n "$cache_dev" ]] && [[ -e "/dev/${cache_dev}n1" ]]; then
-        echo "  Cache (FDP):    /dev/${cache_dev}n1  [Format 4K]"
+    if [[ -n "$cache_dev" ]] && [[ -e "/dev/${cache_dev}" ]]; then
+        echo "  Cache (FDP):    /dev/${cache_dev}  [Format 4K]"
     else
         echo "  Cache (FDP):    Not found at ${CACHE_BDF}"
     fi
-    if [[ -n "$backend_dev" ]] && [[ -e "/dev/${backend_dev}n1" ]]; then
-        echo "  Backend (SSD):  /dev/${backend_dev}n1  [Format 4K]"
+    if [[ -n "$backend_dev" ]] && [[ -e "/dev/${backend_dev}" ]]; then
+        echo "  Backend (SSD):  /dev/${backend_dev}  [Format 4K]"
     else
         echo "  Backend (SSD):  Not found at ${BACKEND_BDF}"
     fi
@@ -57,8 +79,8 @@ pre_format_devices() {
     echo ""
     read -p "Proceed with format/reset? [y/N]: " confirm
     if [[ "${confirm,,}" != "y" ]]; then
-        log "User cancelled. Exiting."
-        exit 0
+        log "Skipping format, continuing with bringup..."
+        return 0
     fi
     echo ""
 
@@ -132,7 +154,6 @@ prefill_cache() {
         --ioengine=libaio \
         --direct=1 \
         --bs=1M \
-        --offset="${CACHE_SPLIT_GB}g" \
         --rw=write \
         --iodepth=32 \
         --numjobs=1 \

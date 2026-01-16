@@ -1253,13 +1253,13 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
             if (!blk.valid) continue;
 
             // Skip blocks with pending host writes
-            if (pending_writes_.count(blk.key)) continue;
+           // if (pending_writes_.count(blk.key)) continue;
 
             // Check if should evict or copy based on threshold
-            if (threshold > 0 && log_cache_timestamp - blk.create_timestamp >= threshold) {
+            /*if (threshold > 0 && log_cache_timestamp - blk.create_timestamp >= threshold) {
                 // Will be evicted, not copied
                 continue;
-            }
+            }*/
 
             // Check if target segment is full
             if (result.target_seg->full()) {
@@ -1350,7 +1350,7 @@ bool LogCache::prepare_evict(EvictPrepareResult &result)
             auto &blk = victim->blocks[i];
             if (!blk.valid) continue;
             // Skip blocks with pending host writes
-            if (pending_writes_.count(blk.key)) continue;
+           // if (pending_writes_.count(blk.key)) continue;
             has_valid = true;
             break;
         }
@@ -1368,7 +1368,7 @@ bool LogCache::prepare_evict(EvictPrepareResult &result)
                 info.seg_indices[offset_in_chunk] = i;
                 if (blk.valid) {
                     // Skip blocks with pending host writes
-                    if (pending_writes_.count(blk.key)) continue;
+                   // if (pending_writes_.count(blk.key)) continue;
                     info.valid_mask[offset_in_chunk] = true;
                     info.backend_keys[offset_in_chunk] = blk.key;
                 }

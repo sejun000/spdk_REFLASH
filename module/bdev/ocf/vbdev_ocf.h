@@ -157,6 +157,10 @@ struct vbdev_ocf {
 	/* OCF uuid for core device of this vbdev */
 	char uuid[VBDEV_OCF_MD_MAX_LEN];
 
+	/* Stats logger for CSV output */
+	struct ocf_stats_logger     *stats_logger;
+	char                        *stat_log_path;
+
 	/* Link to global list of this type structures */
 	TAILQ_ENTRY(vbdev_ocf)       tailq;
 };
@@ -168,6 +172,7 @@ void vbdev_ocf_construct(
 	const char *cache_name,
 	const char *core_name,
 	bool loadq,
+	const char *stat_log_path,
 	void (*cb)(int, struct vbdev_ocf *, void *),
 	void *cb_arg);
 

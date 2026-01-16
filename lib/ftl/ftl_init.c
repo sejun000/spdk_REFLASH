@@ -84,6 +84,12 @@ free_dev(struct spdk_ftl_dev *dev)
 		return;
 	}
 
+	/* Destroy stats logger */
+	if (dev->stats_logger) {
+		ftl_stats_logger_destroy(dev->stats_logger);
+		dev->stats_logger = NULL;
+	}
+
 	deinit_core_thread(dev);
 	spdk_ftl_conf_deinit(&dev->conf);
 	ftl_properties_deinit(dev);
@@ -127,6 +133,13 @@ allocate_dev(const struct spdk_ftl_conf *conf, int *error)
 
 	ftl_writer_init(dev, &dev->writer_user, SPDK_FTL_LIMIT_HIGH, FTL_BAND_TYPE_COMPACTION);
 	ftl_writer_init(dev, &dev->writer_gc, SPDK_FTL_LIMIT_CRIT, FTL_BAND_TYPE_GC);
+
+	/* Create stats logger */
+	dev->stats_logger = ftl_stats_logger_create(conf->name, "logging", 2000000);
+	if (!dev->stats_logger) {
+		FTL_WARNLOG(dev, "Failed to create stats logger\n");
+		/* Non-fatal, continue without logging */
+	}
 
 	return dev;
 error:

@@ -1,12 +1,27 @@
 #!/bin/bash
 
 # icache 디바이스를 찾아 fio 실행 + 검증
-# ublk (/dev/ublkb0) 또는 NVMe-oF (ICACHE) 사용
+# ublk (/dev/ublkb0), NVMe-oF (ICACHE), 또는 OpenCAS (/dev/cas1-1) 사용
+#
+# Usage:
+#   ./fio_icache.sh                    # 자동 디바이스 탐지 (ublk > nvmeof > opencas)
+#   DEVICE_TYPE=opencas ./fio_icache.sh  # OpenCAS 디바이스만 사용
+#   DEVICE_TYPE=ublk ./fio_icache.sh     # ublk 디바이스만 사용
+#   DEVICE_TYPE=nvmeof ./fio_icache.sh   # NVMe-oF 디바이스만 사용
+
+# Device type: auto (default), ublk, nvmeof, opencas
+DEVICE_TYPE=${DEVICE_TYPE:-auto}
 
 UBLK_DEV_ID=${UBLK_DEV_ID:-0}
 UBLK_DEVICE="/dev/ublkb${UBLK_DEV_ID}"
+
+# OpenCAS device settings
+CAS_CACHE_ID=${CAS_CACHE_ID:-1}
+CAS_CORE_ID=${CAS_CORE_ID:-1}
+CAS_DEVICE="/dev/cas${CAS_CACHE_ID}-${CAS_CORE_ID}"
+
 RUNTIME=${RUNTIME:-200}  # Default 2 minutes
-TEST_SIZE=${TEST_SIZE:-70G}  # 검증용 테스트 크기
+TEST_SIZE=${TEST_SIZE:-1700G}  # 검증용 테스트 크기
 VERIFY_ONLY=${VERIFY_ONLY:-0}  # 1이면 검증만 수행
 SKIP_VERIFY=${SKIP_VERIFY:-0}  # 1이면 검증 스킵
 LOG_PREFIX="fio_bw_$(date +%Y%m%d_%H%M%S)"
@@ -53,19 +68,98 @@ else
     IODEPTH=32
 fi
 
-# ublk 디바이스 우선 확인
-if [ -e "$UBLK_DEVICE" ]; then
-    DEVICE="$UBLK_DEVICE"
-    echo "ublk 디바이스 발견: $DEVICE"
-else
-    # Fallback: NVMe-oF 디바이스 검색 (ICACHE, FTLBDEV, 또는 NULL)
-    DEVICE=$(sudo nvme list 2>/dev/null | grep -iE "ICACHE|FTLBDEV|NULL" | awk '{print $1}')
-    if [ -z "$DEVICE" ]; then
-        echo "디바이스를 찾을 수 없습니다. (ublk: $UBLK_DEVICE, NVMe: ICACHE/FTLBDEV/NULL)"
-        exit 1
+# 디바이스 검증 함수
+verify_device() {
+    local dev=$1
+    local dev_type=$2
+
+    if [ ! -e "$dev" ]; then
+        echo "ERROR: ${dev_type} 디바이스가 존재하지 않습니다: $dev"
+        return 1
     fi
-    echo "NVMe-oF 디바이스 발견: $DEVICE"
-fi
+
+    # 블록 디바이스인지 확인
+    if [ ! -b "$dev" ]; then
+        echo "ERROR: ${dev} 는 블록 디바이스가 아닙니다"
+        return 1
+    fi
+
+    # 디바이스 크기 확인 (0이면 문제)
+    local size=$(sudo blockdev --getsize64 "$dev" 2>/dev/null)
+    if [ -z "$size" ] || [ "$size" -eq 0 ]; then
+        echo "ERROR: ${dev} 디바이스 크기를 읽을 수 없거나 0입니다"
+        return 1
+    fi
+
+    local size_gb=$((size / 1024 / 1024 / 1024))
+    echo "${dev_type} 디바이스 확인됨: $dev (${size_gb}GB)"
+    return 0
+}
+
+# 디바이스 탐지
+find_device() {
+    case "$DEVICE_TYPE" in
+        ublk)
+            if verify_device "$UBLK_DEVICE" "ublk"; then
+                DEVICE="$UBLK_DEVICE"
+            else
+                exit 1
+            fi
+            ;;
+        nvmeof)
+            DEVICE=$(sudo nvme list 2>/dev/null | grep -iE "ICACHE|FTLBDEV|NULL|OCF" | awk '{print $1}')
+            if [ -z "$DEVICE" ]; then
+                echo "ERROR: NVMe-oF 디바이스를 찾을 수 없습니다 (ICACHE/FTLBDEV/NULL/OCF)"
+                exit 1
+            fi
+            if ! verify_device "$DEVICE" "NVMe-oF"; then
+                exit 1
+            fi
+            ;;
+        opencas)
+            if ! verify_device "$CAS_DEVICE" "OpenCAS"; then
+                echo ""
+                echo "OpenCAS가 실행중인지 확인하세요:"
+                echo "  casadm -L"
+                echo "  ./run_opencas.sh --start"
+                exit 1
+            fi
+            DEVICE="$CAS_DEVICE"
+            ;;
+        auto|*)
+            # 자동 탐지: ublk > nvmeof > opencas 순서
+            if [ -e "$UBLK_DEVICE" ] && verify_device "$UBLK_DEVICE" "ublk" 2>/dev/null; then
+                DEVICE="$UBLK_DEVICE"
+                echo "자동 탐지: ublk 디바이스 사용"
+            else
+                DEVICE=$(sudo nvme list 2>/dev/null | grep -iE "ICACHE|FTLBDEV|NULL|OCF" | awk '{print $1}')
+                if [ -n "$DEVICE" ] && verify_device "$DEVICE" "NVMe-oF" 2>/dev/null; then
+                    echo "자동 탐지: NVMe-oF 디바이스 사용"
+                elif [ -e "$CAS_DEVICE" ] && verify_device "$CAS_DEVICE" "OpenCAS" 2>/dev/null; then
+                    DEVICE="$CAS_DEVICE"
+                    echo "자동 탐지: OpenCAS 디바이스 사용"
+                else
+                    echo "ERROR: 사용 가능한 디바이스를 찾을 수 없습니다"
+                    echo ""
+                    echo "확인된 위치:"
+                    echo "  ublk:    $UBLK_DEVICE ($([ -e "$UBLK_DEVICE" ] && echo '존재' || echo '없음'))"
+                    echo "  NVMe-oF: ICACHE/FTLBDEV/NULL/OCF (없음)"
+                    echo "  OpenCAS: $CAS_DEVICE ($([ -e "$CAS_DEVICE" ] && echo '존재' || echo '없음'))"
+                    echo ""
+                    echo "디바이스 타입을 지정하세요:"
+                    echo "  DEVICE_TYPE=opencas $0"
+                    echo "  DEVICE_TYPE=ublk $0"
+                    exit 1
+                fi
+            fi
+            ;;
+    esac
+}
+
+find_device
+echo ""
+echo "테스트 대상 디바이스: $DEVICE"
+echo ""
 
 # 검증만 수행 모드
 if [ "${VERIFY_ONLY}" == "1" ]; then
@@ -205,7 +299,7 @@ if not times:
 
 # Convert KiB/s to MiB/s (matches fio display)
 sorted_times = sorted(times.keys())
-bw_mibs = [times[t] / 1024 for t in sorted_times]
+bw_mbs = [times[t] / 1024 for t in sorted_times]
 
 # Print stats
 avg_bw = sum(bw_mbs) / len(bw_mbs)

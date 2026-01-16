@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -36,6 +37,7 @@ extern "C" struct spdk_nvme_ctrlr *bdev_nvme_get_ctrlr(struct spdk_bdev *bdev);
 #include "port/cache_device.h"
 #include "port/evict_policy_greedy.h"
 #include "port/evict_policy_cost_benefit.h"
+#include "port/evict_policy_fifo.h"
 #include "port/istream.h"
 #include "port/log_cache.h"
 #include "port/log_cache_segment.h"
@@ -64,6 +66,41 @@ static double score_warm_first(Segment *seg) {
     if (u < 0.0001) u = 0.0001;  // Avoid division by zero
     return std::min(g_threshold - (g_timestamp - seg->create_timestamp),
                     g_timestamp - seg->create_timestamp) * (1 - u) / u;
+}
+
+// Score function: prefer HOT segments (recently created) for compaction
+static double score_hot_first(Segment *seg) {
+    if (g_threshold <= 0 || g_timestamp <= 0) {
+        return -static_cast<double>(seg->create_timestamp);
+    }
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
+    if (u < 0.0001) u = 0.0001;
+    // Hot-first: higher score for segments with smaller age (recently created)
+    return (g_threshold - (g_timestamp - seg->create_timestamp)) * (1 - u) / u;
+}
+
+// Score function: prefer COLD segments (old) for compaction
+static double score_cold_first(Segment *seg) {
+    if (g_threshold <= 0 || g_timestamp <= 0) {
+        return -static_cast<double>(seg->create_timestamp);
+    }
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
+    if (u < 0.0001) u = 0.0001;
+    // Cold-first: higher score for segments with larger age (older)
+    return (g_timestamp - seg->create_timestamp) * (1 - u) / u;
+}
+
+// Score function for SEPBIT: sqrt of age for balanced selection
+static double score_sepbit_age(Segment *seg) {
+    if (g_threshold <= 0 || g_timestamp <= 0) {
+        return -static_cast<double>(seg->create_timestamp);
+    }
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
+    if (u < 0.0001) u = 0.0001;
+    return std::sqrt(static_cast<double>(g_timestamp - seg->create_timestamp)) * (1 - u) / u;
 }
 
 namespace icache {
@@ -1880,6 +1917,9 @@ public:
 		double effective_valid_rate = valid_rate_threshold;
 		bool score_low_valid_first = false;
 
+		// IStream policy name (default: multi_hotcold_3)
+		std::string istream_policy_name = "multi_hotcold_3";
+
 		if (cache_type == "LOG_GREEDY_COST_BENEFIT_10" || cache_type == "LOG_GREEDY_COST_BENEFIT_11") {
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_warm_first);
@@ -1888,6 +1928,24 @@ public:
 				score_low_valid_first = true;
 			}
 			// LOG_GREEDY_COST_BENEFIT_11 uses valid_rate_threshold from parameter
+		} else if (cache_type == "LOG_GREEDY_COST_BENEFIT_HOT") {
+			// Hot-first compaction: prefer recently created segments
+			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
+			compactor = std::make_unique<CbEvictPolicy>(score_hot_first);
+			effective_valid_rate = 0.6;
+			score_low_valid_first = true;
+		} else if (cache_type == "LOG_GREEDY_COST_BENEFIT_COLD") {
+			// Cold-first compaction: prefer older segments
+			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
+			compactor = std::make_unique<CbEvictPolicy>(score_cold_first);
+			effective_valid_rate = 0.6;
+			score_low_valid_first = true;
+		} else if (cache_type == "LOG_SEPBIT_FIFO") {
+			// SEPBIT with FIFO eviction and sqrt-age compaction
+			evictor = std::make_unique<FifoEvictPolicy>();
+			compactor = std::make_unique<CbEvictPolicy>(score_sepbit_age);
+			effective_valid_rate = 0.93;
+			istream_policy_name = "sepbit";
 		} else if (cache_type == "LOG_COST_BENEFIT") {
 			evictor = std::make_unique<CbEvictPolicy>();
 		} else {
@@ -1897,7 +1955,7 @@ public:
 
 		// Create IStream policy for stream separation (same as icache.cpp)
 		set_stream_interval(static_cast<uint64_t>(cache_block_count));
-		IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+		IStream *input_stream_policy = createIstreamPolicy(istream_policy_name);
 
 		SPDK_NOTICELOG("LogCacheAsync: cache_type=%s, valid_rate=%.2f, has_compactor=%d, istream=%p\n",
 			       cache_type.c_str(), effective_valid_rate, compactor != nullptr, input_stream_policy);
@@ -2663,13 +2721,15 @@ static void gc_io_complete(GcIo *io, int status)
 		double read_mbs = (read_sec > 0) ? (mb / read_sec) : 0;
 		double write_mbs = (write_sec > 0) ? (mb / write_sec) : 0;
 
-		SPDK_NOTICELOG("GC segment: %.1f MB, total=%.2fs (%.0f MB/s), "
+		SPDK_NOTICELOG("GC complete: victim_seg=%p, %.1f MB, total=%.2fs (%.0f MB/s), "
 			       "read=%.2fs (%.0f MB/s), write=%.2fs (%.0f MB/s), status=%d\n",
-			       mb, elapsed_sec, throughput_mbs,
+			       (void*)io->prepare_result.victim_seg, mb, elapsed_sec, throughput_mbs,
 			       read_sec, read_mbs, write_sec, write_mbs, status);
 	}
 
 	auto on_complete = std::move(io->on_complete);
+	auto victim_seg = io->prepare_result.victim_seg;
+	(void)victim_seg;  // For potential future debugging
 	delete io;
 	if (on_complete) {
 		on_complete(status);
@@ -2693,12 +2753,14 @@ static void evict_io_complete(EvictIo *io, int status)
 	// Record evict timing for QoS throttle (use segment capacity = freed space)
 	io->ctx->cache->throttle_gc_complete(io->ctx->cache->segment_capacity(), elapsed_ticks);
 
-	SPDK_NOTICELOG("Evict segment: %.1f MB, total=%.2fs (%.0f MB/s), "
+	SPDK_NOTICELOG("Evict complete: victim_seg=%p, %.1f MB, total=%.2fs (%.0f MB/s), "
 		       "read=%.2fs (%.0f MB/s), write=%.2fs (%.0f MB/s), status=%d\n",
-		       mb, elapsed_sec, throughput_mbs,
+		       (void*)io->prepare_result.victim_seg, mb, elapsed_sec, throughput_mbs,
 		       read_sec, read_mbs, write_sec, write_mbs, status);
 
 	auto on_complete = std::move(io->on_complete);
+	auto victim_seg = io->prepare_result.victim_seg;
+	(void)victim_seg;  // For potential future debugging
 	delete io;
 	SPDK_NOTICELOG("evict_io_complete: calling on_complete=%p\n", (void*)&on_complete);
 	if (on_complete) {
@@ -4294,8 +4356,9 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 			double score = (g_threshold > 0 && g_timestamp > 0) ?
 				std::min(g_threshold - (g_timestamp - victim->create_timestamp),
 				         g_timestamp - victim->create_timestamp) * (1 - u) / u : 0.0;
-			SPDK_NOTICELOG("GC: valid_ratio=%.1f%%, use_sequential_read=%d, g_threshold=%lu, g_timestamp=%lu, create_ts=%lu, age=%lu, score=%.2f\n",
-				       gc_io->valid_ratio * 100, gc_io->use_sequential_read,
+			SPDK_NOTICELOG("GC: victim_seg=%p, valid_ratio=%.1f%%, blocks_to_copy=%zu, use_sequential_read=%d, g_threshold=%lu, g_timestamp=%lu, create_ts=%lu, age=%lu, score=%.2f\n",
+				       (void*)victim, gc_io->valid_ratio * 100, gc_io->prepare_result.blocks_to_copy.size(),
+				       gc_io->use_sequential_read,
 				       g_threshold, g_timestamp, victim->create_timestamp,
 				       g_timestamp - victim->create_timestamp, score);
 
@@ -4366,7 +4429,7 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 		evict_io_state_machine(evict_io);
 		return;
 	}
-
+	
 	// Nothing to evict right now - evictor queue may be temporarily empty
 	// This is normal when all segments have been evicted and new ones are filling up
 	if (on_complete) on_complete(0);
@@ -4577,6 +4640,22 @@ log_cache_ctx_set_channels(struct log_cache_ctx *ctx,
 	struct spdk_bdev *cache_bdev = ctx->device->get_cache_bdev();
 	if (cache_bdev && ctx->cache) {
 		struct spdk_nvme_ctrlr *nvme_ctrlr = bdev_nvme_get_ctrlr(cache_bdev);
+		if (!nvme_ctrlr) {
+			// Split partition case: try parent bdev (strip "pN" suffix)
+			const char *bdev_name = spdk_bdev_get_name(cache_bdev);
+			if (bdev_name) {
+				std::string name(bdev_name);
+				size_t p_pos = name.rfind('p');
+				if (p_pos != std::string::npos && p_pos > 0) {
+					std::string parent_name = name.substr(0, p_pos);
+					struct spdk_bdev *parent_bdev = spdk_bdev_get_by_name(parent_name.c_str());
+					if (parent_bdev) {
+						nvme_ctrlr = bdev_nvme_get_ctrlr(parent_bdev);
+						SPDK_NOTICELOG("Got NVMe controller from parent bdev %s\n", parent_name.c_str());
+					}
+				}
+			}
+		}
 		if (nvme_ctrlr) {
 			ctx->cache->set_stats_nvme_ctrlr(nvme_ctrlr);
 			SPDK_NOTICELOG("Set NVMe controller for stats logger: %p\n", nvme_ctrlr);

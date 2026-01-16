@@ -13,6 +13,9 @@
 #include "ftl_debug.h"
 #include "ftl_utils.h"
 
+/* External function from bdev_nvme to get NVMe controller from bdev */
+extern struct spdk_nvme_ctrlr *bdev_nvme_get_ctrlr(struct spdk_bdev *bdev);
+
 void
 ftl_mngt_check_conf(struct spdk_ftl_dev *dev, struct ftl_mngt_process *mngt)
 {
@@ -198,6 +201,38 @@ ftl_mngt_finalize_startup(struct spdk_ftl_dev *dev, struct ftl_mngt_process *mng
 	ftl_writer_resume(&dev->writer_user);
 	ftl_writer_resume(&dev->writer_gc);
 	ftl_nv_cache_resume(&dev->nv_cache);
+
+	/* Start stats logger */
+	if (dev->stats_logger) {
+		struct spdk_bdev *cache_bdev = spdk_bdev_desc_get_bdev(dev->nv_cache.bdev_desc);
+		struct spdk_nvme_ctrlr *nvme_ctrlr = bdev_nvme_get_ctrlr(cache_bdev);
+
+		/* Split partition case: try parent bdev (strip "pN" suffix) */
+		if (!nvme_ctrlr && cache_bdev) {
+			const char *bdev_name = spdk_bdev_get_name(cache_bdev);
+			if (bdev_name) {
+				char parent_name[256];
+				snprintf(parent_name, sizeof(parent_name), "%s", bdev_name);
+				char *p_pos = strrchr(parent_name, 'p');
+				if (p_pos && p_pos > parent_name) {
+					*p_pos = '\0';
+					struct spdk_bdev *parent_bdev = spdk_bdev_get_by_name(parent_name);
+					if (parent_bdev) {
+						nvme_ctrlr = bdev_nvme_get_ctrlr(parent_bdev);
+						FTL_NOTICELOG(dev, "Got NVMe controller from parent bdev %s\n", parent_name);
+					}
+				}
+			}
+		}
+
+		ftl_stats_logger_set_cache_bdev(dev->stats_logger,
+						 dev->nv_cache.bdev_desc,
+						 dev->nv_cache.cache_ioch);
+		if (nvme_ctrlr) {
+			ftl_stats_logger_set_nvme_ctrlr(dev->stats_logger, nvme_ctrlr);
+		}
+		ftl_stats_logger_start(dev->stats_logger);
+	}
 
 	ftl_mngt_next_step(mngt);
 }

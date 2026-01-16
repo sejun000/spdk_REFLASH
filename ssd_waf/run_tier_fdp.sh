@@ -26,8 +26,8 @@ CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
 BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
 SKIP_PRE_FORMAT=${SKIP_PRE_FORMAT:-0}
 
-# FDP cache size: 200GB
-export CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-200}
+# FDP cache size: ~512GB (549,357,355,008 bytes = 25% of 2TB, aligned to 13079937024)
+export CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-512}
 
 log() {
     echo "[run_tier_fdp] $*"
@@ -75,7 +75,7 @@ pre_format_devices() {
     echo "The following devices will be formatted:"
     echo ""
     if [[ -n "$cache_dev" ]] && [[ -e "/dev/${cache_dev}" ]]; then
-        echo "  Cache (FDP):   /dev/${cache_dev}  [Format - 200GB limit]"
+        echo "  Cache (FDP):   /dev/${cache_dev}  [Format - ${CACHE_SPLIT_GB}GB limit]"
     else
         echo "  Cache (FDP):   Not found at ${CACHE_BDF}"
     fi
@@ -89,8 +89,8 @@ pre_format_devices() {
     echo ""
     read -p "Proceed with format? [y/N]: " confirm
     if [[ "${confirm,,}" != "y" ]]; then
-        log "User cancelled. Exiting."
-        exit 0
+        log "Skipping format, continuing with bringup..."
+        return 0
     fi
     echo ""
 
@@ -166,7 +166,6 @@ prefill_cache() {
         --filename="${device}" \
         --ioengine=libaio \
         --direct=1 \
-        --offset="${CACHE_SPLIT_GB}g" \
         --bs=1M \
         --rw=write \
         --iodepth=32 \

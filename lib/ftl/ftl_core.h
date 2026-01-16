@@ -27,6 +27,7 @@
 #include "utils/ftl_bitmap.h"
 #include "utils/ftl_log.h"
 #include "utils/ftl_property.h"
+#include "ftl_stats_logger.h"
 
 /*
  * We need to reserve at least 2 buffers for band close / open sequence
@@ -99,6 +100,9 @@ struct spdk_ftl_dev {
 
 	/* Statistics */
 	struct ftl_stats		stats;
+
+	/* Stats logger for CSV output */
+	struct ftl_stats_logger		*stats_logger;
 
 	/* Array of bands */
 	struct ftl_band			*bands;

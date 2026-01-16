@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SPDK_TGT_SCRIPT=${SPDK_TGT_SCRIPT:-"$ROOT_DIR/ssd_waf/spdk_tgt.sh"}
 RPC_SOCKET=${SPDK_RPC_SOCKET:-/var/tmp/spdk.sock}
-RPC="$ROOT_DIR/scripts/rpc.py -s $RPC_SOCKET"
+RPC_BIN=${RPC_BIN:-"$ROOT_DIR/scripts/rpc.py"}
+RPC=("$RPC_BIN" "-s" "$RPC_SOCKET")
 
 # Device BDFs
 CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
@@ -14,6 +15,8 @@ BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
 OCF_NAME=${OCF_NAME:-ocf0}
 OCF_MODE=${OCF_MODE:-wb}  # wb, wt, pt, wa, wi, wo
 OCF_CACHE_LINE_SIZE=${OCF_CACHE_LINE_SIZE:-4}  # 4, 8, 16, 32, 64 KiB
+CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-512}  # Split cache device to 500GB
+OCF_STAT_LOG=${OCF_STAT_LOG:-$ROOT_DIR/ssd_waf/logging}  # Directory for stats CSV log
 
 # Export mode: nvmeof (default, stable) or ublk
 EXPORT_MODE=${EXPORT_MODE:-nvmeof}
@@ -26,15 +29,33 @@ UBLK_QUEUE_DEPTH=${UBLK_QUEUE_DEPTH:-512}
 
 # NVMe-oF settings
 NVMF_TRTYPE=${NVMF_TRTYPE:-tcp}
+NVMF_ADRFAM=${NVMF_ADRFAM:-ipv4}
 NVMF_TRADDR=${NVMF_TRADDR:-127.0.0.1}
 NVMF_TRSVCID=${NVMF_TRSVCID:-4420}
 NVMF_SUBSYSTEM=${NVMF_SUBSYSTEM:-nqn.2024-11.io.spdk:${OCF_NAME}}
+NVMF_SERIAL=${NVMF_SERIAL:-OCF0001}
 
 # Skip options
 SKIP_PRE_FORMAT=${SKIP_PRE_FORMAT:-0}
 
+# Prefill: Sequential write to cache device (skipping first CACHE_SPLIT_GB)
+PREFILL=${PREFILL:-0}
+
 log() {
     echo "[run_ocf] $*"
+}
+
+rpc_call() {
+    local desc=$1
+    shift
+    log "RPC start: ${desc}"
+    if sudo "${RPC[@]}" "$@"; then
+        log "RPC success: ${desc}"
+        return 0
+    else
+        log "RPC FAILED: ${desc}"
+        return 1
+    fi
 }
 
 find_nvme_ns() {
@@ -91,8 +112,8 @@ pre_format_devices() {
     echo ""
     read -p "Proceed with format? [y/N]: " confirm
     if [[ "${confirm,,}" != "y" ]]; then
-        log "User cancelled. Exiting."
-        exit 0
+        log "Skipping format, continuing with bringup..."
+        return 0
     fi
     echo ""
 
@@ -114,6 +135,58 @@ pre_format_devices() {
     done
 
     sleep 2
+}
+
+# Prefill: Sequential write to cache device (skipping first CACHE_SPLIT_GB for cache)
+prefill_cache() {
+    if [[ "${PREFILL}" != "1" ]]; then
+        return 0
+    fi
+
+    local cache_ctrl=$(ls -d /sys/bus/pci/devices/${CACHE_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
+    local cache_dev=""
+    if [[ -n "$cache_ctrl" ]]; then
+        cache_dev=$(find_nvme_ns "$cache_ctrl" || true)
+    fi
+
+    if [[ -z "$cache_dev" ]] || [[ ! -e "/dev/${cache_dev}" ]]; then
+        log "Cache device not found at ${CACHE_BDF}, skipping prefill"
+        return 0
+    fi
+
+    local device="/dev/${cache_dev}"
+    local device_size=$(sudo blockdev --getsize64 "$device")
+    local device_size_gb=$((device_size / 1024 / 1024 / 1024))
+
+    echo ""
+    echo "=========================================="
+    echo "  Prefill: Sequential write to cache"
+    echo "  Device: ${device} (${CACHE_BDF})"
+    echo "  Size: ${device_size_gb} GB"
+    echo "  Offset: ${CACHE_SPLIT_GB} GB (skip cache area)"
+    echo "=========================================="
+    echo "예상 시간: ~$((device_size_gb / 2000))-$((device_size_gb / 1500))분 (1.5-2 GB/s 기준)"
+    echo ""
+
+    sudo fio --name=prefill \
+        --filename="${device}" \
+        --ioengine=libaio \
+        --direct=1 \
+        --bs=1M \
+        --rw=write \
+        --iodepth=32 \
+        --numjobs=1 \
+        --group_reporting \
+        --status-interval=10
+
+    if [[ $? -ne 0 ]]; then
+        log "Prefill failed!"
+        exit 1
+    fi
+
+    echo ""
+    log "Prefill completed!"
+    echo ""
 }
 
 wait_for_rpc() {
@@ -157,48 +230,98 @@ create_ocf() {
     local backend_ctrl="backend_ctrl"
 
     log "Attaching cache controller at ${CACHE_BDF}"
-    sudo $RPC bdev_nvme_attach_controller -b "$cache_ctrl" -t pcie -a "$CACHE_BDF" || true
-    sleep 1
+    if ! rpc_call "attach cache controller ${cache_ctrl}" \
+        bdev_nvme_attach_controller -b "$cache_ctrl" -t pcie -a "$CACHE_BDF"; then
+        log "Ignoring attach failure (controller may already exist)"
+    fi
+    sleep 2
 
     log "Attaching backend controller at ${BACKEND_BDF}"
-    sudo $RPC bdev_nvme_attach_controller -b "$backend_ctrl" -t pcie -a "$BACKEND_BDF" || true
-    sleep 1
+    if ! rpc_call "attach backend controller ${backend_ctrl}" \
+        bdev_nvme_attach_controller -b "$backend_ctrl" -t pcie -a "$BACKEND_BDF"; then
+        log "Ignoring attach failure (controller may already exist)"
+    fi
+    sleep 2
 
     local cache_ns="${cache_ctrl}n1"
     local backend_ns="${backend_ctrl}n1"
 
+    # Split cache device to CACHE_SPLIT_GB (OCF uses full bdev unlike icache)
+    local cache_split_mb=$((CACHE_SPLIT_GB * 1024))  # MB units
+    local cache_split_name="${cache_ns}p0"
+
+    log "Splitting cache device ${cache_ns} to ${CACHE_SPLIT_GB}GB (${cache_split_mb} MB)"
+    rpc_call "split cache bdev ${cache_ns}" \
+        bdev_split_create "${cache_ns}" 1 -s "${cache_split_mb}"
+    sleep 1
+
     log "Creating OCF bdev: ${OCF_NAME}"
-    log "  Cache bdev:  ${cache_ns}"
+    log "  Cache bdev:  ${cache_split_name} (${CACHE_SPLIT_GB}GB)"
     log "  Core bdev:   ${backend_ns}"
     log "  Mode:        ${OCF_MODE}"
     log "  Line size:   ${OCF_CACHE_LINE_SIZE}KB"
+    log "  Stats log:   ${OCF_STAT_LOG}"
 
-    sudo $RPC bdev_ocf_create "${OCF_NAME}" "${OCF_MODE}" "${cache_ns}" "${backend_ns}" \
-        --cache-line-size "${OCF_CACHE_LINE_SIZE}"
+    mkdir -p "${OCF_STAT_LOG}"
+    rpc_call "create OCF ${OCF_NAME}" \
+        bdev_ocf_create "${OCF_NAME}" "${OCF_MODE}" "${cache_split_name}" "${backend_ns}" \
+        --cache-line-size "${OCF_CACHE_LINE_SIZE}" \
+        --stat-log-path "${OCF_STAT_LOG}"
 
     log "OCF bdev created: ${OCF_NAME}"
+
+    # Disable sequential cutoff to prevent hot sequential LBAs from bypassing cache
+    # (Zipf distribution accesses low LBAs sequentially, which triggers seq cutoff)
+    sleep 1
+    rpc_call "disable sequential cutoff for ${OCF_NAME}" \
+        bdev_ocf_set_seqcutoff "${OCF_NAME}" -p never
+    log "Sequential cutoff disabled for ${OCF_NAME}"
 }
 
 setup_nvmf() {
     log "Setting up NVMe-oF target..."
 
+    sleep 2
+    NVMF_OK=1
+
     # Create transport
-    sudo $RPC nvmf_create_transport -t "${NVMF_TRTYPE}" || true
-    sleep 1
+    if ! rpc_call "create NVMe-oF transport ${NVMF_TRTYPE}" \
+        nvmf_create_transport -t "${NVMF_TRTYPE}"; then
+        log "Transport ${NVMF_TRTYPE} may already exist, continuing"
+    fi
+    sleep 2
 
     # Create subsystem
-    sudo $RPC nvmf_create_subsystem "${NVMF_SUBSYSTEM}" -a -s "OCF0001"
-    sleep 1
+    if ! rpc_call "create subsystem ${NVMF_SUBSYSTEM}" \
+        nvmf_create_subsystem "${NVMF_SUBSYSTEM}" -a -s "${NVMF_SERIAL}"; then
+        NVMF_OK=0
+    fi
 
-    # Add namespace
-    sudo $RPC nvmf_subsystem_add_ns "${NVMF_SUBSYSTEM}" "${OCF_NAME}"
-    sleep 1
+    if [[ "${NVMF_OK}" == "1" ]]; then
+        sleep 2
+        # Add namespace
+        if ! rpc_call "add namespace ${OCF_NAME} to ${NVMF_SUBSYSTEM}" \
+            nvmf_subsystem_add_ns "${NVMF_SUBSYSTEM}" "${OCF_NAME}"; then
+            NVMF_OK=0
+        fi
+    fi
 
-    # Add listener
-    sudo $RPC nvmf_subsystem_add_listener "${NVMF_SUBSYSTEM}" \
-        -t "${NVMF_TRTYPE}" -f ipv4 -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}"
+    if [[ "${NVMF_OK}" == "1" ]]; then
+        sleep 2
+        # Add listener
+        if ! rpc_call "add listener ${NVMF_SUBSYSTEM}@${NVMF_TRADDR}:${NVMF_TRSVCID}" \
+            nvmf_subsystem_add_listener "${NVMF_SUBSYSTEM}" \
+            -t "${NVMF_TRTYPE}" -f "${NVMF_ADRFAM}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}"; then
+            NVMF_OK=0
+        fi
+    fi
 
-    log "NVMe-oF ready: ${NVMF_SUBSYSTEM} @ ${NVMF_TRADDR}:${NVMF_TRSVCID}"
+    if [[ "${NVMF_OK}" == "1" ]]; then
+        log "NVMe-oF TCP ready: ${NVMF_SUBSYSTEM} @ ${NVMF_TRADDR}:${NVMF_TRSVCID}"
+    else
+        log "NVMe-oF TCP setup failed"
+        return 1
+    fi
 }
 
 connect_nvmf() {
@@ -232,18 +355,21 @@ setup_ublk() {
         }
     fi
 
+    sleep 2
     # Create ublk target
-    sudo $RPC ublk_create_target -m "${UBLK_CPUMASK}" || {
-        log "ublk_create_target failed (might already exist)"
-    }
+    if ! rpc_call "create ublk target (cpumask=${UBLK_CPUMASK})" \
+        ublk_create_target -m "${UBLK_CPUMASK}"; then
+        log "ublk_create_target failed (may already exist), continuing"
+    fi
     sleep 1
 
     # Start ublk device
     log "Starting ublk device /dev/ublkb${UBLK_DEV_ID} (queues=${UBLK_NUM_QUEUES}, depth=${UBLK_QUEUE_DEPTH})"
-    sudo $RPC ublk_start_disk "${OCF_NAME}" "${UBLK_DEV_ID}" -q "${UBLK_NUM_QUEUES}" -d "${UBLK_QUEUE_DEPTH}" || {
+    if ! rpc_call "start ublk for ${OCF_NAME}" \
+        ublk_start_disk "${OCF_NAME}" "${UBLK_DEV_ID}" -q "${UBLK_NUM_QUEUES}" -d "${UBLK_QUEUE_DEPTH}"; then
         log "ERROR: Failed to start ublk disk"
         return 1
-    }
+    fi
 
     # Wait for device
     local waited=0
@@ -300,7 +426,7 @@ show_status() {
     fi
     echo ""
     echo "To get OCF stats:"
-    echo "  sudo $RPC bdev_ocf_get_stats ${OCF_NAME}"
+    echo "  sudo ${RPC_BIN} -s ${RPC_SOCKET} bdev_ocf_get_stats ${OCF_NAME}"
     echo ""
     echo "=========================================="
 }
@@ -310,9 +436,10 @@ log "Resetting SPDK binding..."
 sudo "${ROOT_DIR}/scripts/setup.sh" reset
 
 pre_format_devices
+prefill_cache
 
 log "Binding devices to SPDK..."
-sudo HUGEMEM=8192 "${ROOT_DIR}/scripts/setup.sh"
+sudo HUGEMEM=16384 "${ROOT_DIR}/scripts/setup.sh"
 
 start_spdk_tgt
 create_ocf

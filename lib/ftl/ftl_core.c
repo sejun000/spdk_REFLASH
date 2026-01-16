@@ -414,6 +414,9 @@ spdk_ftl_writev(struct spdk_ftl_dev *dev, struct ftl_io *io, struct spdk_io_chan
 		return rc;
 	}
 
+	/* Track host write bytes */
+	ftl_stats_logger_add_host_write(dev->stats_logger, lba_cnt * FTL_BLOCK_SIZE);
+
 	return queue_io(dev, io);
 }
 

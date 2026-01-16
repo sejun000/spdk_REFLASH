@@ -151,10 +151,15 @@ ftl_stats_logger_poller_fn(void *arg)
 {
 	struct ftl_stats_logger *logger = arg;
 
-	/* First try to read NVMe log page (async) */
+	/* Process admin completions to receive FDP log page results */
+	if (logger->nvme_ctrlr) {
+		spdk_nvme_ctrlr_process_admin_completions(logger->nvme_ctrlr);
+	}
+
+	/* Try to read NVMe log page (async) */
 	ftl_stats_logger_read_nvme_log_page(logger);
 
-	/* Then log current stats */
+	/* Log current stats */
 	ftl_stats_logger_write_stats(logger);
 
 	return SPDK_POLLER_BUSY;

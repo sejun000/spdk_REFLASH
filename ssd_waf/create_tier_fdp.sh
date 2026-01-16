@@ -15,8 +15,8 @@ BACKEND_CTRL=${BACKEND_CTRL:-backend_ctrl}
 CACHE_NS=${CACHE_NS:-${CACHE_CTRL}n1}
 BACKEND_NS=${BACKEND_NS:-${BACKEND_CTRL}n1}
 
-# FDP cache size: 200GB (passed from run_tier_fdp.sh)
-CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-200}
+# FDP cache size: ~512GB (passed from run_tier_fdp.sh, 549,357,355,008 bytes aligned)
+CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-512}
 
 MAX_PENDING_IO=${MAX_PENDING_IO:-64}
 ICACHE_NAME=${ICACHE_NAME:-icache0}
@@ -85,9 +85,15 @@ if ! rpc_call "attach backend controller ${BACKEND_CTRL}" \
 fi
 sleep 2
 
-# Use full namespace (FDP doesn't use zones, cache size enforced in icache module)
-CACHE_DEVICE=${CACHE_NS}
-log "Using FDP cache namespace ${CACHE_DEVICE} (limit ${CACHE_SPLIT_GB}GB enforced in icache)"
+# Split cache device to limit size
+CACHE_SPLIT_MB=$((CACHE_SPLIT_GB * 1024))
+CACHE_DEVICE="${CACHE_NS}p0"
+log "Splitting cache ${CACHE_NS} to ${CACHE_SPLIT_GB}GB (${CACHE_SPLIT_MB} MB)"
+if ! rpc_call "split cache bdev" \
+    bdev_split_create "${CACHE_NS}" 1 -s "${CACHE_SPLIT_MB}"; then
+    log "Split failed, using full namespace"
+    CACHE_DEVICE="${CACHE_NS}"
+fi
 
 cat <<MSG
 [create_tier_fdp] Done.
