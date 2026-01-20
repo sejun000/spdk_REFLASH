@@ -24,4 +24,4 @@ if [[ -f "$TCMALLOC_LIB" ]]; then
 fi
 
 echo "[spdk_tgt] starting $APP (cpu mask ${CPU_MASK}, rpc socket ${RPC_SOCKET})"
-exec "$APP" -m "$CPU_MASK" -r "${RPC_SOCKET}" -L icache &>> "$LOG_FILE"
+exec "$APP" -m "$CPU_MASK" -r "${RPC_SOCKET}" -L icache -L nvme  -L bdev_nvme --iova-mode=pa --wait-for-rpc &>> "$LOG_FILE"

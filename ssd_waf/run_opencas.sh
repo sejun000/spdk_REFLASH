@@ -5,9 +5,8 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 # Device BDFs
 # FDP SSD as cache (200GB partition)
-CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
-# Regular SSD as backend (core device)
-BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
+CACHE_BDF=${CACHE_BDF:-0001:10:00.0}
+BACKEND_BDF=${BACKEND_BDF:-0000:01:00.0}
 
 # Cache configuration
 CACHE_SIZE_GB=${CACHE_SIZE_GB:-200}
@@ -532,8 +531,8 @@ usage() {
     echo "  --help        Show this help"
     echo ""
     echo "Environment variables:"
-    echo "  CACHE_BDF        Cache device BDF (default: 0000:06:00.0)"
-    echo "  BACKEND_BDF      Backend device BDF (default: 0000:07:00.0)"
+    echo "  CACHE_BDF        Cache device BDF (default: 0000:)"
+    echo "  BACKEND_BDF      Backend device BDF (default: 0000:)"
     echo "  CACHE_SIZE_GB    Cache partition size in GB (default: 200)"
     echo "  CACHE_MODE       Cache mode: wb, wt, wa, pt (default: wb)"
     echo "  SKIP_PRE_FORMAT  Skip device format (default: 0)"

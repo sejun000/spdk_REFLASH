@@ -11,8 +11,8 @@ export PYTHONPATH="${PYTHONPATH:-}:$ROOT_DIR/python"
 # FDP mode: same as icache tier
 # Cache: 06:00.0 (FDP SSD)
 # Backend (base device): 07:00.0 (regular SSD)
-CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
-BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
+CACHE_BDF=${CACHE_BDF:-0001:10:00.0}
+BACKEND_BDF=${BACKEND_BDF:-0000:01:00.0}
 CACHE_CTRL=${CACHE_CTRL:-ftl_cache_ctrl}
 BACKEND_CTRL=${BACKEND_CTRL:-ftl_backend_ctrl}
 CACHE_NS=${CACHE_NS:-${CACHE_CTRL}n1}
@@ -61,16 +61,20 @@ if ! rpc_call "attach cache controller ${CACHE_CTRL}" \
 fi
 sleep 2
 
-# Split cache to limit size
-CACHE_SPLIT_MB=$((CACHE_SPLIT_GB * 1024))
-CACHE_SPLIT_BDEV="${CACHE_NS}p0"
-log "Splitting cache ${CACHE_NS} to ${CACHE_SPLIT_GB}GB"
-if ! rpc_call "split cache bdev" \
-    bdev_split_create "${CACHE_NS}" 1 -s "${CACHE_SPLIT_MB}"; then
-    log "Split failed, using full namespace"
-    CACHE_SPLIT_BDEV="${CACHE_NS}"
+# Split cache device if enabled (disabled by default)
+if [[ "${CACHE_SPLIT_ENABLE:-0}" == "1" ]]; then
+    CACHE_SPLIT_MB=$((CACHE_SPLIT_GB * 1024))
+    CACHE_BDEV="${CACHE_NS}p0"
+    log "Splitting cache ${CACHE_NS} to ${CACHE_SPLIT_GB}GB"
+    if ! rpc_call "split cache bdev" \
+        bdev_split_create "${CACHE_NS}" 1 -s "${CACHE_SPLIT_MB}"; then
+        log "Split failed, using full namespace"
+        CACHE_BDEV="${CACHE_NS}"
+    fi
+else
+    CACHE_BDEV="${CACHE_NS}"
+    log "Using full namespace (CACHE_SPLIT_ENABLE=0)"
 fi
-sleep 2
 
 # Attach backend controller (regular SSD)
 log "Attaching backend controller ${BACKEND_CTRL} at ${BACKEND_BDF}"
@@ -82,7 +86,7 @@ sleep 2
 
 cat <<MSG
 [create_ftl] Configuration:
-  Cache bdev (split):        ${CACHE_SPLIT_BDEV} (${CACHE_SPLIT_GB}GB)
+  Cache bdev:                ${CACHE_BDEV}
   Backend bdev (base):       ${BACKEND_NS}
   FTL name:                  ${FTL_NAME}
   Overprovisioning:          ${FTL_OVERPROV}%
@@ -92,12 +96,12 @@ MSG
 
 # Create FTL bdev
 # --base-bdev: base device (regular SSD)
-# --cache: cache device (FDP SSD, split to limit size)
+# --cache: cache device (FDP SSD)
 rpc_call "create FTL ${FTL_NAME}" \
     bdev_ftl_create \
     --name "${FTL_NAME}" \
     --base-bdev "${BACKEND_NS}" \
-    --cache "${CACHE_SPLIT_BDEV}" \
+    --cache "${CACHE_BDEV}" \
     --overprovisioning "${FTL_OVERPROV}" \
     --l2p-dram-limit "${FTL_L2P_DRAM}"
 

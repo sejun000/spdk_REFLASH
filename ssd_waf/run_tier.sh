@@ -12,8 +12,8 @@ NVMF_TRSVCID=${NVMF_TRSVCID:-4420}
 NVMF_SUBSYSTEM=${NVMF_SUBSYSTEM:-nqn.2024-11.io.spdk:icache0}
 
 # Device BDFs for pre-format (must match create_tier.sh)
-CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
-BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
+CACHE_BDF=${CACHE_BDF:-0001:10:00.0}
+BACKEND_BDF=${BACKEND_BDF:-0000:01:00.0}
 SKIP_PRE_FORMAT=${SKIP_PRE_FORMAT:-0}
 
 log() {
@@ -203,7 +203,7 @@ connect_host() {
     fi
 
     log "Connecting host NVMe controller (trtype=${NVMF_TRTYPE}, addr=${NVMF_TRADDR}, port=${NVMF_TRSVCID}, nqn=${NVMF_SUBSYSTEM})"
-    if sudo nvme connect -t "${NVMF_TRTYPE}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" -n "${NVMF_SUBSYSTEM}"; then
+    if sudo nvme connect -t "${NVMF_TRTYPE}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" -n "${NVMF_SUBSYSTEM}" -k 60; then
         log "nvme connect succeeded"
     else
         log "nvme connect failed (might already be connected); continuing"
@@ -219,8 +219,8 @@ prefill_cache
 
 # Bind devices to SPDK (vfio-pci/uio) so spdk_tgt can use them
 # HUGEMEM=8192 allocates 4096 x 2MB hugepages = 8GB for DMA buffers
-log "Binding devices to SPDK (scripts/setup.sh) with HUGEMEM=8192..."
-sudo HUGEMEM=8192 "${ROOT_DIR}/scripts/setup.sh"
+log "Binding devices to SPDK (scripts/setup.sh) with HUGEMEM=8192 and uio_pci_generic..."
+sudo HUGEMEM=8192 DRIVER_OVERRIDE=uio_pci_generic "${ROOT_DIR}/scripts/setup.sh"
 
 start_spdk_tgt
 create_tier

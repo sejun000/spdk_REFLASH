@@ -251,6 +251,44 @@ struct AsyncIoCtx {
 // Forward declaration
 class SpdkCacheDevice;
 
+// Global device command queue depth limiting
+// Disabled: mqes=1023 is large enough, no throttling needed
+static constexpr uint32_t MAX_OUTSTANDING_CMDS = UINT32_MAX;
+static std::atomic<uint32_t> g_outstanding_cmds{0};
+
+struct GlobalPendingWrite {
+	SpdkCacheDevice *device;
+	uint64_t zone_id;
+	uint64_t offset;
+	struct iovec *iovs;
+	int iovcnt;
+	size_t total_len;
+	cache_device_io_cb cb;
+	void *cb_arg;
+	int placement_handle;
+};
+static std::deque<GlobalPendingWrite> g_global_pending_writes;
+
+struct GlobalPendingRead {
+	SpdkCacheDevice *device;
+	uint64_t offset;
+	void *buf;
+	size_t len;
+	cache_device_io_cb cb;
+	void *cb_arg;
+	bool is_iov;  // true = readv, false = read
+	struct iovec *iovs;
+	int iovcnt;
+};
+static std::deque<GlobalPendingRead> g_global_pending_reads;
+
+static std::atomic<bool> g_draining_pending_writes{false};  // Prevent recursive drain for writes
+static std::atomic<bool> g_draining_pending_reads{false};   // Prevent recursive drain for reads
+
+// Forward declaration for drain functions
+static void drain_global_pending_writes();
+static void drain_global_pending_reads();
+
 // Zone reset async context
 struct ZoneResetAsyncCtx {
 	struct spdk_bdev_desc *desc;
@@ -425,6 +463,13 @@ async_io_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 			    ctx->is_read ? "READ" : "WRITE",
 			    ctx->is_cache ? "CACHE" : "BACKEND",
 			    ctx->offset, ctx->len);
+	}
+	// Decrement outstanding cmd count for cache reads
+	if (ctx->is_cache && ctx->is_read) {
+		g_outstanding_cmds.fetch_sub(1);
+		// Drain pending reads and writes
+		drain_global_pending_reads();
+		drain_global_pending_writes();
 	}
 	if (ctx->user_cb) {
 		ctx->user_cb(ctx->user_cb_arg, status);
@@ -857,8 +902,39 @@ public:
 		for (int i = 0; i < iovcnt; ++i) {
 			assert(iovs[i].iov_base != nullptr && "submit_writev_direct: iov_base is NULL");
 		}
+
+		// Check global command queue depth limit
+		// Also queue if pending is not empty to maintain FIFO order
+		// Skip pending check if called from drain context
+		uint32_t current_cmds = g_outstanding_cmds.load();
+		bool has_pending = !g_draining_pending_writes.load() && !g_global_pending_writes.empty();
+		if (current_cmds >= MAX_OUTSTANDING_CMDS || has_pending) {
+			// Queue to global pending - will be drained on completion
+			GlobalPendingWrite pending;
+			pending.device = this;
+			pending.zone_id = zone_id;
+			pending.offset = offset;
+			pending.iovs = iovs;
+			pending.iovcnt = iovcnt;
+			pending.total_len = total_len;
+			pending.cb = cb;
+			pending.cb_arg = cb_arg;
+			pending.placement_handle = placement_handle;
+			g_global_pending_writes.push_back(pending);
+
+			// Try to drain immediately if we have capacity
+			drain_global_pending_writes();
+			return 0;  // Queued successfully, callback will be called later
+		}
+
+		// Increment outstanding command count
+		g_outstanding_cmds.fetch_add(1);
+
 		uint64_t block_offset, num_blocks;
 		if (convert_to_blocks(m_cache_bdev, offset, total_len, &block_offset, &num_blocks)) {
+			g_outstanding_cmds.fetch_sub(1);
+			SPDK_ERRLOG("submit_writev_direct: convert_to_blocks failed offset=%lu len=%zu\n",
+				    offset, total_len);
 			return -EINVAL;
 		}
 
@@ -868,6 +944,8 @@ public:
 		auto *ctx = new (std::nothrow) ZoneAsyncIoCtx();
 		if (!ctx) {
 			zq.remove_inflight(offset);
+			g_outstanding_cmds.fetch_sub(1);
+			SPDK_ERRLOG("submit_writev_direct: failed to allocate ZoneAsyncIoCtx\n");
 			return -ENOMEM;
 		}
 		ctx->device = this;
@@ -895,6 +973,8 @@ public:
 		if (rc) {
 			delete ctx;
 			zq.remove_inflight(offset);
+			g_outstanding_cmds.fetch_sub(1);
+			SPDK_ERRLOG("submit_writev_direct: bdev write failed rc=%d offset=%lu\n", rc, offset);
 			return rc;
 		}
 		return 0;
@@ -918,31 +998,76 @@ public:
 			return -EINVAL;
 		}
 
+		// Check global outstanding cmd limit
+		uint32_t current_cmds = g_outstanding_cmds.load();
+		bool has_pending = !g_draining_pending_reads.load() && !g_global_pending_reads.empty();
+		if (current_cmds >= MAX_OUTSTANDING_CMDS || has_pending) {
+			// Queue to pending reads
+			GlobalPendingRead pending;
+			pending.device = this;
+			pending.offset = offset;
+			pending.buf = nullptr;
+			pending.len = total_len;
+			pending.cb = cb;
+			pending.cb_arg = cb_arg;
+			pending.is_iov = true;
+			pending.iovs = iovs;
+			pending.iovcnt = iovcnt;
+			g_global_pending_reads.push_back(pending);
+
+			drain_global_pending_reads();
+			return 0;  // Queued successfully
+		}
+
+		return submit_readv_direct(offset, iovs, iovcnt, total_len, cb, cb_arg);
+	}
+
+	int submit_readv_direct(uint64_t offset, struct iovec *iovs, int iovcnt,
+				size_t total_len, cache_device_io_cb cb, void *cb_arg)
+	{
+		g_outstanding_cmds.fetch_add(1);
+
 		uint64_t block_offset, num_blocks;
 		if (convert_to_blocks(m_cache_bdev, offset, total_len, &block_offset, &num_blocks)) {
+			g_outstanding_cmds.fetch_sub(1);
 			return -EINVAL;
 		}
 		if (num_blocks == 0) {
+			g_outstanding_cmds.fetch_sub(1);
 			if (cb) cb(cb_arg, 0);
 			return 0;
 		}
 
 		auto *async_ctx = new (std::nothrow) AsyncIoCtx();
 		if (!async_ctx) {
+			g_outstanding_cmds.fetch_sub(1);
 			return -ENOMEM;
 		}
 		async_ctx->user_cb = cb;
 		async_ctx->user_cb_arg = cb_arg;
+		async_ctx->offset = offset;
+		async_ctx->len = total_len;
+		async_ctx->is_read = true;
+		async_ctx->is_cache = true;
 
 		int rc = spdk_bdev_readv_blocks(m_cache_desc, m_cache_ch,
 						iovs, iovcnt,
 						block_offset, num_blocks,
 						async_io_completion, async_ctx);
 		if (rc) {
+			g_outstanding_cmds.fetch_sub(1);
 			delete async_ctx;
 			return rc;
 		}
 		return 0;
+	}
+
+	// Public wrapper for drain_global_pending_reads to submit cache read directly
+	int submit_read_cache_direct(uint64_t offset, void *buf, size_t len,
+				     cache_device_io_cb cb, void *cb_arg)
+	{
+		return submit_rw_async_direct(m_cache_desc, m_cache_ch, m_cache_bdev,
+					      buf, len, offset, false, cb, cb_arg);
 	}
 
 	int write_backend_async(uint64_t offset, const void *buf, size_t len,
@@ -1102,25 +1227,75 @@ private:
 		if (!ch) {
 			return -EINVAL;
 		}
+
+		bool is_cache = (desc == m_cache_desc);
+		bool is_read = !write;
+
+		// Check global outstanding cmd limit for cache reads
+		if (is_cache && is_read) {
+			uint32_t current_cmds = g_outstanding_cmds.load();
+			bool has_pending = !g_draining_pending_reads.load() && !g_global_pending_reads.empty();
+			if (current_cmds >= MAX_OUTSTANDING_CMDS || has_pending) {
+				// Queue to pending reads
+				GlobalPendingRead pending;
+				pending.device = this;
+				pending.offset = byte_offset;
+				pending.buf = const_cast<void*>(buf);
+				pending.len = len;
+				pending.cb = cb;
+				pending.cb_arg = cb_arg;
+				pending.is_iov = false;
+				pending.iovs = nullptr;
+				pending.iovcnt = 0;
+				g_global_pending_reads.push_back(pending);
+
+				drain_global_pending_reads();
+				return 0;  // Queued successfully
+			}
+		}
+
+		return submit_rw_async_direct(desc, ch, bdev, buf, len, byte_offset, write, cb, cb_arg);
+	}
+
+	int submit_rw_async_direct(struct spdk_bdev_desc *desc,
+				   struct spdk_io_channel *ch,
+				   struct spdk_bdev *bdev,
+				   const void *buf,
+				   size_t len,
+				   uint64_t byte_offset,
+				   bool write,
+				   cache_device_io_cb cb,
+				   void *cb_arg)
+	{
+		bool is_cache = (desc == m_cache_desc);
+		bool is_read = !write;
+
+		if (is_cache && is_read) {
+			g_outstanding_cmds.fetch_add(1);
+		}
+
 		uint64_t block_offset, num_blocks;
 		if (convert_to_blocks(bdev, byte_offset, len, &block_offset, &num_blocks)) {
+			if (is_cache && is_read) g_outstanding_cmds.fetch_sub(1);
 			return -EINVAL;
 		}
 		if (num_blocks == 0) {
+			if (is_cache && is_read) g_outstanding_cmds.fetch_sub(1);
 			if (cb) cb(cb_arg, 0);
 			return 0;
 		}
 
 		auto *async_ctx = new (std::nothrow) AsyncIoCtx();
 		if (!async_ctx) {
+			if (is_cache && is_read) g_outstanding_cmds.fetch_sub(1);
 			return -ENOMEM;
 		}
 		async_ctx->user_cb = cb;
 		async_ctx->user_cb_arg = cb_arg;
 		async_ctx->offset = byte_offset;
 		async_ctx->len = len;
-		async_ctx->is_read = !write;
-		async_ctx->is_cache = (desc == m_cache_desc);
+		async_ctx->is_read = is_read;
+		async_ctx->is_cache = is_cache;
 
 		int rc;
 		if (write) {
@@ -1136,6 +1311,7 @@ private:
 		}
 
 		if (rc) {
+			if (is_cache && is_read) g_outstanding_cmds.fetch_sub(1);
 			delete async_ctx;
 			return rc;
 		}
@@ -1165,9 +1341,13 @@ private:
 			return 0;
 		}
 
+		// Increment outstanding command count (will be decremented in zone_async_io_completion)
+		g_outstanding_cmds.fetch_add(1);
+
 		// Allocate context for zone-aware completion
 		auto *zone_ctx = new (std::nothrow) ZoneAsyncIoCtx();
 		if (!zone_ctx) {
+			g_outstanding_cmds.fetch_sub(1);
 			zone_queues_[zone_id].remove_inflight(offset);
 			return -ENOMEM;
 		}
@@ -1191,6 +1371,7 @@ private:
 		}
 
 		if (rc) {
+			g_outstanding_cmds.fetch_sub(1);
 			delete zone_ctx;
 			zone_queues_[zone_id].remove_inflight(offset);
 			return rc;
@@ -1231,6 +1412,12 @@ private:
 		ctx->magic = ZoneAsyncIoCtx::FREED_MAGIC;
 		delete ctx;
 
+		// Decrement global outstanding command count
+		uint32_t prev_cmds = g_outstanding_cmds.fetch_sub(1);
+		if (prev_cmds == 0) {
+			SPDK_ERRLOG("zone_async_io_completion: g_outstanding_cmds underflow!\n");
+		}
+
 		int status = success ? 0 : -EIO;
 		if (!success) {
 			SPDK_ERRLOG("zone_async_io_completion: IO failed! zone_id=%lu, io_offset=%lu\n", zone_id, io_offset);
@@ -1254,6 +1441,9 @@ private:
 		if (wp_advanced) {
 			device->maybe_flush_zrwa(zone_id);
 		}
+
+		// Drain global pending writes if any
+		drain_global_pending_writes();
 	}
 
 	// Process pending IOs for a zone based on WP and alignment
@@ -1577,6 +1767,96 @@ static void clear_zone_state_after_reset(SpdkCacheDevice *device, uint64_t start
 	}
 }
 
+// Drain global pending writes when command slots become available
+static void drain_global_pending_writes()
+{
+	// Prevent recursive drain (completion callbacks may trigger more drains)
+	bool expected = false;
+	if (!g_draining_pending_writes.compare_exchange_strong(expected, true)) {
+		return;  // Already draining
+	}
+
+	size_t drained = 0;
+	while (!g_global_pending_writes.empty()) {
+		// Check if we have room to submit
+		uint32_t current_cmds = g_outstanding_cmds.load();
+		if (current_cmds >= MAX_OUTSTANDING_CMDS) {
+			break;  // Still at limit, stop draining
+		}
+
+		// Pop front and submit
+		GlobalPendingWrite pending = g_global_pending_writes.front();
+		g_global_pending_writes.pop_front();
+
+		// Try to submit - this will increment g_outstanding_cmds on success
+		// Note: submit_writev_direct may re-queue if we hit the limit again (race)
+		int rc = pending.device->submit_writev_direct(
+			pending.zone_id, pending.offset, pending.iovs, pending.iovcnt,
+			pending.total_len, pending.cb, pending.cb_arg, pending.placement_handle);
+
+		if (rc != 0) {
+			SPDK_ERRLOG("drain_global_pending_writes: submit failed rc=%d offset=%lu\n",
+				    rc, pending.offset);
+			// Call the callback with error
+			if (pending.cb) {
+				pending.cb(pending.cb_arg, rc);
+			}
+			// Free iovs if allocated
+			if (pending.iovs) {
+				free(pending.iovs);
+			}
+		}
+		drained++;
+	}
+
+
+	g_draining_pending_writes.store(false);
+}
+
+// Drain global pending reads when command slots become available
+static void drain_global_pending_reads()
+{
+	// Prevent recursive drain (completion callbacks may trigger more drains)
+	bool expected = false;
+	if (!g_draining_pending_reads.compare_exchange_strong(expected, true)) {
+		return;  // Already draining
+	}
+
+	while (!g_global_pending_reads.empty()) {
+		// Check if we have room to submit
+		uint32_t current_cmds = g_outstanding_cmds.load();
+		if (current_cmds >= MAX_OUTSTANDING_CMDS) {
+			break;  // Still at limit, stop draining
+		}
+
+		// Pop front and submit
+		GlobalPendingRead pending = g_global_pending_reads.front();
+		g_global_pending_reads.pop_front();
+
+		int rc;
+		if (pending.is_iov) {
+			rc = pending.device->submit_readv_direct(
+				pending.offset, pending.iovs, pending.iovcnt,
+				pending.len, pending.cb, pending.cb_arg);
+		} else {
+			rc = pending.device->submit_read_cache_direct(
+				pending.offset, pending.buf, pending.len,
+				pending.cb, pending.cb_arg);
+		}
+
+		if (rc != 0) {
+			SPDK_ERRLOG("drain_global_pending_reads: submit failed rc=%d offset=%lu\n",
+				    rc, pending.offset);
+			// Call the callback with error
+			if (pending.cb) {
+				pending.cb(pending.cb_arg, rc);
+			}
+		}
+	}
+
+	g_draining_pending_reads.store(false);
+}
+
 } // namespace icache
 
 class LogCacheAsync;  // Forward declaration
@@ -1883,7 +2163,7 @@ public:
 		// Zone configuration for ZNS vs FDP
 		static constexpr uint64_t ZNS_ZONE_SIZE_BLOCKS = 0x80000;      // 524288 blocks = 2GB
 		static constexpr uint64_t ZNS_ZONE_CAPACITY_BLOCKS = 0x43500;  // 275712 blocks = ~1.07GB
-		static constexpr uint64_t FDP_ZONE_SIZE_BLOCKS = 0x40000;      // 262144 blocks = 1GB
+		static constexpr uint64_t FDP_ZONE_SIZE_BLOCKS = 0x80000;      // 524288 blocks = 2GB
 
 #if FDP
 		// FDP mode: zone_size == zone_capacity (no holes in address space)
@@ -2202,9 +2482,9 @@ private:
 	} throttle_;
 
 	// Throttle constants
-	static constexpr size_t THROTTLE_START_SEGS = 10;    // Start throttle at <= 10 free segs
+	static constexpr size_t THROTTLE_START_SEGS = 15;    // Start throttle at <= 15 free segs
 	static constexpr size_t THROTTLE_NO_RECOVER_SEGS = 7; // No recovery at <= 7 free segs
-	static constexpr size_t THROTTLE_CRITICAL_SEGS = 2;   // Critical - block all at <= 2
+	static constexpr size_t THROTTLE_CRITICAL_SEGS = 5;   // Critical - block all at <= 5 (match CRITICAL_FREE_SEGMENTS)
 	static constexpr double THROTTLE_STEP = 0.1;          // 10% step
 	static constexpr double THROTTLE_MIN_RATIO = 0.1;     // Minimum 10%
 	static constexpr uint64_t THROTTLE_INTERVAL_MS = 500; // 500ms interval
@@ -2454,6 +2734,8 @@ void LogCacheAsync::flush_write_buffer()
 	static uint64_t flush_block_count = 0;
 	static uint64_t block_start_tsc = 0;
 	std::vector<const uint8_t*> buf_ptrs;
+	size_t success_count = 0;
+	bool partial_failure = false;
 	for (size_t i = 0; i < write_buffer_.size(); i++) {
 		auto &blk = write_buffer_[i];
 		uint64_t cache_offset;
@@ -2461,41 +2743,51 @@ void LogCacheAsync::flush_write_buffer()
 		if (!cache_->append_block_metadata(0, static_cast<long>(blk.key),
 						   static_cast<int>(block_size), &cache_offset, &stream_id)) {
 			// No free segments - need GC/Evict
-			// Clear keys that were already added to pending_writes_ before this failure
-			if (!flush_ctx->keys.empty()) {
-				cache_->complete_block_writes(flush_ctx->keys);
-			}
 			if (flush_block_count == 0) {
 				block_start_tsc = spdk_get_ticks();
 			}
 			flush_block_count++;
 			if (flush_block_count == 1 || flush_block_count % 10000 == 0) {
-				SPDK_WARNLOG("BLOCKED: flush_write_buffer waiting for GC (blocked %lu times)\n", flush_block_count);
+				SPDK_WARNLOG("BLOCKED: flush_write_buffer waiting for GC (blocked %lu times, success_count=%zu)\n",
+					     flush_block_count, success_count);
 			}
-			delete flush_ctx;
+			partial_failure = true;
 			flush_pending_ = true;
-			return;
+			break;  // Exit loop, but continue to write successful blocks
 		}
 		flush_ctx->cache_offsets.push_back(cache_offset);
 		flush_ctx->stream_ids.push_back(stream_id);
 		flush_ctx->keys.push_back(static_cast<long>(blk.key));
 		buf_ptrs.push_back(blk.buf);
+		success_count++;
 	}
+
+	// If no blocks succeeded, just return and wait for GC
+	if (success_count == 0) {
+		delete flush_ctx;
+		return;
+	}
+
+	// Update total_blocks to reflect only successful blocks
+	total_blocks = success_count;
 
 	// Store cache pointer for completion
 	flush_ctx->cache = cache_.get();
 
-	// Log if we were blocked and now succeeded
-	if (flush_block_count > 0) {
+	// Log if we were blocked and now succeeded (full success only)
+	if (flush_block_count > 0 && !partial_failure) {
 		uint64_t blocked_us = (spdk_get_ticks() - block_start_tsc) * 1000000 / spdk_get_ticks_hz();
 		SPDK_NOTICELOG("UNBLOCKED: flush_write_buffer succeeded after %lu blocks, %lu us blocked\n",
 			       flush_block_count, blocked_us);
 		flush_block_count = 0;
 	}
 
-	// Move buffer and count blocks per IO
-	flush_ctx->blocks = std::move(write_buffer_);
-	write_buffer_.clear();
+	// Copy successful blocks to flush_ctx, keep failed ones in buffer for retry
+	for (size_t i = 0; i < success_count; i++) {
+		flush_ctx->blocks.push_back(std::move(write_buffer_[i]));
+	}
+	// Remove successful blocks from buffer (failed ones remain for retry)
+	write_buffer_.erase(write_buffer_.begin(), write_buffer_.begin() + success_count);
 
 	for (auto &blk : flush_ctx->blocks) {
 		if (blk.io) {
@@ -2594,7 +2886,8 @@ void LogCacheAsync::flush_write_buffer()
 
 		// Create zone write context
 		size_t group_len = group.count * block_size;
-		int placement_handle = group.stream_id % FDP_NUM_PLACEMENT_HANDLES;
+		// Host write always uses placement handle 0
+		int placement_handle = 0;
 		auto *zctx = new (std::nothrow) ZoneWriteCtx{flush_ctx, iovs, static_cast<int>(group.count), group_len, placement_handle};
 		if (!zctx) {
 			free(iovs);
@@ -2683,10 +2976,10 @@ static int write_buffer_timeout_poller(void *arg)
 			process_pending_writes(ctx);
 		});
 	}
-
 	if (!cache->buffer_empty()) {
 		cache->flush_write_buffer();
 	}
+	process_pending_writes(ctx);
 
 	return SPDK_POLLER_BUSY;
 }
@@ -3126,8 +3419,8 @@ static void host_write_next_block(CacheIo *io)
 		// Track host write for WAF
 		cache->add_host_write_bytes(block_size);
 
-		// FDP placement handle from stream_id
-		int placement_handle = stream_id % FDP_NUM_PLACEMENT_HANDLES;
+		// Host write always uses placement handle 0
+		int placement_handle = 0;
 
 		// Issue async write with FDP placement handle using writev
 		struct iovec iov;
@@ -3230,6 +3523,13 @@ static void gc_dispatch_writes_msg(void *arg);
 
 // Forward declaration for incremental GC
 static void gc_start_reads(GcIo *io);
+
+// GcWriteCtx for all GC write callbacks
+struct GcWriteCtx {
+	GcIo *io;
+	struct iovec *iovs;
+	bool is_leftover;  // true for leftover 4KB writes
+};
 
 // Callback for async finalize_gc completion (zone reset done or chunk done)
 static void gc_finalize_done(void *cb_arg, int status)
@@ -3531,7 +3831,8 @@ static void gc_start_writes(GcIo *io)
 
 		if (crosses_stripe) {
 			// Stripe boundary crossed - write each block individually
-			int gc_placement_handle = io->prepare_result.gc_stream_id % FDP_NUM_PLACEMENT_HANDLES;
+			// GC uses placement handles 1~6 (host uses 0)
+			int gc_placement_handle = 1 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 1));
 			for (size_t i = 0; i < GcIo::BLOCKS_PER_64K; ++i) {
 				size_t block_idx = first_block_idx + i;
 				uint8_t *src = static_cast<uint8_t*>(io->staging) + (chunk_start + i) * block_size;
@@ -3547,11 +3848,7 @@ static void gc_start_writes(GcIo *io)
 				single_iov->iov_base = src;
 				single_iov->iov_len = block_size;
 
-				struct GcWriteCtx {
-					GcIo *io;
-					struct iovec *iovs;
-				};
-				auto *write_ctx = new (std::nothrow) GcWriteCtx{io, single_iov};
+				auto *write_ctx = new (std::nothrow) GcWriteCtx{io, single_iov, false};
 				if (!write_ctx) {
 					free(single_iov);
 					io->last_status = -ENOMEM;
@@ -3592,11 +3889,7 @@ static void gc_start_writes(GcIo *io)
 			iovs[i].iov_len = block_size;
 		}
 
-		struct GcWriteCtx {
-			GcIo *io;
-			struct iovec *iovs;
-		};
-		auto *write_ctx = new (std::nothrow) GcWriteCtx{io, iovs};
+		auto *write_ctx = new (std::nothrow) GcWriteCtx{io, iovs, false};
 		if (!write_ctx) {
 			free(iovs);
 			io->last_status = -ENOMEM;
@@ -3605,7 +3898,8 @@ static void gc_start_writes(GcIo *io)
 		}
 
 		// 64KB scatter-gather write with FDP placement handle
-		int gc_placement_handle = io->prepare_result.gc_stream_id % FDP_NUM_PLACEMENT_HANDLES;
+		// GC uses placement handles 1~6 (host uses 0)
+		int gc_placement_handle = 1 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 1));
 		int rc = io->ctx->device->writev_cache_async(first_dst_offset, iovs, GcIo::BLOCKS_PER_64K,
 							     GcIo::BLOCKS_PER_64K * block_size,
 							     gc_write_done, write_ctx, gc_placement_handle);
@@ -3655,26 +3949,35 @@ static void gc_submit_next_leftover(GcIo *io)
 	uint8_t *src = static_cast<uint8_t*>(io->staging) +
 	               (leftover_start + io->current_leftover_idx) * block_size;
 
-	struct GcWriteCtx {
-		GcIo *io;
-		struct iovec *iovs;
-	};
-	auto *write_ctx = new (std::nothrow) GcWriteCtx{io, nullptr};
+	struct iovec *single_iov = static_cast<struct iovec*>(malloc(sizeof(struct iovec)));
+	if (!single_iov) {
+		io->last_status = -ENOMEM;
+		io->current_leftover_idx++;
+		gc_submit_next_leftover(io);
+		return;
+	}
+	single_iov->iov_base = src;
+	single_iov->iov_len = block_size;
+
+	auto *write_ctx = new (std::nothrow) GcWriteCtx{io, single_iov, true};  // is_leftover = true
 	if (!write_ctx) {
+		free(single_iov);
 		io->last_status = -ENOMEM;
 		io->current_leftover_idx++;
 		gc_submit_next_leftover(io);  // Try next
 		return;
 	}
 
-	// 4KB sequential write at WP
-	int rc = io->ctx->device->write_cache_async(blk.dst_offset, src, block_size,
-	                                            gc_write_done, write_ctx);
+	// 4KB sequential write with GC placement handle
+	int gc_placement_handle = 1 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 1));
+	int rc = io->ctx->device->writev_cache_async(blk.dst_offset, single_iov, 1, block_size,
+	                                             gc_write_done, write_ctx, gc_placement_handle);
 	if (rc == 0) {
 		// Track GC write bytes for WAF calculation
 		io->ctx->cache->add_gc_write_bytes(block_size);
 		io->ctx->cache->add_cache_write_bytes(block_size);
 	} else {
+		free(single_iov);
 		delete write_ctx;
 		io->last_status = rc;
 		io->current_leftover_idx++;
@@ -3684,16 +3987,11 @@ static void gc_submit_next_leftover(GcIo *io)
 
 static void gc_write_done(void *cb_arg, int status)
 {
-	struct GcWriteCtx {
-		GcIo *io;
-		struct iovec *iovs;
-	};
 	auto *ctx = static_cast<GcWriteCtx *>(cb_arg);
 	GcIo *io = ctx->io;
 
-	// iovs == nullptr means leftover write
-	// iovs != nullptr means 64KB-type write (normal batch or stripe-split individual)
-	bool is_64k_write = (ctx->iovs != nullptr);
+	// Use explicit is_leftover flag instead of checking iovs
+	bool is_64k_write = !ctx->is_leftover;
 
 	// Free iovec array if it was a scatter-gather write
 	if (ctx->iovs) {
@@ -3925,6 +4223,7 @@ static void gc_seq_write_done(void *cb_arg, int status)
 }
 
 // Yield-based GC write dispatcher - submits up to GC_WRITES_PER_YIELD writes, then yields
+// Uses writev_cache_async to go through global outstanding cmd limiting
 static void gc_dispatch_writes(GcIo *io)
 {
 	auto &writes = io->pending_gc_writes;
@@ -3933,20 +4232,34 @@ static void gc_dispatch_writes(GcIo *io)
 	while (io->pending_gc_write_idx < writes.size() && submitted < GcIo::GC_WRITES_PER_YIELD) {
 		auto &w = writes[io->pending_gc_write_idx++];
 
+		// Allocate iovec for single block write
+		struct iovec *iov = static_cast<struct iovec*>(malloc(sizeof(struct iovec)));
+		if (!iov) {
+			io->last_status = -ENOMEM;
+			++io->seq_writes_done;
+			continue;
+		}
+		iov->iov_base = w.src;
+		iov->iov_len = w.block_size;
+
 		auto *write_ctx = new (std::nothrow) GcSeqReadCtx{io, 0};
 		if (!write_ctx) {
+			free(iov);
 			io->last_status = -ENOMEM;
 			++io->seq_writes_done;
 			continue;
 		}
 
-		int rc = io->ctx->device->write_cache_async(w.dst_offset, w.src, w.block_size,
-							    gc_seq_write_done, write_ctx);
+		// Use writev_cache_async to respect global outstanding cmd limit
+		int gc_placement_handle = 1 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 1));
+		int rc = io->ctx->device->writev_cache_async(w.dst_offset, iov, 1, w.block_size,
+							     gc_seq_write_done, write_ctx, gc_placement_handle);
 		if (rc == 0) {
 			io->ctx->cache->add_gc_write_bytes(w.block_size);
 			io->ctx->cache->add_cache_write_bytes(w.block_size);
 			++submitted;
 		} else {
+			free(iov);
 			delete write_ctx;
 			io->last_status = rc;
 			++io->seq_writes_done;
@@ -4438,12 +4751,6 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 static void process_pending_writes(log_cache_ctx *ctx)
 {
 	LogCacheAsync *cache = ctx->cache.get();
-
-	// Retry pending flush_write_buffer if needed
-	if (cache->flush_pending() && !cache->need_gc_or_evict()) {
-		cache->set_flush_pending(false);
-		cache->flush_write_buffer();
-	}
 
 	// Start GC/Evict if needed (but don't block writes!)
 	if (cache->need_gc_or_evict() && !cache->gc_in_progress() && !cache->evict_in_progress()) {

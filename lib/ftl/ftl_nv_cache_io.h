@@ -10,6 +10,10 @@
 #include "spdk/bdev.h"
 #include "ftl_core.h"
 
+/* FDP Placement Handles */
+#define FTL_FDP_HANDLE_USER_DATA	0	/* User data (sequential) */
+#define FTL_FDP_HANDLE_METADATA		1	/* Metadata (in-place overwrite) */
+
 static inline int
 ftl_nv_cache_bdev_read_blocks_with_md(struct spdk_bdev_desc *desc,
 				      struct spdk_io_channel *ch,

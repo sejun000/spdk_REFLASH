@@ -64,7 +64,7 @@ connect_host() {
     fi
 
     log "Connecting host NVMe controller (trtype=${NVMF_TRTYPE}, addr=${NVMF_TRADDR}, port=${NVMF_TRSVCID}, nqn=${NVMF_SUBSYSTEM})"
-    if sudo nvme connect -t "${NVMF_TRTYPE}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" -n "${NVMF_SUBSYSTEM}"; then
+    if sudo nvme connect -t "${NVMF_TRTYPE}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" -n "${NVMF_SUBSYSTEM}" -k 60; then
         log "nvme connect succeeded"
     else
         log "nvme connect failed (might already be connected); continuing"
@@ -83,8 +83,8 @@ echo "========================================"
 echo ""
 
 # Bind hugepages for SPDK
-log "Setting up SPDK hugepages (HUGEMEM=8192)..."
-sudo HUGEMEM=8192 "${ROOT_DIR}/scripts/setup.sh"
+log "Setting up SPDK hugepages (HUGEMEM=8192) with uio_pci_generic..."
+sudo HUGEMEM=8192 DRIVER_OVERRIDE=uio_pci_generic "${ROOT_DIR}/scripts/setup.sh"
 
 start_spdk_tgt
 create_null

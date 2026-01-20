@@ -8,8 +8,8 @@ RPC=("$RPC_BIN" "-s" "$RPC_SOCKET")
 export PYTHONPATH="${PYTHONPATH:-}:$ROOT_DIR/python"
 
 # FDP SSD as cache, regular SSD as backend
-CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
-BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
+CACHE_BDF=${CACHE_BDF:-0001:10:00.0}
+BACKEND_BDF=${BACKEND_BDF:-0000:01:00.0}
 CACHE_CTRL=${CACHE_CTRL:-cache_ctrl}
 BACKEND_CTRL=${BACKEND_CTRL:-backend_ctrl}
 CACHE_NS=${CACHE_NS:-${CACHE_CTRL}n1}
@@ -85,14 +85,19 @@ if ! rpc_call "attach backend controller ${BACKEND_CTRL}" \
 fi
 sleep 2
 
-# Split cache device to limit size
-CACHE_SPLIT_MB=$((CACHE_SPLIT_GB * 1024))
-CACHE_DEVICE="${CACHE_NS}p0"
-log "Splitting cache ${CACHE_NS} to ${CACHE_SPLIT_GB}GB (${CACHE_SPLIT_MB} MB)"
-if ! rpc_call "split cache bdev" \
-    bdev_split_create "${CACHE_NS}" 1 -s "${CACHE_SPLIT_MB}"; then
-    log "Split failed, using full namespace"
+# Split cache device if enabled (disabled by default)
+if [[ "${CACHE_SPLIT_ENABLE:-0}" == "1" ]]; then
+    CACHE_SPLIT_MB=$((CACHE_SPLIT_GB * 1024))
+    CACHE_DEVICE="${CACHE_NS}p0"
+    log "Splitting cache ${CACHE_NS} to ${CACHE_SPLIT_GB}GB (${CACHE_SPLIT_MB} MB)"
+    if ! rpc_call "split cache bdev" \
+        bdev_split_create "${CACHE_NS}" 1 -s "${CACHE_SPLIT_MB}"; then
+        log "Split failed, using full namespace"
+        CACHE_DEVICE="${CACHE_NS}"
+    fi
+else
     CACHE_DEVICE="${CACHE_NS}"
+    log "Using full namespace (CACHE_SPLIT_ENABLE=0)"
 fi
 
 cat <<MSG

@@ -8446,7 +8446,7 @@ bdev_nvme_writev(struct nvme_bdev_io *bio, struct iovec *iov, int iovcnt,
 	bio->iovpos = 0;
 	bio->iov_offset = 0;
 
-	if (domain != NULL || seq != NULL) {
+	if (domain != NULL || seq != NULL || cdw12.raw != 0 || cdw13.raw != 0) {
 		bio->ext_opts.size = SPDK_SIZEOF(&bio->ext_opts, accel_sequence);
 		bio->ext_opts.memory_domain = domain;
 		bio->ext_opts.memory_domain_ctx = domain_ctx;

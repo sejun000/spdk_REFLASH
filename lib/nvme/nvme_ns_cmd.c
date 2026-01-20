@@ -193,6 +193,11 @@ _nvme_ns_cmd_setup_request(struct spdk_nvme_ns *ns, struct nvme_request *req,
 
 	cmd->cdw13 = cdw13;
 
+	if (cdw13 != 0 && opc == SPDK_NVME_OPC_WRITE) {
+		SPDK_INFOLOG(nvme, "GC write: cdw13=0x%x, lba=%lu, lba_count=%u\n",
+			     cdw13, lba, lba_count);
+	}
+
 	cmd->cdw15 = apptag_mask;
 	cmd->cdw15 = (cmd->cdw15 << 16 | apptag);
 }

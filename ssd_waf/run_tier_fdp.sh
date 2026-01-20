@@ -21,13 +21,12 @@ NVMF_SUBSYSTEM=${NVMF_SUBSYSTEM:-nqn.2024-11.io.spdk:icache0}
 
 # Device BDFs for FDP setup
 # FDP SSD as cache (100GB limit)
-CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
-# Regular SSD as backend (full capacity)
-BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
+CACHE_BDF=${CACHE_BDF:-0001:10:00.0}
+BACKEND_BDF=${BACKEND_BDF:-0000:01:00.0}
 SKIP_PRE_FORMAT=${SKIP_PRE_FORMAT:-0}
 
 # FDP cache size: ~512GB (549,357,355,008 bytes = 25% of 2TB, aligned to 13079937024)
-export CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-512}
+export CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-256}
 
 log() {
     echo "[run_tier_fdp] $*"
@@ -217,6 +216,15 @@ start_spdk_tgt() {
 
     # Set log level to WARNING (suppress NOTICE logs)
     sudo "$ROOT_DIR/scripts/rpc.py" -s "$RPC_SOCKET" log_set_print_level WARNING 2>/dev/null || true
+
+    # Enable uring zerocopy for better TCP performance (kernel 6.0+)
+    # Must be called before framework_start_init
+    sudo "$ROOT_DIR/scripts/rpc.py" -s "$RPC_SOCKET" sock_impl_set_options -i uring --enable-zerocopy-send-server --enable-zerocopy-send-client 2>/dev/null || true
+    log "uring zerocopy enabled"
+
+    # Start the SPDK framework (required when using --wait-for-rpc)
+    sudo "$ROOT_DIR/scripts/rpc.py" -s "$RPC_SOCKET" framework_start_init
+    log "framework started"
 }
 
 create_tier() {
@@ -282,7 +290,7 @@ connect_nvmeof() {
     fi
 
     log "Connecting host NVMe controller (trtype=${NVMF_TRTYPE}, addr=${NVMF_TRADDR}, port=${NVMF_TRSVCID}, nqn=${NVMF_SUBSYSTEM})"
-    if sudo nvme connect -t "${NVMF_TRTYPE}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" -n "${NVMF_SUBSYSTEM}"; then
+    if sudo nvme connect -t "${NVMF_TRTYPE}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" -n "${NVMF_SUBSYSTEM}" -k 60; then
         log "nvme connect succeeded"
     else
         log "nvme connect failed (might already be connected); continuing"
@@ -312,10 +320,10 @@ sudo "${ROOT_DIR}/scripts/setup.sh" reset
 pre_format_devices
 prefill_cache
 
-# Bind devices to SPDK (vfio-pci/uio) so spdk_tgt can use them
+# Bind devices to SPDK (uio_pci_generic) so spdk_tgt can use them
 # HUGEMEM=8192 allocates 4096 x 2MB hugepages = 8GB for DMA buffers
-log "Binding devices to SPDK (scripts/setup.sh) with HUGEMEM=8192..."
-sudo HUGEMEM=8192 "${ROOT_DIR}/scripts/setup.sh"
+log "Binding devices to SPDK (scripts/setup.sh) with HUGEMEM=8192 and uio_pci_generic..."
+sudo HUGEMEM=8192 DRIVER_OVERRIDE=uio_pci_generic "${ROOT_DIR}/scripts/setup.sh"
 
 start_spdk_tgt
 create_tier

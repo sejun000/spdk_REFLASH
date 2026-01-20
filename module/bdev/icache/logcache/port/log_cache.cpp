@@ -231,14 +231,6 @@ void LogCache::invalidate(long key, int lba_sz) {
     if (exists(key))
     {
         auto loc = mapping[key];
-        // DEBUG: track mapping changes for low keys
-        if (key < 100) {
-            SPDK_NOTICELOG("DEBUG invalidate: key=%ld, old_seg=%p, old_idx=%zu, "
-                    "old_block.key=%ld, old_block.valid=%d, ts=%lu\n",
-                    key, (void*)loc.seg, loc.idx,
-                    loc.seg->blocks[loc.idx].key, loc.seg->blocks[loc.idx].valid,
-                    log_cache_timestamp);
-        }
         if (loc.seg->blocks[loc.idx].valid)
         {
             print_objects("invalidate", log_cache_timestamp - loc.seg->blocks[loc.idx].create_timestamp);
@@ -426,14 +418,6 @@ bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64
     blk.create_timestamp = log_cache_timestamp;
     mapping[key] = { seg, seg->write_ptr };
     pending_writes_.insert(key);  // Mark as write in progress
-
-    // DEBUG: track mapping changes for low keys
-    if (key < 100) {
-        SPDK_NOTICELOG("DEBUG append_block: key=%ld, seg=%p, idx=%zu, "
-                "seg->class_num=%d, ts=%lu\n",
-                key, (void*)seg, seg->write_ptr, seg->get_class_num(),
-                log_cache_timestamp);
-    }
 
     ++seg->write_ptr;
     ++seg->valid_cnt;

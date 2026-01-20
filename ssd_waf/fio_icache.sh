@@ -21,7 +21,7 @@ CAS_CORE_ID=${CAS_CORE_ID:-1}
 CAS_DEVICE="/dev/cas${CAS_CACHE_ID}-${CAS_CORE_ID}"
 
 RUNTIME=${RUNTIME:-200}  # Default 2 minutes
-TEST_SIZE=${TEST_SIZE:-1700G}  # 검증용 테스트 크기
+TEST_SIZE=${TEST_SIZE:-70G}  # 검증용 테스트 크기
 VERIFY_ONLY=${VERIFY_ONLY:-0}  # 1이면 검증만 수행
 SKIP_VERIFY=${SKIP_VERIFY:-0}  # 1이면 검증 스킵
 LOG_PREFIX="fio_bw_$(date +%Y%m%d_%H%M%S)"
@@ -33,7 +33,7 @@ LOG_PREFIX="fio_bw_$(date +%Y%m%d_%H%M%S)"
 WORKLOAD=${WORKLOAD:-uniform}
 
 # Zipf theta parameter (higher = more skewed, 1.2 is typical)
-ZIPF_THETA=${ZIPF_THETA:-1.2}
+ZIPF_THETA=${ZIPF_THETA:-0.8}
 
 # Get random distribution option based on workload type
 get_random_distribution() {

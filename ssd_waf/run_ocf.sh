@@ -8,14 +8,14 @@ RPC_BIN=${RPC_BIN:-"$ROOT_DIR/scripts/rpc.py"}
 RPC=("$RPC_BIN" "-s" "$RPC_SOCKET")
 
 # Device BDFs
-CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
-BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
+CACHE_BDF=${CACHE_BDF:-0001:10:00.0}
+BACKEND_BDF=${BACKEND_BDF:-0000:01:00.0}
 
 # OCF configuration
 OCF_NAME=${OCF_NAME:-ocf0}
 OCF_MODE=${OCF_MODE:-wb}  # wb, wt, pt, wa, wi, wo
 OCF_CACHE_LINE_SIZE=${OCF_CACHE_LINE_SIZE:-4}  # 4, 8, 16, 32, 64 KiB
-CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-512}  # Split cache device to 500GB
+CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-256}  # Split cache device to 500GB
 OCF_STAT_LOG=${OCF_STAT_LOG:-$ROOT_DIR/ssd_waf/logging}  # Directory for stats CSV log
 
 # Export mode: nvmeof (default, stable) or ublk
@@ -220,6 +220,15 @@ start_spdk_tgt() {
         exit 1
     fi
     log "spdk_tgt is ready (RPC socket ${RPC_SOCKET})"
+
+    # Enable uring zerocopy for better TCP performance (kernel 6.0+)
+    # Must be called before framework_start_init
+    "${RPC[@]}" sock_impl_set_options -i uring --enable-zerocopy-send-server --enable-zerocopy-send-client 2>/dev/null || true
+    log "uring zerocopy enabled"
+
+    # Start the SPDK framework (required when using --wait-for-rpc)
+    "${RPC[@]}" framework_start_init
+    log "framework started"
 }
 
 create_ocf() {
@@ -246,17 +255,22 @@ create_ocf() {
     local cache_ns="${cache_ctrl}n1"
     local backend_ns="${backend_ctrl}n1"
 
-    # Split cache device to CACHE_SPLIT_GB (OCF uses full bdev unlike icache)
-    local cache_split_mb=$((CACHE_SPLIT_GB * 1024))  # MB units
-    local cache_split_name="${cache_ns}p0"
-
-    log "Splitting cache device ${cache_ns} to ${CACHE_SPLIT_GB}GB (${cache_split_mb} MB)"
-    rpc_call "split cache bdev ${cache_ns}" \
-        bdev_split_create "${cache_ns}" 1 -s "${cache_split_mb}"
-    sleep 1
+    # Split cache device if enabled (disabled by default)
+    local cache_bdev
+    if [[ "${CACHE_SPLIT_ENABLE:-0}" == "1" ]]; then
+        local cache_split_mb=$((CACHE_SPLIT_GB * 1024))
+        cache_bdev="${cache_ns}p0"
+        log "Splitting cache device ${cache_ns} to ${CACHE_SPLIT_GB}GB (${cache_split_mb} MB)"
+        rpc_call "split cache bdev ${cache_ns}" \
+            bdev_split_create "${cache_ns}" 1 -s "${cache_split_mb}"
+        sleep 1
+    else
+        cache_bdev="${cache_ns}"
+        log "Using full namespace (CACHE_SPLIT_ENABLE=0)"
+    fi
 
     log "Creating OCF bdev: ${OCF_NAME}"
-    log "  Cache bdev:  ${cache_split_name} (${CACHE_SPLIT_GB}GB)"
+    log "  Cache bdev:  ${cache_bdev}"
     log "  Core bdev:   ${backend_ns}"
     log "  Mode:        ${OCF_MODE}"
     log "  Line size:   ${OCF_CACHE_LINE_SIZE}KB"
@@ -264,7 +278,7 @@ create_ocf() {
 
     mkdir -p "${OCF_STAT_LOG}"
     rpc_call "create OCF ${OCF_NAME}" \
-        bdev_ocf_create "${OCF_NAME}" "${OCF_MODE}" "${cache_split_name}" "${backend_ns}" \
+        bdev_ocf_create "${OCF_NAME}" "${OCF_MODE}" "${cache_bdev}" "${backend_ns}" \
         --cache-line-size "${OCF_CACHE_LINE_SIZE}" \
         --stat-log-path "${OCF_STAT_LOG}"
 
@@ -331,7 +345,7 @@ connect_nvmf() {
     fi
 
     log "Connecting to NVMe-oF target..."
-    sudo nvme connect -t "${NVMF_TRTYPE}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" -n "${NVMF_SUBSYSTEM}" || true
+    sudo nvme connect -t "${NVMF_TRTYPE}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" -n "${NVMF_SUBSYSTEM}" -k 60 || true
 
     sleep 2
 
@@ -438,8 +452,8 @@ sudo "${ROOT_DIR}/scripts/setup.sh" reset
 pre_format_devices
 prefill_cache
 
-log "Binding devices to SPDK..."
-sudo HUGEMEM=16384 "${ROOT_DIR}/scripts/setup.sh"
+log "Binding devices to SPDK with uio_pci_generic..."
+sudo HUGEMEM=16384 DRIVER_OVERRIDE=uio_pci_generic "${ROOT_DIR}/scripts/setup.sh"
 
 start_spdk_tgt
 create_ocf

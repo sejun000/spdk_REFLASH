@@ -844,11 +844,15 @@ vbdev_icache_create(const char *name, const char *cache_bdev_name,
 		goto err_open;
 	}
 
-	// Limit cache size (TODO: make this configurable via RPC)
-	// 549,357,355,008 bytes = 25% of 2TB (2,174,461,292,544), aligned to 13079937024 (42 units)
-	uint64_t cache_size_limit_bytes = 549357355008ULL;
+	// Use detected cache device size, aligned down to 2GB boundary
 	uint64_t cache_blockcnt = icache->cache_bdev->blockcnt;
-	uint64_t limit_blockcnt = cache_size_limit_bytes / icache->cache_bdev->blocklen;
+	uint64_t block_size = icache->cache_bdev->blocklen;
+	uint64_t cache_total_bytes = cache_blockcnt * block_size;
+	uint64_t align_2gb = 2ULL * 1024 * 1024 * 1024;  // 2GB
+	uint64_t cache_aligned_bytes = (cache_total_bytes / align_2gb) * align_2gb;
+	uint64_t limit_blockcnt = cache_aligned_bytes / block_size;
+	SPDK_NOTICELOG("icache: cache device %lu bytes, aligned to %lu bytes (%lu GB)\n",
+		       cache_total_bytes, cache_aligned_bytes, cache_aligned_bytes / (1024 * 1024 * 1024));
 
 	// Get zone size and align to stripe boundaries
 	uint64_t zone_size_blocks = spdk_bdev_get_zone_size(icache->cache_bdev);
@@ -858,18 +862,18 @@ vbdev_icache_create(const char *name, const char *cache_bdev_name,
 		#define STRIPE_WIDTH 2
 		#endif
 		uint64_t align_unit = zone_size_blocks * STRIPE_WIDTH;
-		// Round UP to alignment boundary
-		limit_blockcnt = ((limit_blockcnt + align_unit - 1) / align_unit) * align_unit;
+		// Round DOWN to alignment boundary (must not exceed device size)
+		limit_blockcnt = (limit_blockcnt / align_unit) * align_unit;
 		SPDK_NOTICELOG("icache: zone_size=%lu blocks, stripe_width=%d, align_unit=%lu blocks\n",
 			       zone_size_blocks, STRIPE_WIDTH, align_unit);
 	}
 
-	if (limit_blockcnt < cache_blockcnt) {
-		SPDK_NOTICELOG("icache: Limiting cache size from %lu to %lu blocks (%lu MB)\n",
-			       cache_blockcnt, limit_blockcnt,
-			       (limit_blockcnt * icache->cache_bdev->blocklen) / (1024 * 1024));
-		cache_blockcnt = limit_blockcnt;
-	}
+	// Always use aligned limit_blockcnt
+	SPDK_NOTICELOG("icache: Using cache size %lu blocks (%lu MB), original %lu blocks\n",
+		       limit_blockcnt,
+		       (limit_blockcnt * icache->cache_bdev->blocklen) / (1024 * 1024),
+		       icache->cache_bdev->blockcnt);
+	cache_blockcnt = limit_blockcnt;
 
 	icache->log_ctx = log_cache_ctx_create(icache->cache_desc, icache->backend_desc,
 					       cache_blockcnt,
