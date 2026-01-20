@@ -844,12 +844,12 @@ vbdev_icache_create(const char *name, const char *cache_bdev_name,
 		goto err_open;
 	}
 
-	// Use detected cache device size, aligned down to 2GB boundary
+	// Use detected cache device size, aligned down to 6GB boundary (segment size)
 	uint64_t cache_blockcnt = icache->cache_bdev->blockcnt;
 	uint64_t block_size = icache->cache_bdev->blocklen;
 	uint64_t cache_total_bytes = cache_blockcnt * block_size;
-	uint64_t align_2gb = 2ULL * 1024 * 1024 * 1024;  // 2GB
-	uint64_t cache_aligned_bytes = (cache_total_bytes / align_2gb) * align_2gb;
+	uint64_t align_6gb = 6ULL * 1024 * 1024 * 1024;  // 6GB (segment size)
+	uint64_t cache_aligned_bytes = (cache_total_bytes / align_6gb) * align_6gb;
 	uint64_t limit_blockcnt = cache_aligned_bytes / block_size;
 	SPDK_NOTICELOG("icache: cache device %lu bytes, aligned to %lu bytes (%lu GB)\n",
 		       cache_total_bytes, cache_aligned_bytes, cache_aligned_bytes / (1024 * 1024 * 1024));

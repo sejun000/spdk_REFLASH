@@ -2163,7 +2163,7 @@ public:
 		// Zone configuration for ZNS vs FDP
 		static constexpr uint64_t ZNS_ZONE_SIZE_BLOCKS = 0x80000;      // 524288 blocks = 2GB
 		static constexpr uint64_t ZNS_ZONE_CAPACITY_BLOCKS = 0x43500;  // 275712 blocks = ~1.07GB
-		static constexpr uint64_t FDP_ZONE_SIZE_BLOCKS = 0x80000;      // 524288 blocks = 2GB
+		static constexpr uint64_t FDP_ZONE_SIZE_BLOCKS = 0x180000;     // 1572864 blocks = 6GB
 
 #if FDP
 		// FDP mode: zone_size == zone_capacity (no holes in address space)
