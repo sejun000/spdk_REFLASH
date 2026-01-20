@@ -15,6 +15,17 @@
 #include "ctx.h"
 #include "vbdev_ocf.h"
 
+/* Enable FDP for OCF cache writes (set to 1 to enable) */
+#define OCF_FDP_ENABLED			0
+
+/* FDP Placement Handles for OCF hot/cold separation */
+#define OCF_FDP_HANDLE_HOT		0	/* Hot data (frequently accessed) */
+#define OCF_FDP_HANDLE_COLD		1	/* Cold data (infrequently accessed) */
+
+/* I/O class threshold for hot/cold classification
+ * io_class 0 = hot (default), io_class >= 1 = cold */
+#define OCF_FDP_COLD_IO_CLASS_THRESHOLD	1
+
 static int
 vbdev_ocf_volume_open(ocf_volume_t volume, void *opts)
 {
@@ -191,8 +202,27 @@ vbdev_forward_io(ocf_volume_t volume, ocf_forward_token_t token,
 		status = spdk_bdev_readv(base->desc, ch, iovs, iovcnt,
 					 addr, bytes, cb, (void *) token);
 	} else if (dir == OCF_WRITE) {
+#if OCF_FDP_ENABLED
+		/* Use FDP placement handle for cache writes based on I/O class */
+		if (base->is_cache) {
+			uint8_t io_class = ocf_forward_get_io_class(token);
+			uint16_t placement_handle = (io_class >= OCF_FDP_COLD_IO_CLASS_THRESHOLD)
+						    ? OCF_FDP_HANDLE_COLD : OCF_FDP_HANDLE_HOT;
+			struct spdk_bdev_ext_io_opts opts = {};
+			opts.size = sizeof(opts);
+			opts.nvme_cdw12.write.dtype = 2;  /* Directive Type = FDP */
+			opts.nvme_cdw13.write.dspec = placement_handle;
+
+			status = spdk_bdev_writev_ext(base->desc, ch, iovs, iovcnt,
+						      addr, bytes, cb, (void *) token, &opts);
+		} else {
+			status = spdk_bdev_writev(base->desc, ch, iovs, iovcnt,
+						  addr, bytes, cb, (void *) token);
+		}
+#else
 		status = spdk_bdev_writev(base->desc, ch, iovs, iovcnt,
 					  addr, bytes, cb, (void *) token);
+#endif
 	}
 
 	if (unlikely(status)) {
@@ -308,9 +338,30 @@ vbdev_forward_io_simple(ocf_volume_t volume, ocf_forward_token_t token,
 					 data->iovcnt, addr, bytes,
 					 vbdev_forward_io_simple_cb, ctx);
 	} else if (dir == OCF_WRITE) {
+#if OCF_FDP_ENABLED
+		/* Use FDP placement handle for cache writes based on I/O class */
+		if (base->is_cache) {
+			uint8_t io_class = ocf_forward_get_io_class(token);
+			uint16_t placement_handle = (io_class >= OCF_FDP_COLD_IO_CLASS_THRESHOLD)
+						    ? OCF_FDP_HANDLE_COLD : OCF_FDP_HANDLE_HOT;
+			struct spdk_bdev_ext_io_opts opts = {};
+			opts.size = sizeof(opts);
+			opts.nvme_cdw12.write.dtype = 2;  /* Directive Type = FDP */
+			opts.nvme_cdw13.write.dspec = placement_handle;
+
+			status = spdk_bdev_writev_ext(base->desc, ctx->ch, data->iovs,
+						      data->iovcnt, addr, bytes,
+						      vbdev_forward_io_simple_cb, ctx, &opts);
+		} else {
+			status = spdk_bdev_writev(base->desc, ctx->ch, data->iovs,
+						  data->iovcnt, addr, bytes,
+						  vbdev_forward_io_simple_cb, ctx);
+		}
+#else
 		status = spdk_bdev_writev(base->desc, ctx->ch, data->iovs,
 					  data->iovcnt, addr, bytes,
 					  vbdev_forward_io_simple_cb, ctx);
+#endif
 	}
 
 	if (unlikely(status)) {
