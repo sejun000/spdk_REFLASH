@@ -235,6 +235,7 @@ void LogCache::invalidate(long key, int lba_sz) {
         {
             print_objects("invalidate", log_cache_timestamp - loc.seg->blocks[loc.idx].create_timestamp);
             invalidate_blocks += 1;
+            write_hit_size += 1;  // Write cache hit: same LBA exists, invalidating old block
             loc.seg->blocks[loc.idx].valid = false;
             --loc.seg->valid_cnt;
             global_valid_blocks -= 1;
@@ -892,6 +893,7 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
             print_objects("evict", log_cache_timestamp - blk.create_timestamp);
             evicted_blocks += cfg_.evicted_blk_size;
             evicted_ages_histogram->inc(log_cache_timestamp - blk.create_timestamp);
+            evicted_ages_with_segment_histogram->inc(log_cache_timestamp - blk.create_timestamp);
             evicted_timestamp[blk.key] = log_cache_timestamp;
             evicted_blocks_for_victim += 1;
             // map erase and blk valid false is done in this function
@@ -918,6 +920,7 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
         }
 
         print_objects("compact", log_cache_timestamp - blk.create_timestamp);
+        compacted_ages_with_segment_histogram->inc(log_cache_timestamp - blk.create_timestamp);
         copy_block(s, i, target_seg);
         compacted_blocks_for_victim += 1;
 
@@ -958,6 +961,7 @@ void LogCache::evict_segment(LogCacheSegment* s)
         }
         print_objects("evict", log_cache_timestamp - blk.create_timestamp);
         evicted_ages_histogram->inc(log_cache_timestamp - blk.create_timestamp);
+        evicted_ages_with_segment_histogram->inc(log_cache_timestamp - blk.create_timestamp);
         evicted_blocks += cfg_.evicted_blk_size;
         evicted_blocks_for_victim += 1;
         evicted_timestamp[blk.key] = log_cache_timestamp;

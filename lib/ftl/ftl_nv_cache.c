@@ -576,6 +576,16 @@ ftl_chunk_free_chunk_free_entry(struct ftl_nv_cache_chunk *chunk)
 	p2l_map->chunk_dma_md = NULL;
 }
 
+/* Fire-and-forget TRIM completion callback */
+static void
+chunk_trim_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	if (bdev_io) {
+		spdk_bdev_free_io(bdev_io);
+	}
+	/* Fire and forget - no action needed */
+}
+
 static void
 chunk_free_cb(int status, void *ctx)
 {
@@ -591,6 +601,11 @@ chunk_free_cb(int status, void *ctx)
 		chunk->md->state = FTL_CHUNK_STATE_FREE;
 		chunk->md->close_seq_id = 0;
 		ftl_chunk_free_chunk_free_entry(chunk);
+
+		/* Fire-and-forget TRIM to backend device */
+		spdk_bdev_unmap_blocks(nv_cache->bdev_desc, nv_cache->cache_ioch,
+				       chunk->offset, nv_cache->chunk_blocks,
+				       chunk_trim_cb, NULL);
 	} else {
 #ifdef SPDK_FTL_RETRY_ON_ERROR
 		ftl_md_persist_entry_retry(&chunk->md_persist_entry_ctx);

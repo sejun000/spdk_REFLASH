@@ -128,10 +128,11 @@ ftl_stats_logger_write_stats(struct ftl_stats_logger *logger)
 	elapsed_sec = (now_us - logger->start_time_us) / 1000000.0;
 
 	/* Write log line: time, host, cache, backend, host_delta, cache_delta, backend_delta,
-	 *                 nvme_host (HBMW), nvme_media (MBMW), nvme_host_delta, nvme_media_delta
+	 *                 nvme_host (HBMW), nvme_media (MBMW), nvme_host_delta, nvme_media_delta,
+	 *                 valid_blocks, write_hit_count, gc_victim_blocks, evict_victim_blocks
 	 * FDP stats (hbmw, mbmw) are already in bytes, just convert to MB */
 	fprintf(logger->log_fp,
-		"%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+		"%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu,%lu,%lu,%lu\n",
 		elapsed_sec,
 		host_write / MB,
 		cache_write / MB,
@@ -142,7 +143,11 @@ ftl_stats_logger_write_stats(struct ftl_stats_logger *logger)
 		logger->nvme_host_written / MB,
 		logger->nvme_media_written / MB,
 		nvme_host_delta / MB,
-		nvme_media_delta / MB);
+		nvme_media_delta / MB,
+		logger->valid_blocks,
+		logger->write_hit_count,
+		logger->gc_victim_blocks,
+		logger->evict_victim_blocks);
 	fflush(logger->log_fp);
 }
 
@@ -283,7 +288,8 @@ ftl_stats_logger_start(struct ftl_stats_logger *logger)
 		"time_sec,host_write_MB,cache_write_MB,backend_write_MB,"
 		"host_delta_MB,cache_delta_MB,backend_delta_MB,"
 		"nvme_host_written_MB,nvme_media_written_MB,"
-		"nvme_host_delta_MB,nvme_media_delta_MB\n");
+		"nvme_host_delta_MB,nvme_media_delta_MB,"
+		"valid_blocks,write_hit_count,gc_victim_blocks,evict_victim_blocks\n");
 	fflush(logger->log_fp);
 
 	/* Record start time */

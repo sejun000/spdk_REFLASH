@@ -20,15 +20,21 @@ Histogram::Histogram(std::string name, uint64_t granularity, size_t max_buckets,
 
 Histogram::~Histogram() {
     if (m_fp_histo) {
-        // 배열의 처음부터 끝까지 순회
-        fprintf(m_fp_histo, "---summary of %s---\n", m_name.c_str());
+        // CSV header
+        fprintf(m_fp_histo, "histogram,%s\n", m_name.c_str());
+        fprintf(m_fp_histo, "bucket,age_min,age_max,count\n");
+        // 모든 버킷 출력 (0인 것도 포함)
         for (size_t i = 0; i < m_max_buckets; ++i) {
-            // 카운트가 0보다 큰 버킷만 출력
-            if (m_counts[i] > 0) {
-                // %zu는 size_t 타입에 대한 형식 지정자
-                fprintf(m_fp_histo, "%zu th %lu\n", i, m_counts[i]);
+            uint64_t age_min = i * m_granularity;
+            uint64_t age_max = (i + 1) * m_granularity - 1;
+            if (i == m_max_buckets - 1) {
+                // 마지막 버킷은 overflow 포함
+                fprintf(m_fp_histo, "%zu,%lu,+inf,%lu\n", i, age_min, m_counts[i]);
+            } else {
+                fprintf(m_fp_histo, "%zu,%lu,%lu,%lu\n", i, age_min, age_max, m_counts[i]);
             }
         }
+        fprintf(m_fp_histo, "\n");
         fflush(m_fp_histo);
     }
 }

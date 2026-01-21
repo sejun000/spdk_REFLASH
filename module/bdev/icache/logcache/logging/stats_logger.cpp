@@ -95,7 +95,7 @@ bool StatsLogger::start()
     fprintf(log_fp_, "time_sec,host_write_MB,cache_write_MB,backend_write_MB,gc_write_MB,"
                      "host_write_delta_MB,cache_write_delta_MB,backend_write_delta_MB,gc_write_delta_MB,"
                      "nvme_host_written_MB,nvme_media_written_MB,nvme_host_delta_MB,nvme_media_delta_MB,"
-                     "cache_read_MB,backend_read_MB\n");
+                     "cache_read_MB,backend_read_MB,valid_blocks,write_hit_count,gc_victim_blocks,evict_victim_blocks\n");
     fflush(log_fp_);
 
     // Record start time
@@ -223,6 +223,10 @@ void StatsLogger::log_stats()
     uint64_t gc_write = stats_.gc_write_bytes.load(std::memory_order_relaxed);
     uint64_t cache_read = stats_.cache_read_bytes.load(std::memory_order_relaxed);
     uint64_t backend_read = stats_.backend_read_bytes.load(std::memory_order_relaxed);
+    uint64_t valid_blocks = stats_.valid_blocks.load(std::memory_order_relaxed);
+    uint64_t write_hit_count = stats_.write_hit_count.load(std::memory_order_relaxed);
+    uint64_t gc_victim_blocks = stats_.gc_victim_blocks.load(std::memory_order_relaxed);
+    uint64_t evict_victim_blocks = stats_.evict_victim_blocks.load(std::memory_order_relaxed);
 
     // Calculate deltas
     uint64_t host_delta = host_write - prev_host_write_;
@@ -253,7 +257,7 @@ void StatsLogger::log_stats()
 
     // Write log line
     // FDP stats (hbmw, mbmw) are already in bytes, just convert to MB
-    fprintf(log_fp_, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+    fprintf(log_fp_, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu,%lu,%lu,%lu\n",
             elapsed_sec,
             host_write / MB,
             cache_write / MB,
@@ -268,6 +272,10 @@ void StatsLogger::log_stats()
             nvme_host_delta / MB,
             nvme_media_delta / MB,
             cache_read / MB,
-            backend_read / MB);
+            backend_read / MB,
+            valid_blocks,
+            write_hit_count,
+            gc_victim_blocks,
+            evict_victim_blocks);
     fflush(log_fp_);
 }

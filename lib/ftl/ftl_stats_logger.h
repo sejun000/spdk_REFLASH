@@ -64,6 +64,10 @@ struct ftl_stats_logger {
 	uint64_t host_write_bytes;
 	uint64_t cache_write_bytes;
 	uint64_t backend_write_bytes;
+	uint64_t valid_blocks;         /* Valid 4K blocks in nv_cache */
+	uint64_t write_hit_count;      /* Write cache hits (L2P overwrite) */
+	uint64_t gc_victim_blocks;     /* Blocks compacted by GC */
+	uint64_t evict_victim_blocks;  /* Blocks evicted (chunk freed) */
 
 	/* Previous values for delta calculation */
 	uint64_t prev_host_write;
@@ -171,6 +175,50 @@ ftl_stats_logger_add_backend_write(struct ftl_stats_logger *logger, uint64_t byt
 {
 	if (logger) {
 		logger->backend_write_bytes += bytes;
+	}
+}
+
+/**
+ * Set valid blocks count
+ */
+static inline void
+ftl_stats_logger_set_valid_blocks(struct ftl_stats_logger *logger, uint64_t count)
+{
+	if (logger) {
+		logger->valid_blocks = count;
+	}
+}
+
+/**
+ * Add write hit (L2P overwrite)
+ */
+static inline void
+ftl_stats_logger_add_write_hit(struct ftl_stats_logger *logger)
+{
+	if (logger) {
+		logger->write_hit_count++;
+	}
+}
+
+/**
+ * Add GC victim blocks
+ */
+static inline void
+ftl_stats_logger_add_gc_victim(struct ftl_stats_logger *logger, uint64_t count)
+{
+	if (logger) {
+		logger->gc_victim_blocks += count;
+	}
+}
+
+/**
+ * Add evict victim blocks
+ */
+static inline void
+ftl_stats_logger_add_evict_victim(struct ftl_stats_logger *logger, uint64_t count)
+{
+	if (logger) {
+		logger->evict_victim_blocks += count;
 	}
 }
 

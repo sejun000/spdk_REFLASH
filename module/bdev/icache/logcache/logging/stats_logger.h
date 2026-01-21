@@ -50,6 +50,10 @@ public:
         std::atomic<uint64_t> gc_write_bytes{0};      // GC copy writes
         std::atomic<uint64_t> cache_read_bytes{0};    // Reads from cache device
         std::atomic<uint64_t> backend_read_bytes{0};  // Reads from backend device
+        std::atomic<uint64_t> valid_blocks{0};        // Valid 4K blocks in cache
+        std::atomic<uint64_t> write_hit_count{0};     // Write cache hits (same LBA invalidated)
+        std::atomic<uint64_t> gc_victim_blocks{0};    // Blocks copied by GC (compaction)
+        std::atomic<uint64_t> evict_victim_blocks{0}; // Blocks evicted to backend
     };
 
     /**
@@ -83,6 +87,10 @@ public:
     void add_gc_write(uint64_t bytes) { stats_.gc_write_bytes.fetch_add(bytes, std::memory_order_relaxed); }
     void add_cache_read(uint64_t bytes) { stats_.cache_read_bytes.fetch_add(bytes, std::memory_order_relaxed); }
     void add_backend_read(uint64_t bytes) { stats_.backend_read_bytes.fetch_add(bytes, std::memory_order_relaxed); }
+    void set_valid_blocks(uint64_t count) { stats_.valid_blocks.store(count, std::memory_order_relaxed); }
+    void add_write_hit() { stats_.write_hit_count.fetch_add(1, std::memory_order_relaxed); }
+    void add_gc_victim_blocks(uint64_t count) { stats_.gc_victim_blocks.fetch_add(count, std::memory_order_relaxed); }
+    void add_evict_victim_blocks(uint64_t count) { stats_.evict_victim_blocks.fetch_add(count, std::memory_order_relaxed); }
 
     // Get current values
     uint64_t host_write_bytes() const { return stats_.host_write_bytes.load(std::memory_order_relaxed); }

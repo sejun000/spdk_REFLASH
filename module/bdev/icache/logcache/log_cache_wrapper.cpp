@@ -2458,6 +2458,7 @@ public:
 			stats_logger_->add_host_write(bytes);
 		}
 		maybe_log_waf();
+		update_stats_logger();
 	}
 
 	void add_gc_write_bytes(uint64_t bytes) {
@@ -2512,6 +2513,18 @@ public:
 	void stop_stats_logger() {
 		if (stats_logger_) {
 			stats_logger_->stop();
+		}
+	}
+
+	// Update stats logger with LogCache stats (call periodically)
+	void update_stats_logger() {
+		if (stats_logger_ && cache_) {
+			stats_logger_->set_valid_blocks(cache_->get_valid_blocks());
+			// write_hit, gc_victim, evict_victim are cumulative in LogCache
+			// StatsLogger expects cumulative values too, so just set directly
+			stats_logger_->stats().write_hit_count.store(cache_->get_write_hit_count(), std::memory_order_relaxed);
+			stats_logger_->stats().gc_victim_blocks.store(cache_->get_compacted_blocks(), std::memory_order_relaxed);
+			stats_logger_->stats().evict_victim_blocks.store(cache_->get_evicted_blocks(), std::memory_order_relaxed);
 		}
 	}
 
