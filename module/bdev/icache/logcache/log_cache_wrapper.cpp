@@ -306,6 +306,21 @@ struct ZoneResetAsyncCtx {
 	int zones_reset;          // Count of zones reset
 };
 
+#if FDP && FDP_TRIM
+// FDP trim async context
+struct FdpTrimAsyncCtx {
+	struct spdk_bdev_desc *desc;
+	struct spdk_io_channel *ch;
+	uint64_t block_offset;
+	uint64_t num_blocks;
+	uint64_t zone_size_blocks;
+	cache_device_io_cb user_cb;
+	void *user_cb_arg;
+	SpdkCacheDevice *device;
+	uint64_t start_tsc;
+};
+#endif
+
 // Zone Queue Entry - pending IO for a zone
 struct ZoneQueueEntry {
 	uint64_t offset;
@@ -549,6 +564,41 @@ zone_reset_next(ZoneResetAsyncCtx *ctx)
 		delete ctx;
 	}
 }
+
+#if FDP && FDP_TRIM
+// Forward declaration for clearing zone state after FDP trim
+static void clear_zone_state_after_fdp_trim(SpdkCacheDevice *device, uint64_t block_offset,
+					    uint64_t num_blocks, uint64_t zone_size_blocks);
+
+static void
+fdp_trim_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	auto *ctx = static_cast<FdpTrimAsyncCtx *>(cb_arg);
+	spdk_bdev_free_io(bdev_io);
+
+	int status = 0;
+	if (!success) {
+		SPDK_ERRLOG("fdp_trim_completion: TRIM/UNMAP failed!\n");
+		status = -EIO;
+	} else {
+		uint64_t elapsed_tsc = spdk_get_ticks() - ctx->start_tsc;
+		uint64_t elapsed_us = elapsed_tsc * 1000000 / spdk_get_ticks_hz();
+		SPDK_NOTICELOG("FDP TRIM complete: block_offset=0x%lx, num_blocks=%lu, %lu us\n",
+			       ctx->block_offset, ctx->num_blocks, elapsed_us);
+
+		// Clear zone state for reuse
+		if (ctx->device) {
+			clear_zone_state_after_fdp_trim(ctx->device, ctx->block_offset,
+						       ctx->num_blocks, ctx->zone_size_blocks);
+		}
+	}
+
+	if (ctx->user_cb) {
+		ctx->user_cb(ctx->user_cb_arg, status);
+	}
+	delete ctx;
+}
+#endif
 
 class SpdkCacheDevice : public CacheDeviceInterface {
 public:
@@ -960,7 +1010,14 @@ public:
 		struct spdk_bdev_ext_io_opts opts = {};
 		opts.size = sizeof(opts);
 		opts.nvme_cdw12.write.dtype = 2;  // Directive Type = FDP (Data Placement)
+#if FDP_PLACEMENT_ENABLED
 		opts.nvme_cdw13.write.dspec = static_cast<uint16_t>(placement_handle);  // Placement Handle ID
+#else
+		opts.nvme_cdw13.write.dspec = 0;  // Force all writes to placement_handle=0
+#endif
+
+		// SPDK_NOTICELOG("FDP submit: placement_handle=%d, cdw12.raw=0x%x, cdw13.raw=0x%x, opts.size=%zu\n",
+		// 	       placement_handle, opts.nvme_cdw12.raw, opts.nvme_cdw13.raw, opts.size);
 
 		rc = spdk_bdev_writev_blocks_ext(m_cache_desc, m_cache_ch, iovs, iovcnt,
 						 block_offset, num_blocks,
@@ -1140,9 +1197,44 @@ public:
 				     cache_device_io_cb cb, void *cb_arg) override
 	{
 		// Check if ZNS and valid parameters
-		// For FDP mode (m_cache_zoned=false): skip zone reset but clear zone state
+		// For FDP mode (m_cache_zoned=false): send TRIM if FDP_TRIM enabled, else just clear zone state
 		if (!m_cache_zoned || len == 0 || m_cache_zone_blocks == 0) {
-			// FDP mode: still need to clear zone state for reuse
+#if FDP && FDP_TRIM
+			// FDP mode with TRIM enabled: send TRIM/UNMAP command
+			if (len > 0 && m_cache_ch) {
+				uint64_t block_offset, num_blocks;
+				if (convert_to_blocks(m_cache_bdev, offset, len, &block_offset, &num_blocks) == 0 &&
+				    num_blocks > 0) {
+					auto *ctx = new (std::nothrow) FdpTrimAsyncCtx();
+					if (!ctx) {
+						if (cb) cb(cb_arg, -ENOMEM);
+						return 0;
+					}
+					ctx->desc = m_cache_desc;
+					ctx->ch = m_cache_ch;
+					ctx->block_offset = block_offset;
+					ctx->num_blocks = num_blocks;
+					ctx->zone_size_blocks = m_cache_zone_blocks;
+					ctx->user_cb = cb;
+					ctx->user_cb_arg = cb_arg;
+					ctx->device = this;
+					ctx->start_tsc = spdk_get_ticks();
+
+					SPDK_NOTICELOG("FDP TRIM: block_offset=0x%lx, num_blocks=%lu\n",
+						       block_offset, num_blocks);
+					int rc = spdk_bdev_unmap_blocks(m_cache_desc, m_cache_ch,
+								       block_offset, num_blocks,
+								       fdp_trim_completion, ctx);
+					if (rc) {
+						SPDK_ERRLOG("FDP TRIM failed to submit: rc=%d\n", rc);
+						delete ctx;
+						if (cb) cb(cb_arg, rc);
+					}
+					return 0;
+				}
+			}
+#else
+			// FDP mode without TRIM: just clear zone state for reuse
 			if (m_cache_zone_blocks > 0 && len > 0) {
 				uint64_t start_zone = offset / (m_cache_zone_blocks * m_block_size);
 				uint64_t end_zone = (offset + len - 1) / (m_cache_zone_blocks * m_block_size);
@@ -1150,6 +1242,7 @@ public:
 					clear_zone_state(z);
 				}
 			}
+#endif
 			// Defer callback to avoid nested callback chain
 			if (cb) {
 				auto *ctx = new DeferredResetCtx{cb, cb_arg};
@@ -1766,6 +1859,20 @@ static void clear_zone_state_after_reset(SpdkCacheDevice *device, uint64_t start
 		device->clear_zone_state(zone_id);
 	}
 }
+
+#if FDP && FDP_TRIM
+// Implementation of clear_zone_state_after_fdp_trim (called from fdp_trim_completion)
+static void clear_zone_state_after_fdp_trim(SpdkCacheDevice *device, uint64_t block_offset,
+					    uint64_t num_blocks, uint64_t zone_size_blocks)
+{
+	if (!device || zone_size_blocks == 0) return;
+	uint64_t start_zone_id = block_offset / zone_size_blocks;
+	uint64_t end_zone_id = (block_offset + num_blocks - 1) / zone_size_blocks;
+	for (uint64_t zone_id = start_zone_id; zone_id <= end_zone_id; ++zone_id) {
+		device->clear_zone_state(zone_id);
+	}
+}
+#endif
 
 // Drain global pending writes when command slots become available
 static void drain_global_pending_writes()

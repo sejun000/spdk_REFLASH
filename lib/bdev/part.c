@@ -285,6 +285,8 @@ bdev_part_init_ext_io_opts(struct spdk_bdev_io *bdev_io, struct spdk_bdev_ext_io
 	opts->memory_domain_ctx = bdev_io->u.bdev.memory_domain_ctx;
 	opts->metadata = bdev_io->u.bdev.md_buf;
 	opts->dif_check_flags_exclude_mask = ~bdev_io->u.bdev.dif_check_flags;
+	opts->nvme_cdw12 = bdev_io->u.bdev.nvme_cdw12;
+	opts->nvme_cdw13 = bdev_io->u.bdev.nvme_cdw13;
 }
 
 int

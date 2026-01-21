@@ -193,10 +193,10 @@ _nvme_ns_cmd_setup_request(struct spdk_nvme_ns *ns, struct nvme_request *req,
 
 	cmd->cdw13 = cdw13;
 
-	if (cdw13 != 0 && opc == SPDK_NVME_OPC_WRITE) {
-		SPDK_INFOLOG(nvme, "GC write: cdw13=0x%x, lba=%lu, lba_count=%u\n",
-			     cdw13, lba, lba_count);
-	}
+	// if (cdw13 != 0 && opc == SPDK_NVME_OPC_WRITE) {
+	// 	SPDK_NOTICELOG("FDP write cmd: cdw13=0x%x, lba=%lu, lba_count=%u\n",
+	// 		       cdw13, lba, lba_count);
+	// }
 
 	cmd->cdw15 = apptag_mask;
 	cmd->cdw15 = (cmd->cdw15 << 16 | apptag);
@@ -731,7 +731,7 @@ nvme_ns_cmd_rw_ext(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, void 
 	payload.opts = opts;
 
 	req = _nvme_ns_cmd_rw(ns, qpair, &payload, 0, 0, lba, lba_count, cb_fn, cb_arg, opc, opts->io_flags,
-			      opts->apptag_mask, opts->apptag, 0, false, seq, &rc);
+			      opts->apptag_mask, opts->apptag, opts->cdw13, false, seq, &rc);
 	if (spdk_unlikely(req == NULL)) {
 		return nvme_ns_map_failure_rc(lba_count,
 					      ns->sectors_per_max_io,
