@@ -253,7 +253,7 @@ class SpdkCacheDevice;
 
 // Global device command queue depth limiting
 // Disabled: mqes=1023 is large enough, no throttling needed
-static constexpr uint32_t MAX_OUTSTANDING_CMDS = UINT32_MAX;
+static constexpr uint32_t MAX_OUTSTANDING_CMDS = 192;
 static std::atomic<uint32_t> g_outstanding_cmds{0};
 
 struct GlobalPendingWrite {
@@ -2341,7 +2341,9 @@ public:
 		}
 
 		// Create IStream policy for stream separation (same as icache.cpp)
-		set_stream_interval(static_cast<uint64_t>(cache_block_count));
+		// Align interval to segment boundary for proper FDP handle pingpong
+		uint64_t segment_size_blocks = segment_capacity_bytes_ / block_size;
+		set_stream_interval(static_cast<uint64_t>(cache_block_count), segment_size_blocks);
 		IStream *input_stream_policy = createIstreamPolicy(istream_policy_name);
 
 		SPDK_NOTICELOG("LogCacheAsync: cache_type=%s, valid_rate=%.2f, has_compactor=%d, istream=%p\n",
@@ -2397,6 +2399,9 @@ public:
 	bool evict_in_progress() const { return evict_in_progress_; }
 	void set_gc_in_progress(bool v) { gc_in_progress_ = v; }
 	void set_evict_in_progress(bool v) { evict_in_progress_ = v; }
+
+	// Host write placement handle (toggle between 0 and 1) - delegated to LogCache
+	int get_host_write_handle() const { return cache_->get_host_write_handle(); }
 
 	// Pending writes waiting for GC/Evict
 	std::list<CacheIo*>& pending_writes() { return pending_writes_; }
@@ -2557,6 +2562,7 @@ private:
 	bool gc_in_progress_;
 	bool evict_in_progress_;
 	std::list<CacheIo*> pending_writes_;
+	// host_write_handle_ moved to LogCache for proper toggle timing
 	uint64_t zone_size_bytes_;
 	uint64_t segment_capacity_bytes_;  // zone_capacity * stripe_width
 
@@ -2860,8 +2866,9 @@ void LogCacheAsync::flush_write_buffer()
 		auto &blk = write_buffer_[i];
 		uint64_t cache_offset;
 		int stream_id = 0;
+		bool segment_full = false;
 		if (!cache_->append_block_metadata(0, static_cast<long>(blk.key),
-						   static_cast<int>(block_size), &cache_offset, &stream_id)) {
+						   static_cast<int>(block_size), &cache_offset, &stream_id, &segment_full)) {
 			// No free segments - need GC/Evict
 			if (flush_block_count == 0) {
 				block_start_tsc = spdk_get_ticks();
@@ -2875,6 +2882,7 @@ void LogCacheAsync::flush_write_buffer()
 			flush_pending_ = true;
 			break;  // Exit loop, but continue to write successful blocks
 		}
+		// Note: toggle is now done inside append_block_metadata when segment becomes full
 		flush_ctx->cache_offsets.push_back(cache_offset);
 		flush_ctx->stream_ids.push_back(stream_id);
 		flush_ctx->keys.push_back(static_cast<long>(blk.key));
@@ -3006,8 +3014,8 @@ void LogCacheAsync::flush_write_buffer()
 
 		// Create zone write context
 		size_t group_len = group.count * block_size;
-		// Host write always uses placement handle 0
-		int placement_handle = 0;
+		// Use the stream_id recorded per-block (host_write_handle at append time)
+		int placement_handle = group.stream_id;
 		auto *zctx = new (std::nothrow) ZoneWriteCtx{flush_ctx, iovs, static_cast<int>(group.count), group_len, placement_handle};
 		if (!zctx) {
 			free(iovs);
@@ -3502,8 +3510,9 @@ static void host_write_next_block(CacheIo *io)
 		// Direct write path - bypass buffer
 		uint64_t cache_offset;
 		int stream_id = 0;
+		bool segment_full = false;
 		if (!cache->cache()->append_block_metadata(0, static_cast<long>(key),
-							   static_cast<int>(block_size), &cache_offset, &stream_id)) {
+							   static_cast<int>(block_size), &cache_offset, &stream_id, &segment_full)) {
 			// No free segments - check if we should block or just trigger GC
 			size_t critical = cache->is_free_critical();
 
@@ -3531,6 +3540,7 @@ static void host_write_next_block(CacheIo *io)
 			cache_io_complete(io, -ENOSPC);
 			return;
 		}
+		// Note: toggle is now done inside append_block_metadata when segment becomes full
 		// Not critical but low - trigger GC in background and return error
 		if (!cache->gc_in_progress() && !cache->evict_in_progress()) {
 			start_gc_or_evict(ctx, nullptr);
@@ -3539,8 +3549,8 @@ static void host_write_next_block(CacheIo *io)
 		// Track host write for WAF
 		cache->add_host_write_bytes(block_size);
 
-		// Host write always uses placement handle 0
-		int placement_handle = 0;
+		// Use the stream_id returned from append_block_metadata (host_write_handle at append time)
+		int placement_handle = stream_id;
 
 		// Issue async write with FDP placement handle using writev
 		struct iovec iov;
@@ -3951,8 +3961,8 @@ static void gc_start_writes(GcIo *io)
 
 		if (crosses_stripe) {
 			// Stripe boundary crossed - write each block individually
-			// GC uses placement handles 1~6 (host uses 0)
-			int gc_placement_handle = 1 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 1));
+			// GC uses placement handles 2~6 (host uses 0, 1)
+			int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
 			for (size_t i = 0; i < GcIo::BLOCKS_PER_64K; ++i) {
 				size_t block_idx = first_block_idx + i;
 				uint8_t *src = static_cast<uint8_t*>(io->staging) + (chunk_start + i) * block_size;
@@ -4018,8 +4028,8 @@ static void gc_start_writes(GcIo *io)
 		}
 
 		// 64KB scatter-gather write with FDP placement handle
-		// GC uses placement handles 1~6 (host uses 0)
-		int gc_placement_handle = 1 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 1));
+		// GC uses placement handles 2~6 (host uses 0, 1)
+		int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
 		int rc = io->ctx->device->writev_cache_async(first_dst_offset, iovs, GcIo::BLOCKS_PER_64K,
 							     GcIo::BLOCKS_PER_64K * block_size,
 							     gc_write_done, write_ctx, gc_placement_handle);
@@ -4089,7 +4099,8 @@ static void gc_submit_next_leftover(GcIo *io)
 	}
 
 	// 4KB sequential write with GC placement handle
-	int gc_placement_handle = 1 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 1));
+	// GC uses placement handles 2~6 (host uses 0, 1)
+	int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
 	int rc = io->ctx->device->writev_cache_async(blk.dst_offset, single_iov, 1, block_size,
 	                                             gc_write_done, write_ctx, gc_placement_handle);
 	if (rc == 0) {
@@ -4371,7 +4382,8 @@ static void gc_dispatch_writes(GcIo *io)
 		}
 
 		// Use writev_cache_async to respect global outstanding cmd limit
-		int gc_placement_handle = 1 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 1));
+		// GC uses placement handles 2~6 (host uses 0, 1)
+		int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
 		int rc = io->ctx->device->writev_cache_async(w.dst_offset, iov, 1, w.block_size,
 							     gc_seq_write_done, write_ctx, gc_placement_handle);
 		if (rc == 0) {

@@ -153,8 +153,9 @@ public:
     void complete_segment_reset(LogCacheSegment *seg);  // Called by async callback
     // Append block metadata only, returns cache offset for async write
     // out_stream_id: optional output for the actual stream_id assigned (for FDP placement handle)
+    // out_segment_full: optional output, set to true if segment became full after this write
     // Adds key to pending_writes_; call complete_block_write() after write completes
-    bool append_block_metadata(int stream_id, long key, int lba_sz, uint64_t *cache_offset, int *out_stream_id = nullptr);
+    bool append_block_metadata(int stream_id, long key, int lba_sz, uint64_t *cache_offset, int *out_stream_id = nullptr, bool *out_segment_full = nullptr);
     // Mark block write as complete (removes from pending_writes_)
     void complete_block_write(long key);
     void complete_block_writes(const std::vector<long>& keys);  // batch version
@@ -188,6 +189,10 @@ public:
     // Free segment count for watermark checks
     size_t free_segment_count() const { return free_pool.size(); }
 
+    // Host write handle for FDP placement (0 or 1, toggled on segment full)
+    int get_host_write_handle() const { return host_write_handle_; }
+    void toggle_host_write_handle() { host_write_handle_ = 1 - host_write_handle_; }
+
     // Stats getters for StatsLogger
     uint64_t get_valid_blocks() const { return global_valid_blocks; }
     uint64_t get_write_hit_count() const { return write_hit_size; }
@@ -215,6 +220,7 @@ private:
     std::unique_ptr<EvictPolicy> evictor;
     CacheDeviceInterface *device_io_ = nullptr;
     bool async_mode_ = false;  // When true, sync eviction is disabled
+    int host_write_handle_ = 0;  // Toggle between 0 and 1 for host writes (FDP)
 
     LogCacheSegment* alloc_segment(bool shrink = true);
     void             evict_segment(LogCacheSegment* s);

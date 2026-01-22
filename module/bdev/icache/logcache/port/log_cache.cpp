@@ -379,7 +379,7 @@ void LogCache::append_block(int stream_id, long key, int lba_sz, const void *pay
     }
 }
 
-bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64_t *cache_offset, int *out_stream_id)
+bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64_t *cache_offset, int *out_stream_id, bool *out_segment_full)
 {
     periodic();
     ghost_cache.access(key);
@@ -398,6 +398,8 @@ bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64
         evict_policy_add(seg);
         int assigned_class_num = seg->get_class_num();
         active_seg.erase(seg->get_class_num());
+        // Use assigned_class_num to maintain stream policy classification
+        // host_write_handle_ (0,1) is separate from class_num (stream policy)
         seg = get_segment_to_active_stream(false, assigned_class_num);
         if (!seg) {
             return false;
@@ -427,19 +429,27 @@ bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64
     if (stream_policy) {
         stream_policy->Append(key, log_cache_timestamp, reinterpret_cast<void*>(seg->valid_cnt));
     }
+    
     write_size_to_cache += lba_sz;
 
     *cache_offset = dst_offset;
-    // Return the actual stream_id (segment's class_num) for FDP placement handle
+    // Return the current host_write_handle for FDP placement
+    // (this block will be written with this handle)
     if (out_stream_id) {
-        *out_stream_id = seg->get_class_num();
+        *out_stream_id = host_write_handle_;
     }
 
     // Check if segment became full after this write - add to evictor immediately
     // This prevents full segments from staying in active_seg when next write goes to different stream
-    if (seg->full()) {
+    bool segment_full = seg->full();
+    if (segment_full) {
         evict_policy_add(seg);
         active_seg.erase(seg->get_class_num());
+        // Toggle for next block (after segment full)
+        toggle_host_write_handle();
+    }
+    if (out_segment_full) {
+        *out_segment_full = segment_full;
     }
 
     return true;

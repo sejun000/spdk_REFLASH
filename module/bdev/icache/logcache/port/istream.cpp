@@ -9,13 +9,21 @@
 
 uint64_t interval = 1;
 namespace {
-constexpr int kMultiHotColdStreams = 6;
+constexpr int kMultiHotColdStreams = 5;
 }
 
-void set_stream_interval(uint64_t cache_block_count) {
-    uint64_t computed = cache_block_count / 4;
+void set_stream_interval(uint64_t cache_block_count, uint64_t segment_size_blocks) {
+    uint64_t computed = (uint64_t)(cache_block_count / (3.5));
     if (computed == 0) {
         computed = 1;
+    }
+    // Align interval to segment boundary if segment_size_blocks is specified
+    if (segment_size_blocks > 0) {
+        // Round up to nearest segment boundary
+        computed = ((computed + segment_size_blocks - 1) / segment_size_blocks) * segment_size_blocks;
+        if (computed == 0) {
+            computed = segment_size_blocks;
+        }
     }
     interval = computed;
 }
