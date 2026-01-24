@@ -345,7 +345,16 @@ connect_nvmf() {
     fi
 
     log "Connecting to NVMe-oF target..."
-    sudo nvme connect -t "${NVMF_TRTYPE}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" -n "${NVMF_SUBSYSTEM}" -k 60 || true
+    if sudo nvme connect -t "${NVMF_TRTYPE}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" -n "${NVMF_SUBSYSTEM}" -k 120 --ctrl-loss-tmo=120; then
+        # Set I/O timeout to 120 seconds (default 30s)
+        sleep 1
+        for dev in /sys/class/nvme/nvme*/io_timeout; do
+            if [[ -w "$dev" ]]; then
+                echo 120 | sudo tee "$dev" > /dev/null 2>&1 || true
+            fi
+        done
+        log "I/O timeout set to 120 seconds"
+    fi
 
     sleep 2
 

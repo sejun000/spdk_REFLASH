@@ -486,6 +486,11 @@ async_io_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		drain_global_pending_reads();
 		drain_global_pending_writes();
 	}
+	// Cache write completion: also trigger drain (NVMe queue slot freed)
+	if (ctx->is_cache && !ctx->is_read) {
+		drain_global_pending_reads();
+		drain_global_pending_writes();
+	}
 	if (ctx->user_cb) {
 		ctx->user_cb(ctx->user_cb_arg, status);
 	}
@@ -1511,6 +1516,8 @@ private:
 			SPDK_ERRLOG("zone_async_io_completion: g_outstanding_cmds underflow!\n");
 		}
 
+		// Drain pending reads and writes (NVMe queue slot freed)
+
 		int status = success ? 0 : -EIO;
 		if (!success) {
 			SPDK_ERRLOG("zone_async_io_completion: IO failed! zone_id=%lu, io_offset=%lu\n", zone_id, io_offset);
@@ -1536,6 +1543,7 @@ private:
 		}
 
 		// Drain global pending writes if any
+		drain_global_pending_reads();
 		drain_global_pending_writes();
 	}
 

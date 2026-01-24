@@ -576,14 +576,32 @@ ftl_chunk_free_chunk_free_entry(struct ftl_nv_cache_chunk *chunk)
 	p2l_map->chunk_dma_md = NULL;
 }
 
-/* Fire-and-forget TRIM completion callback */
+/* TRIM completion callback - add chunk to free list after TRIM completes */
 static void
 chunk_trim_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 {
+	struct ftl_nv_cache_chunk *chunk = (struct ftl_nv_cache_chunk *)cb_arg;
+	struct ftl_nv_cache *nv_cache = chunk->nv_cache;
+	struct spdk_ftl_dev *dev = SPDK_CONTAINEROF(nv_cache, struct spdk_ftl_dev, nv_cache);
+
 	if (bdev_io) {
 		spdk_bdev_free_io(bdev_io);
 	}
-	/* Fire and forget - no action needed */
+
+	if (!success) {
+		FTL_ERRLOG(dev, "TRIM failed for chunk offset %"PRIu64"\n", chunk->offset);
+	}
+
+	FTL_NOTICELOG(dev, "TRIM complete: chunk_offset=%"PRIu64", success=%d, free_count=%"PRIu64"->%"PRIu64"\n",
+		      chunk->offset, success, nv_cache->chunk_free_count, nv_cache->chunk_free_count + 1);
+
+	/* Now safe to add chunk to free list after TRIM completes */
+	TAILQ_INSERT_TAIL(&nv_cache->chunk_free_list, chunk, entry);
+	nv_cache->chunk_free_count++;
+	nv_cache->chunk_full_count--;
+	chunk->md->state = FTL_CHUNK_STATE_FREE;
+	chunk->md->close_seq_id = 0;
+	ftl_chunk_free_chunk_free_entry(chunk);
 }
 
 static void
@@ -593,19 +611,28 @@ chunk_free_cb(int status, void *ctx)
 
 	if (spdk_likely(!status)) {
 		struct ftl_nv_cache *nv_cache = chunk->nv_cache;
+		struct spdk_ftl_dev *dev = SPDK_CONTAINEROF(nv_cache, struct spdk_ftl_dev, nv_cache);
+		int rc;
 
 		nv_cache->chunk_free_persist_count--;
-		TAILQ_INSERT_TAIL(&nv_cache->chunk_free_list, chunk, entry);
-		nv_cache->chunk_free_count++;
-		nv_cache->chunk_full_count--;
-		chunk->md->state = FTL_CHUNK_STATE_FREE;
-		chunk->md->close_seq_id = 0;
-		ftl_chunk_free_chunk_free_entry(chunk);
 
-		/* Fire-and-forget TRIM to backend device */
-		spdk_bdev_unmap_blocks(nv_cache->bdev_desc, nv_cache->cache_ioch,
-				       chunk->offset, nv_cache->chunk_blocks,
-				       chunk_trim_cb, NULL);
+		/* Send TRIM to backend device, chunk will be added to free list on completion */
+		FTL_NOTICELOG(dev, "TRIM submit: chunk_offset=%"PRIu64", blocks=%"PRIu64", free_count=%"PRIu64", full_count=%"PRIu64"\n",
+			      chunk->offset, nv_cache->chunk_blocks,
+			      nv_cache->chunk_free_count, nv_cache->chunk_full_count);
+		rc = spdk_bdev_unmap_blocks(nv_cache->bdev_desc, nv_cache->cache_ioch,
+					    chunk->offset, nv_cache->chunk_blocks,
+					    chunk_trim_cb, chunk);
+		if (spdk_unlikely(rc != 0)) {
+			/* TRIM submission failed, add chunk to free list directly */
+			FTL_ERRLOG(dev, "TRIM submit failed rc=%d, adding chunk directly\n", rc);
+			TAILQ_INSERT_TAIL(&nv_cache->chunk_free_list, chunk, entry);
+			nv_cache->chunk_free_count++;
+			nv_cache->chunk_full_count--;
+			chunk->md->state = FTL_CHUNK_STATE_FREE;
+			chunk->md->close_seq_id = 0;
+			ftl_chunk_free_chunk_free_entry(chunk);
+		}
 	} else {
 #ifdef SPDK_FTL_RETRY_ON_ERROR
 		ftl_md_persist_entry_retry(&chunk->md_persist_entry_ctx);

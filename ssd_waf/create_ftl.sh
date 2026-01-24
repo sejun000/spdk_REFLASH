@@ -103,7 +103,7 @@ rpc_call "create FTL ${FTL_NAME}" \
     --base-bdev "${BACKEND_NS}" \
     --cache "${CACHE_BDEV}" \
     --overprovisioning "${FTL_OVERPROV}" \
-    --l2p-dram-limit "${FTL_L2P_DRAM}"
+    --l2p-dram-limit "${FTL_L2P_DRAM}" 
 
 # Track if device exposure succeeded
 DEVICE_EXPOSED=0

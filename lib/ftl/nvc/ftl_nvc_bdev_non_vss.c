@@ -8,6 +8,7 @@
 #include "ftl_nv_cache.h"
 #include "mngt/ftl_mngt.h"
 #include "ftl_nvc_bdev_common.h"
+#include "ftl_nv_cache_io.h"
 
 static void write_io(struct ftl_io *io);
 static void p2l_log_cb(struct ftl_io *io);
@@ -94,11 +95,24 @@ write_io(struct ftl_io *io)
 	struct spdk_ftl_dev *dev = io->dev;
 	struct ftl_nv_cache *nv_cache = &dev->nv_cache;
 	int rc;
+#if FTL_FDP_METADATA_ENABLED
+	struct spdk_bdev_ext_io_opts opts = {};
 
+	/* Use FDP handle 0 for user data writes */
+	opts.size = sizeof(opts);
+	opts.nvme_cdw12.write.dtype = 2;  /* Directive Type = FDP */
+	opts.nvme_cdw13.write.dspec = FTL_FDP_HANDLE_USER_DATA;  /* Handle 0 for user data */
+
+	rc = spdk_bdev_writev_blocks_ext(nv_cache->bdev_desc, nv_cache->cache_ioch,
+					 io->iov, io->iov_cnt,
+					 ftl_addr_to_nvc_offset(dev, io->addr), io->num_blocks,
+					 write_io_cb, io, &opts);
+#else
 	rc = spdk_bdev_writev_blocks(nv_cache->bdev_desc, nv_cache->cache_ioch,
 				     io->iov, io->iov_cnt,
 				     ftl_addr_to_nvc_offset(dev, io->addr), io->num_blocks,
 				     write_io_cb, io);
+#endif
 	if (spdk_unlikely(rc)) {
 		if (rc == -ENOMEM) {
 			struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(nv_cache->bdev_desc);

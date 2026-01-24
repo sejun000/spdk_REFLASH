@@ -573,7 +573,7 @@ LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key,
 {
     LogCacheSegment *seg = nullptr;
     uint64_t previous_blk_create_timestamp = log_cache_timestamp;  // Default to current timestamp for new keys
-    if (exists(key))
+    if (gc && exists(key))
     {
         auto loc = mapping[key];
         assert(loc.seg != nullptr);
@@ -762,13 +762,7 @@ bool LogCache::is_cache_filled() {
         static_cast<std::size_t>(std::ceil(total_segments *
                                            cfg_.free_ratio_low));
 
-    // In async mode, trigger GC early
-#if FDP
-    constexpr size_t ASYNC_GC_TRIGGER_SEGMENTS = 50;  // FDP: smaller segments, trigger earlier
-#else
-    constexpr size_t ASYNC_GC_TRIGGER_SEGMENTS = 10;
-#endif
-    if (async_mode_ && free_pool.size() <= ASYNC_GC_TRIGGER_SEGMENTS) {
+    if (async_mode_ && free_pool.size() <= LOW_FREE_SEGMENTS) {
         return true;
     }
 
@@ -1090,19 +1084,15 @@ bool LogCache::need_gc_or_evict() const
     // In async mode, trigger GC early (before blocking host IO)
     // GC_TRIGGER: start GC while host IO continues
     // BLOCK threshold (in get_free_segment): stop host IO
-#if FDP
-    constexpr size_t ASYNC_GC_TRIGGER_SEGMENTS = 50;  // FDP: smaller segments, trigger earlier
-#else
-    constexpr size_t ASYNC_GC_TRIGGER_SEGMENTS = 10;  // Start GC at <= 10 free segments
-#endif
-    if (async_mode_ && free_pool.size() <= ASYNC_GC_TRIGGER_SEGMENTS) {
+
+    if (async_mode_ && free_pool.size() <= LOW_FREE_SEGMENTS) {
         // Don't trigger GC if evictor is empty (nothing to evict)
         if (evictor->empty()) {
             return false;
         }
         static uint64_t gc_trigger_count = 0;
         if (++gc_trigger_count % 1000 == 1) {
-            SPDK_NOTICELOG("GC triggered! free_pool=%zu <= %zu\n", free_pool.size(), ASYNC_GC_TRIGGER_SEGMENTS);
+            SPDK_NOTICELOG("GC triggered! free_pool=%zu <= %zu\n", free_pool.size(), LOW_FREE_SEGMENTS);
         }
         return true;
     }

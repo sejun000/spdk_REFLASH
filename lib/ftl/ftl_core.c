@@ -141,6 +141,11 @@ ftl_invalidate_addr(struct spdk_ftl_dev *dev, ftl_addr addr)
 	struct ftl_band *band;
 	struct ftl_p2l_map *p2l_map;
 
+	/* Skip invalid addresses - addr 0 can occur when L2P entry was never written */
+	if (addr == FTL_ADDR_INVALID || addr == 0) {
+		return;
+	}
+
 	if (ftl_addr_in_nvc(dev, addr)) {
 		ftl_bitmap_clear(dev->valid_map, addr);
 		return;

@@ -102,6 +102,10 @@ static const struct ftl_mngt_process_desc desc_startup = {
 			.action = ftl_mngt_scrub_nv_cache,
 		},
 		{
+			.name = "TRIM NV cache",
+			.action = ftl_mngt_trim_nv_cache,
+		},
+		{
 			.name = "Initialize metadata",
 			.action = ftl_mngt_init_md,
 			.cleanup = ftl_mngt_deinit_md

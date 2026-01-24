@@ -67,6 +67,8 @@ void ftl_mngt_restore_l2p(struct spdk_ftl_dev *dev, struct ftl_mngt_process *mng
 
 void ftl_mngt_scrub_nv_cache(struct spdk_ftl_dev *dev, struct ftl_mngt_process *mngt);
 
+void ftl_mngt_trim_nv_cache(struct spdk_ftl_dev *dev, struct ftl_mngt_process *mngt);
+
 void ftl_mngt_finalize_init_bands(struct spdk_ftl_dev *dev, struct ftl_mngt_process *mngt);
 
 void ftl_mngt_finalize_startup(struct spdk_ftl_dev *dev, struct ftl_mngt_process *mngt);

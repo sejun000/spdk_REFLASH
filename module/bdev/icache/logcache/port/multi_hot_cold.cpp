@@ -15,56 +15,35 @@ int MultiHotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_
     if (mCheckCreatedTimestampOnly) {
         time_diff = created_timestamp;
     }
-    int gc_stream_id = time_diff / mTimestampGranularity;
-    if (!isGcAppend) {
-        if (mClassifyForHostAppend) {
-            if (!mClassifyForGcAppend) {
-                if (created_timestamp == UINT64_MAX) {
-                    return 1;
-                }
-                if ((global_timestamp - created_timestamp) < g_threshold * 0.3) {
-                    return 0;
-                }
-                return 1;
-            }
-        }
-        else {
-            return 0;
-        }
-    }
-    else {
-        if (!mClassifyForGcAppend) {
-            return Segment::GC_STREAM_START;
-        }
-    }
-    if (gc_stream_id >= mMaxGcStreams) {
+    int stream_id = time_diff / mTimestampGranularity;
+    if (stream_id >= mMaxGcStreams) {
         if (mCheckCreatedTimestampOnly)
         {
-            gc_stream_id = gc_stream_id % mMaxGcStreams;
+            stream_id = stream_id % mMaxGcStreams;
         }
         else 
         {
-            gc_stream_id = mMaxGcStreams - 1; // Limit to max GC streams
+            stream_id = mMaxGcStreams - 1; // Limit to max GC streams
         }
     }
     // Implement classification logic here
     // For now, we return 0 as a placeholder
-    auto it = oldest_timestamp_map.find(gc_stream_id);
+    auto it = oldest_timestamp_map.find(stream_id);
     if (it == oldest_timestamp_map.end()) {
         // If found, use the stored timestamp
-        oldest_timestamp_map[gc_stream_id] = created_timestamp;
+        oldest_timestamp_map[stream_id] = created_timestamp;
     }
-    else if (oldest_timestamp_map[gc_stream_id] ) {
+    else if (oldest_timestamp_map[stream_id] ) {
         // If not found, update the timestamp
         if (created_timestamp < it->second) {
-            oldest_timestamp_map[gc_stream_id] = created_timestamp;
+            oldest_timestamp_map[stream_id] = created_timestamp;
         }
     }
     else {
         // If not found, initialize it
-        oldest_timestamp_map[gc_stream_id] = created_timestamp;
+        oldest_timestamp_map[stream_id] = created_timestamp;
     }
-    return gc_stream_id + Segment::GC_STREAM_START;
+    return stream_id + Segment::GC_STREAM_START;
 }
 
 int MultiHotCold::GetVictimStreamId(uint64_t global_timestamp, uint64_t threshold) {

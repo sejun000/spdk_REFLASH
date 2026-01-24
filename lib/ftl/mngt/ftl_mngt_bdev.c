@@ -29,7 +29,7 @@ ftl_calculate_num_blocks_in_band(struct spdk_bdev_desc *desc)
 #ifdef SPDK_FTL_ZONE_EMU_BLOCKS
 	return SPDK_FTL_ZONE_EMU_BLOCKS;
 #else
-	return (2ULL << 30) / FTL_BLOCK_SIZE;
+	return (1ULL << 30) / FTL_BLOCK_SIZE;
 #endif
 }
 

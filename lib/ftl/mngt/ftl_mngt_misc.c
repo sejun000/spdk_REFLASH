@@ -178,6 +178,54 @@ ftl_mngt_scrub_nv_cache(struct spdk_ftl_dev *dev, struct ftl_mngt_process *mngt)
 	}
 }
 
+static void
+nvc_trim_cb(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct ftl_mngt_process *mngt = cb_arg;
+	struct spdk_ftl_dev *dev = ftl_mngt_get_dev(mngt);
+
+	spdk_bdev_free_io(bdev_io);
+
+	if (success) {
+		FTL_NOTICELOG(dev, "NV cache TRIM completed successfully\n");
+		ftl_mngt_next_step(mngt);
+	} else {
+		FTL_ERRLOG(dev, "NV cache TRIM failed\n");
+		ftl_mngt_fail_step(mngt);
+	}
+}
+
+void
+ftl_mngt_trim_nv_cache(struct spdk_ftl_dev *dev, struct ftl_mngt_process *mngt)
+{
+	struct ftl_nv_cache *nv_cache = &dev->nv_cache;
+	struct spdk_bdev *bdev;
+	uint64_t total_blocks;
+	int rc;
+	bool is_first_start = (dev->conf.mode & SPDK_FTL_MODE_CREATE) != 0;
+	bool is_major_upgrade = dev->sb->clean == 1 && dev->sb_shm->shm_clean == 0 &&
+				dev->sb->upgrade_ready == 1;
+
+	if (is_first_start || is_major_upgrade) {
+		/* TRIM entire bdev */
+		bdev = spdk_bdev_desc_get_bdev(nv_cache->bdev_desc);
+		total_blocks = spdk_bdev_get_num_blocks(bdev);
+
+		FTL_NOTICELOG(dev, "Sending TRIM to entire NV cache bdev: offset=0, blocks=%"PRIu64"\n",
+			      total_blocks);
+
+		rc = spdk_bdev_unmap_blocks(nv_cache->bdev_desc, nv_cache->cache_ioch,
+					    0, total_blocks, nvc_trim_cb, mngt);
+		if (rc) {
+			FTL_ERRLOG(dev, "Failed to submit NV cache TRIM, rc=%d\n", rc);
+			/* Don't fail - TRIM is optional, continue with startup */
+			ftl_mngt_next_step(mngt);
+		}
+	} else {
+		ftl_mngt_skip_step(mngt);
+	}
+}
+
 void
 ftl_mngt_finalize_startup(struct spdk_ftl_dev *dev, struct ftl_mngt_process *mngt)
 {

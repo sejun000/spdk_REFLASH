@@ -290,8 +290,16 @@ connect_nvmeof() {
     fi
 
     log "Connecting host NVMe controller (trtype=${NVMF_TRTYPE}, addr=${NVMF_TRADDR}, port=${NVMF_TRSVCID}, nqn=${NVMF_SUBSYSTEM})"
-    if sudo nvme connect -t "${NVMF_TRTYPE}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" -n "${NVMF_SUBSYSTEM}" -k 60; then
+    if sudo nvme connect -t "${NVMF_TRTYPE}" -a "${NVMF_TRADDR}" -s "${NVMF_TRSVCID}" -n "${NVMF_SUBSYSTEM}" -k 120 --ctrl-loss-tmo=120; then
         log "nvme connect succeeded"
+        # Set I/O timeout to 120 seconds (default 30s)
+        sleep 1
+        for dev in /sys/class/nvme/nvme*/io_timeout; do
+            if [[ -w "$dev" ]]; then
+                echo 120 | sudo tee "$dev" > /dev/null 2>&1 || true
+            fi
+        done
+        log "I/O timeout set to 120 seconds"
     else
         log "nvme connect failed (might already be connected); continuing"
     fi

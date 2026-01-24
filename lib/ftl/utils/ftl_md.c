@@ -514,13 +514,14 @@ write_blocks(struct spdk_ftl_dev *dev, struct spdk_bdev_desc *desc,
 	     struct spdk_io_channel *ch,
 	     void *buf, void *md_buf,
 	     uint64_t offset_blocks, uint64_t num_blocks,
-	     spdk_bdev_io_completion_cb cb, void *cb_arg)
+	     spdk_bdev_io_completion_cb cb, void *cb_arg,
+	     struct iovec *iov, uint16_t fdp_handle)
 {
 	if (desc == dev->nv_cache.bdev_desc) {
-		/* Use FDP placement handle for metadata writes to NV cache */
+		/* Use FDP placement handle for writes to NV cache */
 		return ftl_nv_cache_bdev_write_blocks_with_md_fdp(desc, ch, buf, md_buf,
 				offset_blocks, num_blocks,
-				cb, cb_arg, FTL_FDP_HANDLE_METADATA);
+				cb, cb_arg, fdp_handle, iov);
 	} else if (md_buf) {
 		return spdk_bdev_write_blocks_with_md(desc, ch, buf, md_buf, offset_blocks,
 						      num_blocks, cb, cb_arg);
@@ -535,9 +536,14 @@ read_write_blocks(void *_md)
 	struct ftl_md *md = _md;
 	const struct ftl_layout_region *region = md->region;
 	uint64_t blocks;
+	uint16_t fdp_handle;
 	int rc = 0;
 
 	blocks = spdk_min(md->io.remaining, ftl_md_xfer_blocks(md->dev));
+
+	/* DATA_NVC (scrub) uses user data handle, other regions use metadata handle */
+	fdp_handle = (region->type == FTL_LAYOUT_REGION_TYPE_DATA_NVC) ?
+		     FTL_FDP_HANDLE_USER_DATA : FTL_FDP_HANDLE_METADATA;
 
 	switch (md->io.op) {
 	case FTL_MD_OP_RESTORE:
@@ -551,7 +557,7 @@ read_write_blocks(void *_md)
 		rc = write_blocks(md->dev, region->bdev_desc, region->ioch,
 				  md->io.data, md->io.md,
 				  md->io.address, blocks,
-				  read_write_blocks_cb, md);
+				  read_write_blocks_cb, md, &md->io.iov, fdp_handle);
 		break;
 	default:
 		ftl_abort();
@@ -698,12 +704,17 @@ static int
 ftl_md_persist_entry_write_blocks(struct ftl_md_io_entry_ctx *ctx, struct ftl_md *md,
 				  spdk_bdev_io_wait_cb retry_fn)
 {
+	uint16_t fdp_handle;
 	int rc;
+
+	/* DATA_NVC uses user data handle, other regions use metadata handle */
+	fdp_handle = (md->region->type == FTL_LAYOUT_REGION_TYPE_DATA_NVC) ?
+		     FTL_FDP_HANDLE_USER_DATA : FTL_FDP_HANDLE_METADATA;
 
 	rc = write_blocks(md->dev, md->region->bdev_desc, md->region->ioch,
 			  ctx->buffer, ctx->vss_buffer,
 			  persist_entry_lba(md, ctx->start_entry), md->region->entry_size * ctx->num_entries,
-			  persist_entry_cb, ctx);
+			  persist_entry_cb, ctx, &ctx->iov, fdp_handle);
 	if (spdk_unlikely(rc)) {
 		if (rc == -ENOMEM) {
 			struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(md->region->bdev_desc);

@@ -68,6 +68,7 @@ struct ftl_md {
 		int status;
 		enum ftl_md_ops op;
 		struct spdk_bdev_io_wait_entry bdev_io_wait;
+		struct iovec iov;  /* For FDP ext I/O - must persist until I/O completes */
 	} io;
 
 	/* SHM object file descriptor or -1 if heap alloc */
@@ -111,6 +112,7 @@ struct ftl_md_io_entry_ctx {
 	void *buffer;
 	void *vss_buffer;
 	struct spdk_bdev_io_wait_entry bdev_io_wait;
+	struct iovec iov;  /* For FDP ext I/O - must persist until I/O completes */
 };
 
 #define FTL_MD_VSS_SZ	64
