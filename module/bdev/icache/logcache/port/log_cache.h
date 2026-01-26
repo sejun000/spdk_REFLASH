@@ -48,8 +48,8 @@ struct Config
 static constexpr bool INCREMENTAL_GC_ENABLED = false;
 
 // Free segment thresholds for GC triggering
-static constexpr size_t CRITICAL_FREE_SEGMENTS = 5;   // Block host IO if <= this
-static constexpr size_t LOW_FREE_SEGMENTS = 15;       // Trigger GC if <= this
+static constexpr size_t CRITICAL_FREE_SEGMENTS = 2;   // Block host IO if <= this
+static constexpr size_t LOW_FREE_SEGMENTS = 8;       // Trigger GC if <= this
 
 class LogCache final : public ICache
 {
@@ -146,6 +146,7 @@ public:
     void evict(LogCacheSegment *seg, std::size_t idx);
     bool is_cache_filled() override;
     virtual void print_stats() override;
+    void print_histograms(bool reset = false);
     void print_objects(std::string prefix, uint64_t value);
     void invalidate(long key, int lba_sz);
     void reset_segment(LogCacheSegment *seg);

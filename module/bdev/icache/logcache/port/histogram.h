@@ -28,6 +28,12 @@ public:
      */
     void inc(uint64_t key, int inc = 1);
 
+    /**
+     * @brief 현재 히스토그램을 파일에 출력합니다 (주기적 출력용)
+     * @param reset true면 출력 후 카운트 초기화
+     */
+    void print_current(bool reset = false);
+
 private:
     std::string m_name; // 히스토그램 이름
     uint64_t m_granularity;

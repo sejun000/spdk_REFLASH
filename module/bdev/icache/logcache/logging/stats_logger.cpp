@@ -153,6 +153,15 @@ int StatsLogger::poller_fn(void *arg)
     // Log current stats
     self->log_stats();
 
+    // Check if histogram print is due (~60 seconds)
+    if (self->histogram_cb_) {
+        uint64_t now_us = spdk_get_ticks() * 1000000 / spdk_get_ticks_hz();
+        if (now_us - self->last_histogram_us_ >= self->histogram_interval_us_) {
+            self->histogram_cb_();
+            self->last_histogram_us_ = now_us;
+        }
+    }
+
     return SPDK_POLLER_BUSY;
 }
 

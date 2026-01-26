@@ -27,6 +27,8 @@ SKIP_PRE_FORMAT=${SKIP_PRE_FORMAT:-0}
 
 # FDP cache size: ~512GB (549,357,355,008 bytes = 25% of 2TB, aligned to 13079937024)
 export CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-256}
+# Backend split size (0 = use full capacity)
+export BACKEND_SPLIT_GB=${BACKEND_SPLIT_GB:-0}
 
 log() {
     echo "[run_tier_fdp] $*"
@@ -79,7 +81,11 @@ pre_format_devices() {
         echo "  Cache (FDP):   Not found at ${CACHE_BDF}"
     fi
     if [[ -n "$backend_dev" ]] && [[ -e "/dev/${backend_dev}" ]]; then
-        echo "  Backend:       /dev/${backend_dev}  [Format - Full capacity]"
+        if [[ "${BACKEND_SPLIT_GB}" -gt 0 ]]; then
+            echo "  Backend:       /dev/${backend_dev}  [Format - ${BACKEND_SPLIT_GB}GB limit]"
+        else
+            echo "  Backend:       /dev/${backend_dev}  [Format - Full capacity]"
+        fi
     else
         echo "  Backend:       Not found at ${BACKEND_BDF}"
     fi

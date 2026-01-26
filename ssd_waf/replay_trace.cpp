@@ -48,7 +48,7 @@ constexpr int IO_BLOCK_SIZE = 4096;
 constexpr int MAX_IO_SIZE = 1024 * 1024;  // 1MB
 constexpr uint64_t MAX_PENDING_BYTES = 1 * 1024 * 1024;  // 1MB total pending limit
 constexpr int REPORT_INTERVAL = 100000;
-constexpr double DEFAULT_MAX_TB = 8.0;
+constexpr double DEFAULT_MAX_TB = 4.0;
 constexpr const char* DEFAULT_TRACE = "/home/sejun000/alibaba_dwpd1.trace.head30p";
 
 // Global state

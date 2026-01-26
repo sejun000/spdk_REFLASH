@@ -17,6 +17,8 @@ BACKEND_NS=${BACKEND_NS:-${BACKEND_CTRL}n1}
 
 # FDP cache size: ~512GB (passed from run_tier_fdp.sh, 549,357,355,008 bytes aligned)
 CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-512}
+# Backend split size (0 = use full capacity)
+BACKEND_SPLIT_GB=${BACKEND_SPLIT_GB:-0}
 
 MAX_PENDING_IO=${MAX_PENDING_IO:-64}
 ICACHE_NAME=${ICACHE_NAME:-icache0}
@@ -69,7 +71,11 @@ if (( CACHE_SPLIT_MB <= 0 )); then
     exit 1
 fi
 
-log "FDP Mode: Cache ${CACHE_SPLIT_GB}GB, Backend full capacity"
+if [[ "${BACKEND_SPLIT_GB}" -gt 0 ]]; then
+    log "FDP Mode: Cache ${CACHE_SPLIT_GB}GB, Backend ${BACKEND_SPLIT_GB}GB"
+else
+    log "FDP Mode: Cache ${CACHE_SPLIT_GB}GB, Backend full capacity"
+fi
 
 log "Attaching cache controller ${CACHE_CTRL} at ${CACHE_BDF}"
 if ! rpc_call "attach cache controller ${CACHE_CTRL}" \
@@ -100,21 +106,35 @@ else
     log "Using full namespace (CACHE_SPLIT_ENABLE=0)"
 fi
 
+# Split backend device if enabled
+if [[ "${BACKEND_SPLIT_GB}" -gt 0 ]]; then
+    BACKEND_SPLIT_MB=$((BACKEND_SPLIT_GB * 1024))
+    BACKEND_DEVICE="${BACKEND_NS}p0"
+    log "Splitting backend ${BACKEND_NS} to ${BACKEND_SPLIT_GB}GB (${BACKEND_SPLIT_MB} MB)"
+    if ! rpc_call "split backend bdev" \
+        bdev_split_create "${BACKEND_NS}" 1 -s "${BACKEND_SPLIT_MB}"; then
+        log "Split failed, using full namespace"
+        BACKEND_DEVICE="${BACKEND_NS}"
+    fi
+else
+    BACKEND_DEVICE="${BACKEND_NS}"
+fi
+
 cat <<MSG
 [create_tier_fdp] Done.
  Cache bdev (FDP) : ${CACHE_DEVICE}
- Backend bdev     : ${BACKEND_NS}
+ Backend bdev     : ${BACKEND_DEVICE}
  Max pending IO   : ${MAX_PENDING_IO}
  Cache policy     : ${ICACHE_CACHE_TYPE}
  WAF log path     : ${ICACHE_WAF_LOG}
-Creating icache bdev "${ICACHE_NAME}" (cache=${CACHE_DEVICE}, backend=${BACKEND_NS})
+Creating icache bdev "${ICACHE_NAME}" (cache=${CACHE_DEVICE}, backend=${BACKEND_DEVICE})
 MSG
 
 ICACHE_RPC_ARGS=(
 	bdev_icache_create
 	--name "${ICACHE_NAME}"
 	--cache-bdev "${CACHE_DEVICE}"
-	--backend-bdev "${BACKEND_NS}"
+	--backend-bdev "${BACKEND_DEVICE}"
 	--max-pending-io "${MAX_PENDING_IO}"
 	--cache-type "${ICACHE_CACHE_TYPE}"
 	--waf-log-path "${ICACHE_WAF_LOG}"

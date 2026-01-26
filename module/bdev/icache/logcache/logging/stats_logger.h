@@ -4,6 +4,7 @@
 #include <string>
 #include <atomic>
 #include <cstdio>
+#include <functional>
 
 extern "C" {
 #include "spdk/thread.h"
@@ -92,6 +93,9 @@ public:
     void add_gc_victim_blocks(uint64_t count) { stats_.gc_victim_blocks.fetch_add(count, std::memory_order_relaxed); }
     void add_evict_victim_blocks(uint64_t count) { stats_.evict_victim_blocks.fetch_add(count, std::memory_order_relaxed); }
 
+    // Set histogram print callback (called every ~60 seconds)
+    void set_histogram_callback(std::function<void()> cb) { histogram_cb_ = std::move(cb); }
+
     // Get current values
     uint64_t host_write_bytes() const { return stats_.host_write_bytes.load(std::memory_order_relaxed); }
     uint64_t cache_write_bytes() const { return stats_.cache_write_bytes.load(std::memory_order_relaxed); }
@@ -142,4 +146,9 @@ private:
     uint64_t nvme_media_written_ = 0;    // MBMW: Media Bytes with Metadata Written
     uint64_t prev_nvme_host_written_ = 0;
     uint64_t prev_nvme_media_written_ = 0;
+
+    // Histogram periodic print (every ~60 seconds)
+    std::function<void()> histogram_cb_;
+    uint64_t histogram_interval_us_ = 60000000;  // 60 seconds
+    uint64_t last_histogram_us_ = 0;
 };

@@ -15,7 +15,8 @@ BACKEND_BDF=${BACKEND_BDF:-0000:01:00.0}
 OCF_NAME=${OCF_NAME:-ocf0}
 OCF_MODE=${OCF_MODE:-wb}  # wb, wt, pt, wa, wi, wo
 OCF_CACHE_LINE_SIZE=${OCF_CACHE_LINE_SIZE:-4}  # 4, 8, 16, 32, 64 KiB
-CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-256}  # Split cache device to 500GB
+CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-256}  # Split cache device to 256GB
+BACKEND_SPLIT_GB=${BACKEND_SPLIT_GB:-0}  # Split backend device (0 = full capacity)
 OCF_STAT_LOG=${OCF_STAT_LOG:-$ROOT_DIR/ssd_waf/logging}  # Directory for stats CSV log
 
 # Export mode: nvmeof (default, stable) or ublk
@@ -100,7 +101,11 @@ pre_format_devices() {
         echo "  Cache:   Not found at ${CACHE_BDF}"
     fi
     if [[ -n "$backend_dev" ]] && [[ -e "/dev/${backend_dev}" ]]; then
-        echo "  Backend: /dev/${backend_dev}"
+        if [[ "${BACKEND_SPLIT_GB}" -gt 0 ]]; then
+            echo "  Backend: /dev/${backend_dev}  [${BACKEND_SPLIT_GB}GB limit]"
+        else
+            echo "  Backend: /dev/${backend_dev}  [Full capacity]"
+        fi
     else
         echo "  Backend: Not found at ${BACKEND_BDF}"
     fi
@@ -266,19 +271,33 @@ create_ocf() {
         sleep 1
     else
         cache_bdev="${cache_ns}"
-        log "Using full namespace (CACHE_SPLIT_ENABLE=0)"
+        log "Using full cache namespace (CACHE_SPLIT_ENABLE=0)"
+    fi
+
+    # Split backend device if enabled
+    local backend_bdev
+    if [[ "${BACKEND_SPLIT_GB}" -gt 0 ]]; then
+        local backend_split_mb=$((BACKEND_SPLIT_GB * 1024))
+        backend_bdev="${backend_ns}p0"
+        log "Splitting backend device ${backend_ns} to ${BACKEND_SPLIT_GB}GB (${backend_split_mb} MB)"
+        rpc_call "split backend bdev ${backend_ns}" \
+            bdev_split_create "${backend_ns}" 1 -s "${backend_split_mb}"
+        sleep 1
+    else
+        backend_bdev="${backend_ns}"
+        log "Using full backend namespace"
     fi
 
     log "Creating OCF bdev: ${OCF_NAME}"
     log "  Cache bdev:  ${cache_bdev}"
-    log "  Core bdev:   ${backend_ns}"
+    log "  Core bdev:   ${backend_bdev}"
     log "  Mode:        ${OCF_MODE}"
     log "  Line size:   ${OCF_CACHE_LINE_SIZE}KB"
     log "  Stats log:   ${OCF_STAT_LOG}"
 
     mkdir -p "${OCF_STAT_LOG}"
     rpc_call "create OCF ${OCF_NAME}" \
-        bdev_ocf_create "${OCF_NAME}" "${OCF_MODE}" "${cache_bdev}" "${backend_ns}" \
+        bdev_ocf_create "${OCF_NAME}" "${OCF_MODE}" "${cache_bdev}" "${backend_bdev}" \
         --cache-line-size "${OCF_CACHE_LINE_SIZE}" \
         --stat-log-path "${OCF_STAT_LOG}"
 

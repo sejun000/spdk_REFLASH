@@ -253,7 +253,7 @@ class SpdkCacheDevice;
 
 // Global device command queue depth limiting
 // Disabled: mqes=1023 is large enough, no throttling needed
-static constexpr uint32_t MAX_OUTSTANDING_CMDS = 192;
+static constexpr uint32_t MAX_OUTSTANDING_CMDS = UINT64_MAX;
 static std::atomic<uint32_t> g_outstanding_cmds{0};
 
 struct GlobalPendingWrite {
@@ -531,12 +531,12 @@ zone_reset_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		// More zones to reset
 		zone_reset_next(ctx);
 	} else {
-		// All zones reset - log elapsed time
-		uint64_t elapsed_tsc = spdk_get_ticks() - ctx->start_tsc;
-		uint64_t elapsed_us = elapsed_tsc * 1000000 / spdk_get_ticks_hz();
-		SPDK_NOTICELOG("Zone reset complete: %d zones, %lu us (%.2f ms/zone)\n",
-			       ctx->zones_reset, elapsed_us,
-			       (double)elapsed_us / 1000.0 / ctx->zones_reset);
+		// // All zones reset - log elapsed time
+		// uint64_t elapsed_tsc = spdk_get_ticks() - ctx->start_tsc;
+		// uint64_t elapsed_us = elapsed_tsc * 1000000 / spdk_get_ticks_hz();
+		// SPDK_NOTICELOG("Zone reset complete: %d zones, %lu us (%.2f ms/zone)\n",
+		// 	       ctx->zones_reset, elapsed_us,
+		// 	       (double)elapsed_us / 1000.0 / ctx->zones_reset);
 
 		// Clear ZoneQueue state
 		if (ctx->device && ctx->last_status == 0) {
@@ -586,10 +586,10 @@ fdp_trim_completion(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		SPDK_ERRLOG("fdp_trim_completion: TRIM/UNMAP failed!\n");
 		status = -EIO;
 	} else {
-		uint64_t elapsed_tsc = spdk_get_ticks() - ctx->start_tsc;
-		uint64_t elapsed_us = elapsed_tsc * 1000000 / spdk_get_ticks_hz();
-		SPDK_NOTICELOG("FDP TRIM complete: block_offset=0x%lx, num_blocks=%lu, %lu us\n",
-			       ctx->block_offset, ctx->num_blocks, elapsed_us);
+		// uint64_t elapsed_tsc = spdk_get_ticks() - ctx->start_tsc;
+		// uint64_t elapsed_us = elapsed_tsc * 1000000 / spdk_get_ticks_hz();
+		// SPDK_NOTICELOG("FDP TRIM complete: block_offset=0x%lx, num_blocks=%lu, %lu us\n",
+		// 	       ctx->block_offset, ctx->num_blocks, elapsed_us);
 
 		// Clear zone state for reuse
 		if (ctx->device) {
@@ -1223,10 +1223,10 @@ public:
 					ctx->user_cb = cb;
 					ctx->user_cb_arg = cb_arg;
 					ctx->device = this;
-					ctx->start_tsc = spdk_get_ticks();
+					// ctx->start_tsc = spdk_get_ticks();
 
-					SPDK_NOTICELOG("FDP TRIM: block_offset=0x%lx, num_blocks=%lu\n",
-						       block_offset, num_blocks);
+					// SPDK_NOTICELOG("FDP TRIM: block_offset=0x%lx, num_blocks=%lu\n",
+					// 	       block_offset, num_blocks);
 					int rc = spdk_bdev_unmap_blocks(m_cache_desc, m_cache_ch,
 								       block_offset, num_blocks,
 								       fdp_trim_completion, ctx);
@@ -1298,7 +1298,7 @@ public:
 		ctx->user_cb_arg = cb_arg;
 		ctx->last_status = 0;
 		ctx->device = this;
-		ctx->start_tsc = spdk_get_ticks();
+		// ctx->start_tsc = spdk_get_ticks();
 		ctx->zones_reset = 0;
 
 		// Start first zone reset
@@ -1885,6 +1885,11 @@ static void clear_zone_state_after_fdp_trim(SpdkCacheDevice *device, uint64_t bl
 // Drain global pending writes when command slots become available
 static void drain_global_pending_writes()
 {
+	// Skip if throttling disabled (UINT64_MAX means no limit)
+	if (MAX_OUTSTANDING_CMDS == UINT64_MAX) {
+		return;
+	}
+
 	// Prevent recursive drain (completion callbacks may trigger more drains)
 	bool expected = false;
 	if (!g_draining_pending_writes.compare_exchange_strong(expected, true)) {
@@ -1931,6 +1936,11 @@ static void drain_global_pending_writes()
 // Drain global pending reads when command slots become available
 static void drain_global_pending_reads()
 {
+	// Skip if throttling disabled (UINT64_MAX means no limit)
+	if (MAX_OUTSTANDING_CMDS == UINT64_MAX) {
+		return;
+	}
+
 	// Prevent recursive drain (completion callbacks may trigger more drains)
 	bool expected = false;
 	if (!g_draining_pending_reads.compare_exchange_strong(expected, true)) {
@@ -2196,7 +2206,15 @@ struct EvictIo {
 		uint32_t block_size;
 	};
 	std::vector<PendingEvictWrite> pending_evict_writes;
-	size_t pending_evict_write_idx;  // Current index in pending_evict_writes
+
+	// Merged write for adjacent blocks
+	struct MergedEvictWrite {
+		uint64_t backend_offset;      // Starting offset
+		std::vector<struct iovec> iovs;  // Scatter-gather list
+		size_t total_len;             // Total bytes
+	};
+	std::vector<MergedEvictWrite> merged_evict_writes;
+	size_t merged_evict_write_idx;  // Current index in merged_evict_writes
 
 	// Timing for segment evict
 	uint64_t start_ticks;
@@ -2227,7 +2245,7 @@ struct EvictIo {
 
 	EvictIo() : batch_start(0), batch_count(0), parallel_batch_start(0),
 	            parallel_batch_count(0), parallel_reads_done(0), parallel_writes_done(0),
-	            coalesced_writes_total(0), pending_evict_write_idx(0),
+	            coalesced_writes_total(0), merged_evict_write_idx(0),
 	            start_ticks(0), read_total_us(0), write_total_us(0),
 	            batch_read_start_ticks(0), batch_write_start_ticks(0), total_bytes(0), segment_base_offset(0),
 	            segment_size_blocks(0), valid_ratio(0), use_sequential_read(false),
@@ -2322,24 +2340,30 @@ public:
 				effective_valid_rate = 0.6;
 				score_low_valid_first = true;
 			}
+		}
 			// LOG_GREEDY_COST_BENEFIT_11 uses valid_rate_threshold from parameter
+		else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_WARM") {
+			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
+			compactor = std::make_unique<CbEvictPolicy>(score_warm_first);
+			effective_valid_rate = 0.8;
+			score_low_valid_first = false;
 		} else if (cache_type == "LOG_GREEDY_COST_BENEFIT_HOT") {
 			// Hot-first compaction: prefer recently created segments
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_hot_first);
-			effective_valid_rate = 0.6;
-			score_low_valid_first = true;
+			effective_valid_rate = 0.8;
+			score_low_valid_first = false;
 		} else if (cache_type == "LOG_GREEDY_COST_BENEFIT_COLD") {
 			// Cold-first compaction: prefer older segments
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_cold_first);
-			effective_valid_rate = 0.6;
+			effective_valid_rate = 0.8;
 			score_low_valid_first = true;
 		} else if (cache_type == "LOG_SEPBIT_FIFO") {
 			// SEPBIT with FIFO eviction and sqrt-age compaction
 			evictor = std::make_unique<FifoEvictPolicy>();
 			compactor = std::make_unique<CbEvictPolicy>(score_sepbit_age);
-			effective_valid_rate = 0.93;
+			effective_valid_rate = 0.8;
 			istream_policy_name = "sepbit";
 		} else if (cache_type == "LOG_COST_BENEFIT") {
 			evictor = std::make_unique<CbEvictPolicy>();
@@ -2518,6 +2542,12 @@ public:
 	// Start the stats logger (call from worker thread after channels set)
 	void start_stats_logger() {
 		if (stats_logger_) {
+			// Register histogram print callback (~60 seconds)
+			if (cache_) {
+				stats_logger_->set_histogram_callback([this]() {
+					cache_->print_histograms(false);  // print without reset (cumulative)
+				});
+			}
 			stats_logger_->start();
 		}
 	}
@@ -2604,11 +2634,10 @@ private:
 		uint64_t interval_tsc = 0;           // 500ms interval in ticks
 		uint64_t start_tsc = 0;              // Start of current interval
 		size_t prev_free_segs = 0;           // Previous free segment count
-		double throttle_ratio = 1.0;         // Current throttle ratio (1.0 = 100%)
 
-		// Host IO tracking for this interval
+		// Host IO tracking
 		uint64_t blocks_submitted = 0;       // Host blocks submitted this interval
-		uint64_t host_blocks_baseline = 0;   // Baseline blocks per interval (measured at 100%)
+		uint64_t blocks_limit = 0;           // Limit for this interval (0 = no limit)
 
 		// For logging
 		enum class Level { NORMAL, LOW, CRITICAL };
@@ -2616,11 +2645,10 @@ private:
 	} throttle_;
 
 	// Throttle constants
-	static constexpr size_t THROTTLE_START_SEGS = 15;    // Start throttle at <= 15 free segs
-	static constexpr size_t THROTTLE_NO_RECOVER_SEGS = 7; // No recovery at <= 7 free segs
-	static constexpr size_t THROTTLE_CRITICAL_SEGS = 5;   // Critical - block all at <= 5 (match CRITICAL_FREE_SEGMENTS)
-	static constexpr double THROTTLE_STEP = 0.1;          // 10% step
-	static constexpr double THROTTLE_MIN_RATIO = 0.1;     // Minimum 10%
+	static constexpr size_t THROTTLE_START_SEGS = 9;      // Start throttle at <= 9 free segs
+	static constexpr size_t THROTTLE_CRITICAL_SEGS = 2;   // Critical - block all at <= 2
+	static constexpr double THROTTLE_STEP_DOWN = 0.05;    // 5% decrease when free_segs drops
+	static constexpr double THROTTLE_STEP_UP = 0.05;      // 5% increase when free_segs rises or unchanged
 	static constexpr uint64_t THROTTLE_INTERVAL_MS = 500; // 500ms interval
 
 public:
@@ -2629,9 +2657,8 @@ public:
 		throttle_.interval_tsc = THROTTLE_INTERVAL_MS * spdk_get_ticks_hz() / 1000;
 		throttle_.start_tsc = spdk_get_ticks();
 		throttle_.prev_free_segs = free_segment_count();
-		throttle_.throttle_ratio = 1.0;
 		throttle_.blocks_submitted = 0;
-		throttle_.host_blocks_baseline = 0;
+		throttle_.blocks_limit = 0;  // 0 = no limit
 	}
 
 	// Record GC completion (for logging only now)
@@ -2641,7 +2668,7 @@ public:
 		// No longer used for throttle calculation
 	}
 
-	// Update throttle ratio based on free segment changes (called every 500ms)
+	// Update throttle limit based on free segment changes (called every 500ms)
 	void throttle_update() {
 		auto &t = throttle_;
 		uint64_t now = spdk_get_ticks();
@@ -2658,11 +2685,7 @@ public:
 
 		size_t current_free = free_segment_count();
 		size_t prev_free = t.prev_free_segs;
-
-		// Update baseline if we're at 100% and have data
-		if (t.throttle_ratio >= 1.0 && t.blocks_submitted > 0) {
-			t.host_blocks_baseline = t.blocks_submitted;
-		}
+		uint64_t current_perf = t.blocks_submitted > 0 ? t.blocks_submitted : 1;
 
 		// Determine level for logging
 		Throttle::Level cur_level;
@@ -2673,44 +2696,35 @@ public:
 		// Log level changes
 		if (cur_level != t.prev_level) {
 			static const char* level_names[] = {"NORMAL", "LOW", "CRITICAL"};
-			SPDK_NOTICELOG("THROTTLE: %s -> %s (free_segs=%zu, ratio=%.0f%%)\n",
+			SPDK_NOTICELOG("THROTTLE: %s -> %s (free_segs=%zu, limit=%lu)\n",
 				       level_names[static_cast<int>(t.prev_level)],
 				       level_names[static_cast<int>(cur_level)],
-				       current_free, t.throttle_ratio * 100);
+				       current_free, t.blocks_limit);
 			t.prev_level = cur_level;
 		}
 
 		// Apply throttle policy based on free segment change
 		if (current_free > THROTTLE_START_SEGS) {
-			// Above threshold: no throttle
-			if (t.throttle_ratio < 1.0) {
-				SPDK_NOTICELOG("THROTTLE: Recovered to 100%% (free_segs=%zu)\n", current_free);
+			// Above threshold (>9): no throttle
+			if (t.blocks_limit > 0) {
+				SPDK_NOTICELOG("THROTTLE: Recovered to unlimited (free_segs=%zu)\n", current_free);
 			}
-			t.throttle_ratio = 1.0;
+			t.blocks_limit = 0;  // 0 = no limit
 		} else {
-			// In throttle zone (<=10)
+			// In throttle zone (<=9)
 			if (current_free < prev_free) {
-				// Free segments decreased -> reduce performance by 10%
-				t.throttle_ratio *= (1.0 - THROTTLE_STEP);
-				if (t.throttle_ratio < THROTTLE_MIN_RATIO) {
-					t.throttle_ratio = THROTTLE_MIN_RATIO;
-				}
-				uint64_t limit = static_cast<uint64_t>(t.host_blocks_baseline * t.throttle_ratio);
-				double limit_mbs = (double)limit * 2 * block_size_ / (1024.0 * 1024.0);
-				SPDK_NOTICELOG("THROTTLE: Decreased to %.0f%% (free_segs=%zu->%zu, limit=%.1fMB/s)\n",
-					       t.throttle_ratio * 100, prev_free, current_free, limit_mbs);
-			} else if (current_free > prev_free && current_free > THROTTLE_NO_RECOVER_SEGS) {
-				// Free segments increased AND above 7 -> increase performance by 10%
-				t.throttle_ratio /= (1.0 - THROTTLE_STEP);
-				if (t.throttle_ratio > 1.0) {
-					t.throttle_ratio = 1.0;
-				}
-				uint64_t limit = static_cast<uint64_t>(t.host_blocks_baseline * t.throttle_ratio);
-				double limit_mbs = (double)limit * 2 * block_size_ / (1024.0 * 1024.0);
-				SPDK_NOTICELOG("THROTTLE: Increased to %.0f%% (free_segs=%zu->%zu, limit=%.1fMB/s)\n",
-					       t.throttle_ratio * 100, prev_free, current_free, limit_mbs);
+				// Free segments decreased -> next limit = current_perf * 0.95
+				t.blocks_limit = static_cast<uint64_t>(current_perf * (1.0 - THROTTLE_STEP_DOWN));
+				if (t.blocks_limit < 1) t.blocks_limit = 1;
+				SPDK_NOTICELOG("THROTTLE: Decreased limit to %lu (was %lu, free_segs=%zu->%zu)\n",
+					       t.blocks_limit, current_perf, prev_free, current_free);
+			} else {
+				// Free segments increased or unchanged -> next limit = current_perf * 1.03
+				t.blocks_limit = static_cast<uint64_t>(current_perf * (1.0 + THROTTLE_STEP_UP));
+				// No upper cap here - limit removed when free_segs > 9
+				SPDK_NOTICELOG("THROTTLE: Increased limit to %lu (was %lu, free_segs=%zu->%zu)\n",
+					       t.blocks_limit, current_perf, prev_free, current_free);
 			}
-			// else: unchanged or <=7 with increase -> maintain current ratio
 		}
 
 		// Reset for next interval
@@ -2740,17 +2754,13 @@ public:
 			return false;
 		}
 
-		// Apply ratio-based throttling
-		// If no baseline yet, don't throttle
-		if (throttle_.host_blocks_baseline == 0) {
+		// No limit set yet (first interval in throttle zone)
+		if (throttle_.blocks_limit == 0) {
 			return false;
 		}
 
-		// Calculate limit for this interval based on ratio
-		uint64_t limit = static_cast<uint64_t>(throttle_.host_blocks_baseline * throttle_.throttle_ratio);
-		if (limit < 1) limit = 1;
-
-		return throttle_.blocks_submitted >= limit;
+		// Block if submitted >= limit
+		return throttle_.blocks_submitted >= throttle_.blocks_limit;
 	}
 
 	// Record host write block submission
@@ -2759,9 +2769,8 @@ public:
 	}
 
 	// Get current throttle state for debugging
-	double throttle_ratio() const { return throttle_.throttle_ratio; }
+	uint64_t throttle_limit() const { return throttle_.blocks_limit; }
 	size_t throttle_submitted() const { return throttle_.blocks_submitted; }
-	uint64_t throttle_baseline() const { return throttle_.host_blocks_baseline; }
 };
 
 //==============================================================================
@@ -2878,14 +2887,14 @@ void LogCacheAsync::flush_write_buffer()
 		if (!cache_->append_block_metadata(0, static_cast<long>(blk.key),
 						   static_cast<int>(block_size), &cache_offset, &stream_id, &segment_full)) {
 			// No free segments - need GC/Evict
-			if (flush_block_count == 0) {
-				block_start_tsc = spdk_get_ticks();
-			}
-			flush_block_count++;
-			if (flush_block_count == 1 || flush_block_count % 10000 == 0) {
-				SPDK_WARNLOG("BLOCKED: flush_write_buffer waiting for GC (blocked %lu times, success_count=%zu)\n",
-					     flush_block_count, success_count);
-			}
+			// if (flush_block_count == 0) {
+			// 	block_start_tsc = spdk_get_ticks();
+			// }
+			// flush_block_count++;
+			// if (flush_block_count == 1 || flush_block_count % 10000 == 0) {
+			// 	SPDK_WARNLOG("BLOCKED: flush_write_buffer waiting for GC (blocked %lu times, success_count=%zu)\n",
+			// 		     flush_block_count, success_count);
+			// }
 			partial_failure = true;
 			flush_pending_ = true;
 			break;  // Exit loop, but continue to write successful blocks
@@ -2910,13 +2919,13 @@ void LogCacheAsync::flush_write_buffer()
 	// Store cache pointer for completion
 	flush_ctx->cache = cache_.get();
 
-	// Log if we were blocked and now succeeded (full success only)
-	if (flush_block_count > 0 && !partial_failure) {
-		uint64_t blocked_us = (spdk_get_ticks() - block_start_tsc) * 1000000 / spdk_get_ticks_hz();
-		SPDK_NOTICELOG("UNBLOCKED: flush_write_buffer succeeded after %lu blocks, %lu us blocked\n",
-			       flush_block_count, blocked_us);
-		flush_block_count = 0;
-	}
+	// // Log if we were blocked and now succeeded (full success only)
+	// if (flush_block_count > 0 && !partial_failure) {
+	// 	uint64_t blocked_us = (spdk_get_ticks() - block_start_tsc) * 1000000 / spdk_get_ticks_hz();
+	// 	SPDK_NOTICELOG("UNBLOCKED: flush_write_buffer succeeded after %lu blocks, %lu us blocked\n",
+	// 		       flush_block_count, blocked_us);
+	// 	flush_block_count = 0;
+	// }
 
 	// Copy successful blocks to flush_ctx, keep failed ones in buffer for retry
 	for (size_t i = 0; i < success_count; i++) {
@@ -3135,26 +3144,26 @@ static void cache_io_complete(CacheIo *io, int status)
 
 static void gc_io_complete(GcIo *io, int status)
 {
-	// Calculate and log GC timing
-	if (io->start_ticks > 0) {
-		uint64_t elapsed_ticks = spdk_get_ticks() - io->start_ticks;
-		// Use segment capacity for throttle (freed space, not copied bytes)
-		io->ctx->cache->throttle_gc_complete(io->ctx->cache->segment_capacity(), elapsed_ticks);
+	// // Calculate and log GC timing
+	// if (io->start_ticks > 0) {
+	// 	uint64_t elapsed_ticks = spdk_get_ticks() - io->start_ticks;
+	// 	// Use segment capacity for throttle (freed space, not copied bytes)
+	// 	io->ctx->cache->throttle_gc_complete(io->ctx->cache->segment_capacity(), elapsed_ticks);
 
-		double ticks_hz = spdk_get_ticks_hz();
-		double elapsed_sec = elapsed_ticks / ticks_hz;
-		double read_sec = io->read_ticks / ticks_hz;
-		double write_sec = io->write_ticks / ticks_hz;
-		double mb = io->total_gc_bytes / 1024.0 / 1024.0;
-		double throughput_mbs = (elapsed_sec > 0) ? (mb / elapsed_sec) : 0;
-		double read_mbs = (read_sec > 0) ? (mb / read_sec) : 0;
-		double write_mbs = (write_sec > 0) ? (mb / write_sec) : 0;
+	// 	double ticks_hz = spdk_get_ticks_hz();
+	// 	double elapsed_sec = elapsed_ticks / ticks_hz;
+	// 	double read_sec = io->read_ticks / ticks_hz;
+	// 	double write_sec = io->write_ticks / ticks_hz;
+	// 	double mb = io->total_gc_bytes / 1024.0 / 1024.0;
+	// 	double throughput_mbs = (elapsed_sec > 0) ? (mb / elapsed_sec) : 0;
+	// 	double read_mbs = (read_sec > 0) ? (mb / read_sec) : 0;
+	// 	double write_mbs = (write_sec > 0) ? (mb / write_sec) : 0;
 
-		SPDK_NOTICELOG("GC complete: victim_seg=%p, %.1f MB, total=%.2fs (%.0f MB/s), "
-			       "read=%.2fs (%.0f MB/s), write=%.2fs (%.0f MB/s), status=%d\n",
-			       (void*)io->prepare_result.victim_seg, mb, elapsed_sec, throughput_mbs,
-			       read_sec, read_mbs, write_sec, write_mbs, status);
-	}
+	// 	SPDK_NOTICELOG("GC complete: victim_seg=%p, %.1f MB, total=%.2fs (%.0f MB/s), "
+	// 		       "read=%.2fs (%.0f MB/s), write=%.2fs (%.0f MB/s), status=%d\n",
+	// 		       (void*)io->prepare_result.victim_seg, mb, elapsed_sec, throughput_mbs,
+	// 		       read_sec, read_mbs, write_sec, write_mbs, status);
+	// }
 
 	auto on_complete = std::move(io->on_complete);
 	auto victim_seg = io->prepare_result.victim_seg;
@@ -3167,25 +3176,25 @@ static void gc_io_complete(GcIo *io, int status)
 
 static void evict_io_complete(EvictIo *io, int status)
 {
-	// Calculate and log segment evict time
-	uint64_t elapsed_ticks = spdk_get_ticks() - io->start_ticks;
-	uint64_t elapsed_us = elapsed_ticks * 1000000 / spdk_get_ticks_hz();
-	double elapsed_sec = elapsed_us / 1000000.0;
-	double mb = io->total_bytes / (1024.0 * 1024.0);
-	double throughput_mbs = (elapsed_sec > 0) ? (mb / elapsed_sec) : 0;
+	// // Calculate and log segment evict time
+	// uint64_t elapsed_ticks = spdk_get_ticks() - io->start_ticks;
+	// uint64_t elapsed_us = elapsed_ticks * 1000000 / spdk_get_ticks_hz();
+	// double elapsed_sec = elapsed_us / 1000000.0;
+	// double mb = io->total_bytes / (1024.0 * 1024.0);
+	// double throughput_mbs = (elapsed_sec > 0) ? (mb / elapsed_sec) : 0;
 
-	double read_sec = io->read_total_us / 1000000.0;
-	double write_sec = io->write_total_us / 1000000.0;
-	double read_mbs = (read_sec > 0) ? (mb / read_sec) : 0;
-	double write_mbs = (write_sec > 0) ? (mb / write_sec) : 0;
+	// double read_sec = io->read_total_us / 1000000.0;
+	// double write_sec = io->write_total_us / 1000000.0;
+	// double read_mbs = (read_sec > 0) ? (mb / read_sec) : 0;
+	// double write_mbs = (write_sec > 0) ? (mb / write_sec) : 0;
 
-	// Record evict timing for QoS throttle (use segment capacity = freed space)
-	io->ctx->cache->throttle_gc_complete(io->ctx->cache->segment_capacity(), elapsed_ticks);
+	// // Record evict timing for QoS throttle (use segment capacity = freed space)
+	// io->ctx->cache->throttle_gc_complete(io->ctx->cache->segment_capacity(), elapsed_ticks);
 
-	SPDK_NOTICELOG("Evict complete: victim_seg=%p, %.1f MB, total=%.2fs (%.0f MB/s), "
-		       "read=%.2fs (%.0f MB/s), write=%.2fs (%.0f MB/s), status=%d\n",
-		       (void*)io->prepare_result.victim_seg, mb, elapsed_sec, throughput_mbs,
-		       read_sec, read_mbs, write_sec, write_mbs, status);
+	// SPDK_NOTICELOG("Evict complete: victim_seg=%p, %.1f MB, total=%.2fs (%.0f MB/s), "
+	// 	       "read=%.2fs (%.0f MB/s), write=%.2fs (%.0f MB/s), status=%d\n",
+	// 	       (void*)io->prepare_result.victim_seg, mb, elapsed_sec, throughput_mbs,
+	// 	       read_sec, read_mbs, write_sec, write_mbs, status);
 
 	auto on_complete = std::move(io->on_complete);
 	auto victim_seg = io->prepare_result.victim_seg;
@@ -3755,10 +3764,10 @@ static void gc_start_batch(GcIo *io)
 {
 	auto &blocks = io->prepare_result.blocks_to_copy;
 
-	// Record previous batch write time (if any)
-	if (io->batch_start > 0 && io->write_start > 0) {
-		io->write_ticks += spdk_get_ticks() - io->write_start;
-	}
+	// // Record previous batch write time (if any)
+	// if (io->batch_start > 0 && io->write_start > 0) {
+	// 	io->write_ticks += spdk_get_ticks() - io->write_start;
+	// }
 
 	// Check if all batches done
 	if (io->batch_start >= blocks.size()) {
@@ -3779,7 +3788,7 @@ static void gc_start_batch(GcIo *io)
 	io->state = GcIoState::READ_GC_SUBMIT;
 	io->completed_reads = 0;
 	io->completed_writes = 0;
-	io->read_start = spdk_get_ticks();  // Start read timing
+	// io->read_start = spdk_get_ticks();  // Start read timing
 
 	// Calculate batch size
 	size_t remaining = blocks.size() - io->batch_start;
@@ -3883,8 +3892,8 @@ static void gc_coalesced_read_done(void *cb_arg, int status)
 
 	// Check if all coalesced reads are done
 	if (io->completed_coalesced_reads >= io->coalesced_reads.size()) {
-		// Record read time
-		io->read_ticks += spdk_get_ticks() - io->read_start;
+		// // Record read time
+		// io->read_ticks += spdk_get_ticks() - io->read_start;
 
 		// All reads done, start writes for this batch
 		if (io->last_status != 0) {
@@ -3905,7 +3914,7 @@ static void gc_start_writes(GcIo *io)
 	// ZNS rule: 64KB aligned writes can be parallel within 1MB window
 	//           Leftover (non-aligned) must be sequential at WP
 	io->state = GcIoState::WRITE_GC_SUBMIT;
-	io->write_start = spdk_get_ticks();  // Start write timing
+	// io->write_start = spdk_get_ticks();  // Start write timing
 
 	// Calculate and store 64KB chunks and leftover counts
 	io->num_64k_chunks = io->batch_count / GcIo::BLOCKS_PER_64K;
@@ -4180,10 +4189,10 @@ struct GcSeqReadCtx {
 
 static void gc_start_seq_batch(GcIo *io)
 {
-	// Record previous batch timing
-	if (io->seq_current_chunk > 0 && io->write_start > 0) {
-		io->write_ticks += spdk_get_ticks() - io->write_start;
-	}
+	// // Record previous batch timing
+	// if (io->seq_current_chunk > 0 && io->write_start > 0) {
+	// 	io->write_ticks += spdk_get_ticks() - io->write_start;
+	// }
 
 	// Check if all chunks done
 	if (io->seq_current_chunk >= io->seq_chunks.size()) {
@@ -4239,7 +4248,7 @@ static void gc_start_seq_batch(GcIo *io)
 	io->seq_writes_done.store(0);
 	io->pending_gc_writes.clear();
 	io->pending_gc_write_idx = 0;
-	io->read_start = spdk_get_ticks();
+	// io->read_start = spdk_get_ticks();
 
 	LogCacheSegment *victim = io->prepare_result.victim_seg;
 
@@ -4294,8 +4303,8 @@ static void gc_seq_read_done(void *cb_arg, int status)
 		io->seq_writes_done.fetch_add(sc.valid_block_indices.size());
 		size_t reads_done = ++io->seq_reads_done;
 		if (reads_done == io->seq_parallel_count) {
-			io->read_ticks += spdk_get_ticks() - io->read_start;
-			io->write_start = spdk_get_ticks();
+			// io->read_ticks += spdk_get_ticks() - io->read_start;
+			// io->write_start = spdk_get_ticks();
 			io->pending_gc_write_idx = 0;
 			// Dispatch any queued writes from successful reads
 			if (!io->pending_gc_writes.empty()) {
@@ -4325,8 +4334,8 @@ static void gc_seq_read_done(void *cb_arg, int status)
 	size_t reads_done = ++io->seq_reads_done;
 	if (reads_done == io->seq_parallel_count) {
 		// All reads done - start dispatching writes with yield
-		io->read_ticks += spdk_get_ticks() - io->read_start;
-		io->write_start = spdk_get_ticks();
+		// io->read_ticks += spdk_get_ticks() - io->read_start;
+		// io->write_start = spdk_get_ticks();
 		io->pending_gc_write_idx = 0;
 
 		// BUG FIX: If no valid blocks (seq_total_writes = 0), skip to next batch
@@ -4354,7 +4363,7 @@ static void gc_seq_write_done(void *cb_arg, int status)
 
 	size_t done = ++io->seq_writes_done;
 	if (done >= io->seq_total_writes) {
-		io->write_ticks += spdk_get_ticks() - io->write_start;
+		// io->write_ticks += spdk_get_ticks() - io->write_start;
 		io->seq_current_chunk += io->seq_parallel_count;
 		io->pending_gc_writes.clear();  // Clear queue for next batch
 		gc_start_seq_batch(io);
@@ -4468,6 +4477,7 @@ struct CoalescedReadCtx {
 };
 
 static void coalesced_read_done(void *cb_arg, int status);
+static void evict_merge_writes(EvictIo *io);
 static void evict_dispatch_writes(EvictIo *io);
 static void evict_dispatch_writes_msg(void *arg);
 
@@ -4491,7 +4501,7 @@ static void evict_start_chunk(EvictIo *io)
 	}
 
 	io->state = EvictIoState::BACKEND_READ_BLOCK;
-	io->batch_read_start_ticks = spdk_get_ticks();
+	// io->batch_read_start_ticks = spdk_get_ticks();
 	io->batch_write_start_ticks = 0;
 	uint32_t block_size = io->ctx->block_size;
 	constexpr size_t CHUNK_BLOCKS = 32;  // 128k = 32 * 4k
@@ -4530,7 +4540,8 @@ static void evict_start_chunk(EvictIo *io)
 	io->parallel_writes_done.store(0);
 	io->coalesced_writes_total = total_valid_blocks;
 	io->pending_evict_writes.clear();
-	io->pending_evict_write_idx = 0;
+	io->merged_evict_writes.clear();
+	io->merged_evict_write_idx = 0;
 
 	LogCacheSegment *victim = io->prepare_result.victim_seg;
 
@@ -4613,12 +4624,14 @@ static void coalesced_read_done(void *cb_arg, int status)
 		io->parallel_writes_done.fetch_add(valid_count);
 		size_t reads_done = ++io->parallel_reads_done;
 		if (reads_done == io->parallel_batch_count) {
-			uint64_t read_elapsed = spdk_get_ticks() - io->batch_read_start_ticks;
-			io->read_total_us += read_elapsed * 1000000 / spdk_get_ticks_hz();
-			io->batch_write_start_ticks = spdk_get_ticks();
-			io->pending_evict_write_idx = 0;
+			// uint64_t read_elapsed = spdk_get_ticks() - io->batch_read_start_ticks;
+			// io->read_total_us += read_elapsed * 1000000 / spdk_get_ticks_hz();
+			// io->batch_write_start_ticks = spdk_get_ticks();
 			// Dispatch any queued writes from successful reads
 			if (!io->pending_evict_writes.empty()) {
+				evict_merge_writes(io);
+				io->merged_evict_write_idx = 0;
+				io->coalesced_writes_total = io->merged_evict_writes.size();
 				evict_dispatch_writes(io);
 			} else if (io->parallel_writes_done >= io->coalesced_writes_total) {
 				// All writes skipped due to errors
@@ -4645,10 +4658,9 @@ static void coalesced_read_done(void *cb_arg, int status)
 
 	if (reads_done == io->parallel_batch_count) {
 		// All reads done - start dispatching writes with yield
-		uint64_t read_elapsed = spdk_get_ticks() - io->batch_read_start_ticks;
-		io->read_total_us += read_elapsed * 1000000 / spdk_get_ticks_hz();
-		io->batch_write_start_ticks = spdk_get_ticks();
-		io->pending_evict_write_idx = 0;
+		// uint64_t read_elapsed = spdk_get_ticks() - io->batch_read_start_ticks;
+		// io->read_total_us += read_elapsed * 1000000 / spdk_get_ticks_hz();
+		// io->batch_write_start_ticks = spdk_get_ticks();
 
 		// BUG FIX: If no valid blocks to write, skip to next batch
 		if (io->coalesced_writes_total == 0 || io->pending_evict_writes.empty()) {
@@ -4658,6 +4670,12 @@ static void coalesced_read_done(void *cb_arg, int status)
 			evict_start_chunk(io);
 			return;
 		}
+
+		// Merge adjacent writes before dispatch
+		evict_merge_writes(io);
+		io->merged_evict_write_idx = 0;
+		// Update coalesced_writes_total to merged count for completion tracking
+		io->coalesced_writes_total = io->merged_evict_writes.size();
 
 		evict_dispatch_writes(io);
 	}
@@ -4676,26 +4694,67 @@ static void pipelined_write_done(void *cb_arg, int status)
 	size_t done = ++io->parallel_writes_done;
 
 	if (done >= io->coalesced_writes_total) {
-		// All writes done - record write timing
-		uint64_t write_start = io->batch_write_start_ticks ? io->batch_write_start_ticks : io->batch_read_start_ticks;
-		uint64_t elapsed = spdk_get_ticks() - write_start;
-		io->write_total_us += elapsed * 1000000 / spdk_get_ticks_hz();
+		// // All writes done - record write timing
+		// uint64_t write_start = io->batch_write_start_ticks ? io->batch_write_start_ticks : io->batch_read_start_ticks;
+		// uint64_t elapsed = spdk_get_ticks() - write_start;
+		// io->write_total_us += elapsed * 1000000 / spdk_get_ticks_hz();
 
 		io->state = EvictIoState::BACKEND_WRITE_DONE;
 		io->current_chunk_idx += io->parallel_batch_count;
 		io->pending_evict_writes.clear();  // Clear queue for next batch
+		io->merged_evict_writes.clear();
 		evict_start_chunk(io);
 	}
+}
+
+// Merge adjacent writes and prepare for dispatch
+static void evict_merge_writes(EvictIo *io)
+{
+	auto &writes = io->pending_evict_writes;
+	auto &merged = io->merged_evict_writes;
+	merged.clear();
+
+	if (writes.empty()) return;
+
+	// Sort by backend_offset
+	std::sort(writes.begin(), writes.end(),
+		  [](const EvictIo::PendingEvictWrite &a, const EvictIo::PendingEvictWrite &b) {
+			  return a.backend_offset < b.backend_offset;
+		  });
+
+	// Merge adjacent blocks
+	merged.push_back({writes[0].backend_offset, {}, 0});
+	merged.back().iovs.push_back({writes[0].src, writes[0].block_size});
+	merged.back().total_len = writes[0].block_size;
+
+	for (size_t i = 1; i < writes.size(); ++i) {
+		auto &prev = merged.back();
+		auto &cur = writes[i];
+
+		// Check if adjacent (prev.offset + prev.total_len == cur.offset)
+		if (prev.backend_offset + prev.total_len == cur.backend_offset) {
+			// Merge into current group
+			prev.iovs.push_back({cur.src, cur.block_size});
+			prev.total_len += cur.block_size;
+		} else {
+			// Start new group
+			merged.push_back({cur.backend_offset, {}, 0});
+			merged.back().iovs.push_back({cur.src, cur.block_size});
+			merged.back().total_len = cur.block_size;
+		}
+	}
+
+	// Merge stats logging removed (too noisy)
 }
 
 // Yield-based Evict write dispatcher - submits up to EVICT_WRITES_PER_YIELD writes, then yields
 static void evict_dispatch_writes(EvictIo *io)
 {
-	auto &writes = io->pending_evict_writes;
+	auto &merged = io->merged_evict_writes;
 	size_t submitted = 0;
 
-	while (io->pending_evict_write_idx < writes.size() && submitted < EvictIo::EVICT_WRITES_PER_YIELD) {
-		auto &w = writes[io->pending_evict_write_idx++];
+	while (io->merged_evict_write_idx < merged.size() && submitted < EvictIo::EVICT_WRITES_PER_YIELD) {
+		auto &w = merged[io->merged_evict_write_idx++];
 
 		auto *write_ctx = new (std::nothrow) CoalescedReadCtx{io, nullptr, 0, 0};
 		if (!write_ctx) {
@@ -4704,11 +4763,21 @@ static void evict_dispatch_writes(EvictIo *io)
 			continue;
 		}
 
-		int rc = io->ctx->device->write_backend_async(w.backend_offset, w.src, w.block_size,
-							      pipelined_write_done, write_ctx);
+		int rc;
+		if (w.iovs.size() == 1) {
+			// Single block - use regular write
+			rc = io->ctx->device->write_backend_async(w.backend_offset, w.iovs[0].iov_base,
+								  w.total_len, pipelined_write_done, write_ctx);
+		} else {
+			// Multiple blocks - use writev
+			rc = io->ctx->device->writev_backend_async(w.backend_offset, w.iovs.data(),
+								   static_cast<int>(w.iovs.size()),
+								   w.total_len, pipelined_write_done, write_ctx);
+		}
+
 		if (rc == 0) {
 			// Track backend write bytes for stats
-			io->ctx->cache->add_backend_write_bytes(w.block_size);
+			io->ctx->cache->add_backend_write_bytes(w.total_len);
 			++submitted;
 		} else {
 			delete write_ctx;
@@ -4718,7 +4787,7 @@ static void evict_dispatch_writes(EvictIo *io)
 	}
 
 	// If more writes pending, yield and continue later
-	if (io->pending_evict_write_idx < writes.size()) {
+	if (io->merged_evict_write_idx < merged.size()) {
 		spdk_thread_send_msg(spdk_get_thread(), evict_dispatch_writes_msg, io);
 	}
 }
@@ -4793,7 +4862,7 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 			gc_io->completed_writes = 0;
 			gc_io->last_status = 0;
 			gc_io->on_complete = std::move(on_complete);
-			gc_io->start_ticks = spdk_get_ticks();
+			// gc_io->start_ticks = spdk_get_ticks();
 			gc_io->total_gc_bytes = gc_io->prepare_result.blocks_to_copy.size() * ctx->block_size;
 
 			// Calculate valid ratio for read strategy
@@ -4858,7 +4927,7 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 
 		evict_io->state = EvictIoState::EVICT_SEGMENT_SUBMIT;
 		evict_io->ctx = ctx;
-		evict_io->start_ticks = spdk_get_ticks();
+		// evict_io->start_ticks = spdk_get_ticks();
 		evict_io->total_bytes = evict_result.chunks.size() * 32 * ctx->block_size;  // 128k per chunk
 
 		// Calculate valid ratio for read strategy

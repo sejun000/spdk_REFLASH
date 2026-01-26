@@ -49,3 +49,29 @@ void Histogram::inc(uint64_t key, int inc) {
 
     m_counts[index] += inc;
 }
+
+void Histogram::print_current(bool reset) {
+    if (!m_fp_histo) {
+        return;
+    }
+
+    // CSV header
+    fprintf(m_fp_histo, "histogram,%s\n", m_name.c_str());
+    fprintf(m_fp_histo, "bucket,age_min,age_max,count\n");
+    // 모든 버킷 출력
+    for (size_t i = 0; i < m_max_buckets; ++i) {
+        uint64_t age_min = i * m_granularity;
+        uint64_t age_max = (i + 1) * m_granularity - 1;
+        if (i == m_max_buckets - 1) {
+            fprintf(m_fp_histo, "%zu,%lu,+inf,%lu\n", i, age_min, m_counts[i]);
+        } else {
+            fprintf(m_fp_histo, "%zu,%lu,%lu,%lu\n", i, age_min, age_max, m_counts[i]);
+        }
+    }
+    fprintf(m_fp_histo, "\n");
+    fflush(m_fp_histo);
+
+    if (reset) {
+        std::fill(m_counts.begin(), m_counts.end(), 0);
+    }
+}
