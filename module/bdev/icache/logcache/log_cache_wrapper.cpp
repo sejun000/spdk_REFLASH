@@ -2358,10 +2358,10 @@ public:
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_cold_first);
 			effective_valid_rate = 0.8;
-			score_low_valid_first = true;
+			score_low_valid_first = false;
 		} else if (cache_type == "LOG_SEPBIT_FIFO") {
 			// SEPBIT with FIFO eviction and sqrt-age compaction
-			evictor = std::make_unique<FifoEvictPolicy>();
+			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_sepbit_age);
 			effective_valid_rate = 0.8;
 			istream_policy_name = "sepbit";
@@ -5045,10 +5045,10 @@ log_cache_ctx_create(struct spdk_bdev_desc *cache_desc,
 	if (!cache_desc || !backend_desc || cache_block_count == 0 || backend_block_count == 0 || block_size == 0) {
 		return nullptr;
 	}
-	if (!is_supported_cache_type(cache_type)) {
+	/*(cache_type)) {
 		SPDK_ERRLOG("icache: unsupported cache type %s\n", cache_type);
 		return nullptr;
-	}
+	}*/
 
 	auto ctx = std::make_unique<log_cache_ctx>();
 	ctx->block_size = block_size;
