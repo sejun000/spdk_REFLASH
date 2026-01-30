@@ -313,21 +313,18 @@ void LogCache::periodic() {
                 // eviction_ratio > 1.3이면 무조건 LOWER (full random workload → eviction-heavy)
                 if (compaction_ratio.value() > 1.3) {
                     target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.04);
-                    SPDK_NOTICELOG("periodic: LOWER (evict>30%%) target=%.4f, evict_delta=%.6f, compact_delta=%.6f, m=%d\n",
-                                   target_valid_blk_rate, 6.73 * eviction_delta,
-                                   compaction_delta, last_ghost_m);
+                    SPDK_NOTICELOG("periodic: LOWER (compact>1.3) target=%.4f, evict_delta=%.6f, compact_delta=%.6f\n",
+                                   target_valid_blk_rate, 6.73 * eviction_delta, compaction_delta);
                 }
                 else if (6.73 * eviction_delta > compaction_delta) {
                     target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + 0.04);
-                    SPDK_NOTICELOG("periodic: RISE target=%.4f, evict_delta=%.6f, compact_delta=%.6f, m=%d\n",
-                                   target_valid_blk_rate, 6.73 * eviction_delta,
-                                   compaction_delta, last_ghost_m);
+                    SPDK_NOTICELOG("periodic: RISE target=%.4f, evict_delta=%.6f, compact_delta=%.6f\n",
+                                   target_valid_blk_rate, 6.73 * eviction_delta, compaction_delta);
                 }
                 else {
                     target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.02);
-                    SPDK_NOTICELOG("periodic: LOWER target=%.4f, evict_delta=%.6f, compact_delta=%.6f, m=%d\n",
-                                   target_valid_blk_rate, 6.73 * eviction_delta,
-                                   compaction_delta, last_ghost_m);
+                    SPDK_NOTICELOG("periodic: LOWER target=%.4f, evict_delta=%.6f, compact_delta=%.6f\n",
+                                   target_valid_blk_rate, 6.73 * eviction_delta, compaction_delta);
                 }
             }
         }
@@ -1197,7 +1194,10 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
             double g_u = ghost_cache.utilization();
             if (g_u > 0.0) {
                 last_ghost_m = static_cast<int>(GHOST_CACHE_RATIO * global_valid_blocks / g_u);
-                ghost_compacted_blocks += compactor->get_mth_score_valid_pages(last_ghost_m);
+                uint64_t avg_valid = compactor->get_mth_score_valid_pages(last_ghost_m);
+                ghost_compacted_blocks += avg_valid;
+                SPDK_NOTICELOG("ghost_compact: m=%d, g_u=%.4f, seg_cnt=%zu, avg_valid=%lu, ghost_compacted=%lu\n",
+                               last_ghost_m, g_u, compactor->segment_count(), avg_valid, ghost_compacted_blocks);
             }
             if (victim->valid_cnt >= 0.8 * victim->blocks.size()) {
                 return false;
