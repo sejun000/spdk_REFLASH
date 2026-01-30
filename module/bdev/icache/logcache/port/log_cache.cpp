@@ -51,7 +51,8 @@ LogCache::LogCache(uint64_t              cold_capacity,
       compaction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       eviction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       eviction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
-      ghost_cache(cache_block_count * 0.1),
+      compaction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      ghost_cache(cache_block_count * GHOST_CACHE_RATIO),
       device_io_(device_io)
 {
     // For striping: segment_bytes = zone_capacity * stripe_width
@@ -298,29 +299,42 @@ void LogCache::periodic() {
             eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
             uint64_t evicted_in_ghost = ghost_cache.evictCount();
             eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
+
+            // ghost compaction 추정: m번째 segment의 valid_cnt 누적
+            double g_u = ghost_cache.utilization();
+            if (g_u > 0.0 && compactor) {
+                last_ghost_m = static_cast<int>(GHOST_CACHE_RATIO * global_valid_blocks / g_u);
+                ghost_compacted_blocks += compactor->get_mth_score_valid_pages(last_ghost_m);
+            }
+            compaction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, ghost_compacted_blocks);
         }
         if (log_cache_timestamp % (segment_size_blocks * 4) == 0) {
             if (compaction_ratio.has_value() &&
                 eviction_ratio.has_value() &&
-                eviction_ratio_in_ghost_cache.has_value()){
+                eviction_ratio_in_ghost_cache.has_value() &&
+                compaction_ratio_in_ghost_cache.has_value()){
+
+                double eviction_delta = eviction_ratio.value() - eviction_ratio_in_ghost_cache.value();
+                double compaction_delta = compaction_ratio_in_ghost_cache.value() - compaction_ratio.value();
+
                 // eviction_ratio > 1.3이면 무조건 LOWER (full random workload → eviction-heavy)
                 if (compaction_ratio.value() > 1.3) {
                     target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.04);
-                    SPDK_NOTICELOG("periodic: LOWER (evict>30%%) target=%.4f, evict_val=%.6f, compact_val=%.6f, evict_ratio=%.6f\n",
-                                   target_valid_blk_rate, 6.73 * eviction_ratio.value(),
-                                   compaction_ratio.value(), eviction_ratio.value());
+                    SPDK_NOTICELOG("periodic: LOWER (evict>30%%) target=%.4f, evict_delta=%.6f, compact_delta=%.6f, m=%d\n",
+                                   target_valid_blk_rate, 6.73 * eviction_delta,
+                                   compaction_delta, last_ghost_m);
                 }
-                else if (6.73 * (eviction_ratio.value()) > compaction_ratio.value()) {
+                else if (6.73 * eviction_delta > compaction_delta) {
                     target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + 0.04);
-                    SPDK_NOTICELOG("periodic: RISE target=%.4f, evict_val=%.6f, compact_val=%.6f, evict_ratio=%.6f\n",
-                                   target_valid_blk_rate, 6.73 * eviction_ratio.value(),
-                                   compaction_ratio.value(), eviction_ratio.value());
+                    SPDK_NOTICELOG("periodic: RISE target=%.4f, evict_delta=%.6f, compact_delta=%.6f, m=%d\n",
+                                   target_valid_blk_rate, 6.73 * eviction_delta,
+                                   compaction_delta, last_ghost_m);
                 }
                 else {
                     target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.02);
-                    SPDK_NOTICELOG("periodic: LOWER target=%.4f, evict_val=%.6f, compact_val=%.6f, evict_ratio=%.6f\n",
-                                   target_valid_blk_rate, 6.73 * eviction_ratio.value(),
-                                   compaction_ratio.value(), eviction_ratio.value());
+                    SPDK_NOTICELOG("periodic: LOWER target=%.4f, evict_delta=%.6f, compact_delta=%.6f, m=%d\n",
+                                   target_valid_blk_rate, 6.73 * eviction_delta,
+                                   compaction_delta, last_ghost_m);
                 }
             }
         }

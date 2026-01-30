@@ -42,6 +42,13 @@ public:
 
     /* Check if evictor has any segments to choose from */
     virtual bool empty() const { return false; }  // Default: not empty
+
+    /* Get valid_cnt of m-th segment in score order (for ghost compaction estimation) */
+    virtual uint64_t get_mth_score_valid_pages(int m) const { return 0; }
+
+    /* Get current segment count in the policy */
+    virtual size_t segment_count() const { return 0; }
+
     void init(uint64_t* time, std::size_t size, int num) {
         logical_time = time;  // 외부에서 logical_time을 설정
         pages_in_segment = size;  // 세그먼트 크기 설정

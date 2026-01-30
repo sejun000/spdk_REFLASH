@@ -267,11 +267,15 @@ private:
     std::unique_ptr<Histogram> evicted_cache_blocks_per_evict;
     static const int HISTOGRAM_BUCKETS = 40;
     static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = 262144 * 4;
+    static constexpr double GHOST_CACHE_RATIO = 0.05;  // 5% of cache size
     bool is_ghost_cache = false;
     uint64_t bypass_blocks_threshold = 128; // 128* 4k bytes = 512K bytes
     EwmaRatio compaction_ratio;
     EwmaRatio eviction_ratio;
     EwmaRatio eviction_ratio_in_ghost_cache;
+    EwmaRatio compaction_ratio_in_ghost_cache;
+    uint64_t ghost_compacted_blocks = 0;
+    int last_ghost_m = 0;  // 마지막으로 계산된 m 값 (for logging)
     GhostCache ghost_cache;
     std::vector<uint8_t> staging_buffer_;
 

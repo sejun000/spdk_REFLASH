@@ -7,6 +7,8 @@ void GhostCache::reset() {
     cache_.clear();
     lookup_.clear();
     evict_count_ = 0;
+    push_count_ = 0;
+    access_hit_count_ = 0;
 }
 
 bool GhostCache::access(uint64_t block_id) {
@@ -15,6 +17,7 @@ bool GhostCache::access(uint64_t block_id) {
         // hit → 리스트에서 제거 + 맵에서도 제거
         cache_.erase(it->second);
         lookup_.erase(it);
+        access_hit_count_++;
         return true;
     }
     return false;
@@ -22,6 +25,7 @@ bool GhostCache::access(uint64_t block_id) {
 
 
 bool GhostCache::push(uint64_t block_id) {
+    push_count_++;
     auto it = lookup_.find(block_id);
     if (it != lookup_.end()) {
         // hit → 리스트에서 제거 + 맵에서도 제거

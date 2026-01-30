@@ -39,6 +39,8 @@ public:
     void remove(Segment* seg) override;
     void update(Segment* seg) override;
     bool empty() const override { return heap_.empty(); }
+    size_t segment_count() const override { return heap_.size(); }
+    uint64_t get_mth_score_valid_pages(int m) const override;
 private:
     /* 실제 점수 계산: age/u  (u==0 → ∞) */
     inline double score(Segment* s) const {
