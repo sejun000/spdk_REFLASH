@@ -2365,6 +2365,7 @@ public:
 			compactor = std::make_unique<CbEvictPolicy>(score_sepbit_age);
 			effective_valid_rate = 0.8;
 			istream_policy_name = "sepbit";
+			score_low_valid_first = false;
 		} else if (cache_type == "LOG_COST_BENEFIT") {
 			evictor = std::make_unique<CbEvictPolicy>();
 		} else {

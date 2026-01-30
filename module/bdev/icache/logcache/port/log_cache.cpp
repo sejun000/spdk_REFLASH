@@ -306,8 +306,8 @@ void LogCache::periodic() {
                 eviction_ratio.has_value() &&
                 compaction_ratio_in_ghost_cache.has_value() &&
                 eviction_ratio_in_ghost_cache.has_value()) {
-                double current_tco = compaction_ratio.has_value() + 2.8 * eviction_ratio.value();
-                double ghost_tco = compaction_ratio_in_ghost_cache.has_value() + 2.8 * eviction_ratio_in_ghost_cache.value();
+                double current_tco = compaction_ratio.value() + 2.8 * eviction_ratio.value();
+                double ghost_tco = compaction_ratio_in_ghost_cache.value() + 2.8 * eviction_ratio_in_ghost_cache.value();
                 // eviction_ratio > 1.3이면 무조건 LOWER (full random workload → eviction-heavy)
                 if (compaction_ratio.value() > 1.3) {
                     target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.02);
@@ -322,7 +322,7 @@ void LogCache::periodic() {
                 else {
                     target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.02);
                     SPDK_NOTICELOG("periodic: LOWER target=%.4f, evict_val=%.6f, compact_val=%.6f, current_tco=%.6f ghost_tco=%.6f\n",
-                                   target_valid_blk_rate, 2.8 * eviction_ratio.value(), compaction_ratio.value());
+                                   target_valid_blk_rate, 2.8 * eviction_ratio.value(), compaction_ratio.value(), current_tco, ghost_tco);
                 }
             }
         }
@@ -1190,15 +1190,15 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
             victim = (LogCacheSegment *)compactor->choose_segment();
             // ghost compaction 추정: m번째 segment의 valid_cnt 누적
             double g_u = ghost_cache.utilization();
+            /*f (victim->valid_cnt >= 0.8 * victim->blocks.size()) {
+                return false;
+            }*/
             if (g_u > 0.0) {
                 last_ghost_m = static_cast<int>(GHOST_CACHE_RATIO * compactor->segment_count() / g_u);
                 uint64_t avg_valid = compactor->get_mth_score_valid_pages(last_ghost_m);
                 ghost_compacted_blocks += avg_valid;
                 SPDK_NOTICELOG("ghost_compact: m=%d, g_u=%.4f, seg_cnt=%zu, avg_valid=%lu, ghost_compacted=%lu\n",
                                last_ghost_m, g_u, compactor->segment_count(), avg_valid, ghost_compacted_blocks);
-            }
-            if (victim->valid_cnt >= 0.8 * victim->blocks.size()) {
-                return false;
             }
             if (!victim) {
                 return false;
