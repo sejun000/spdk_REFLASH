@@ -63,13 +63,16 @@ uint64_t CbEvictPolicy::get_mth_score_valid_pages(int m) const
     if (m <= 0 || static_cast<size_t>(m) > heap_.size()) {
         return 0;
     }
-    // ordered_iterator로 score 순서대로 순회
+    // ordered_iterator로 score 순서대로 순회하며 1~m번째 평균 valid_cnt 계산
+    uint64_t sum = 0;
+    int count = 0;
     auto it = heap_.ordered_begin();
-    for (int i = 1; i < m && it != heap_.ordered_end(); ++i) {
-        ++it;
+    for (int i = 0; i < m && it != heap_.ordered_end(); ++i, ++it) {
+        sum += it->seg->valid_cnt;
+        ++count;
     }
-    if (it == heap_.ordered_end()) {
+    if (count == 0) {
         return 0;
     }
-    return it->seg->valid_cnt;
+    return sum / count;
 }

@@ -299,13 +299,6 @@ void LogCache::periodic() {
             eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
             uint64_t evicted_in_ghost = ghost_cache.evictCount();
             eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
-
-            // ghost compaction 추정: m번째 segment의 valid_cnt 누적
-            double g_u = ghost_cache.utilization();
-            if (g_u > 0.0 && compactor) {
-                last_ghost_m = static_cast<int>(GHOST_CACHE_RATIO * global_valid_blocks / g_u);
-                ghost_compacted_blocks += compactor->get_mth_score_valid_pages(last_ghost_m);
-            }
             compaction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, ghost_compacted_blocks);
         }
         if (log_cache_timestamp % (segment_size_blocks * 4) == 0) {
@@ -1200,6 +1193,12 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
         evictor->add(victim, log_cache_timestamp);
         if (compact) {
             victim = (LogCacheSegment *)compactor->choose_segment();
+            // ghost compaction 추정: m번째 segment의 valid_cnt 누적
+            double g_u = ghost_cache.utilization();
+            if (g_u > 0.0) {
+                last_ghost_m = static_cast<int>(GHOST_CACHE_RATIO * global_valid_blocks / g_u);
+                ghost_compacted_blocks += compactor->get_mth_score_valid_pages(last_ghost_m);
+            }
             if (victim->valid_cnt >= 0.8 * victim->blocks.size()) {
                 return false;
             }
