@@ -45,7 +45,7 @@ struct Config
 };
 // Incremental GC/Evict: process 1GB segment in 16MB chunks
 // Set to false to bypass and process entire segment at once
-static constexpr bool INCREMENTAL_GC_ENABLED = false;
+static constexpr bool INCREMENTAL_GC_ENABLED = true;
 
 // Free segment thresholds for GC triggering
 static constexpr size_t CRITICAL_FREE_SEGMENTS = 2;   // Block host IO if <= this

@@ -2092,12 +2092,12 @@ struct GcIo {
 	uint64_t read_start;    // Batch read start
 	uint64_t write_start;   // Batch write start
 
-	// Batch processing (1MB = 256 blocks at a time for cache device)
-	static constexpr size_t BATCH_BLOCKS = 256;  // 1MB / 4KB
+	// Batch processing (2MB = 512 blocks at a time for cache device)
+	static constexpr size_t BATCH_BLOCKS = 512;  // 2MB / 4KB
 	size_t batch_start;      // Current batch start index in blocks_to_copy
 	size_t batch_count;      // Number of blocks in current batch
 
-	// Sequential read optimization (when valid_ratio >= 0.5)
+	// Sequential read optimization (when valid_ratio >= 0.3)
 	double valid_ratio;
 	bool use_sequential_read;
 	uint64_t segment_base_offset;
@@ -2451,8 +2451,8 @@ public:
 	// Segment capacity for throttle calculation (freed capacity per GC/Evict)
 	uint64_t segment_capacity() const { return segment_capacity_bytes_; }
 
-	// 16KB Write Buffer - flush when this size is reached
-	static constexpr size_t WRITE_BUFFER_SIZE = 16 * 1024;  // 16KB
+	// 64KB Write Buffer - flush when this size is reached
+	static constexpr size_t WRITE_BUFFER_SIZE = 64 * 1024;  // 64KB
 	static constexpr uint64_t WRITE_BUFFER_TIMEOUT_US = 300;  // 300us
 	// Set to false to bypass write buffer and write directly per-block
 	static constexpr bool WRITE_BUFFER_ENABLED = true;
@@ -3749,9 +3749,6 @@ static void gc_start_reads(GcIo *io)
 			io->seq_chunks.push_back(std::move(sc));
 		}
 
-		SPDK_NOTICELOG("GC seq mode: %zu blocks in %zu chunks\n",
-			       blocks.size(), io->seq_chunks.size());
-
 		gc_start_seq_batch(io);
 		return;
 	}
@@ -4871,7 +4868,7 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 			gc_io->segment_size_blocks = victim->blocks.size();
 			gc_io->segment_base_offset = victim->physical_bases[0];
 			gc_io->valid_ratio = (double)victim->valid_cnt / gc_io->segment_size_blocks;
-			gc_io->use_sequential_read = (gc_io->valid_ratio >= 0.5);
+			gc_io->use_sequential_read = (gc_io->valid_ratio >= 0.3);
 
 			// Calculate score for debugging
 			double u = (double)victim->valid_cnt / victim->blocks.size();
@@ -4937,7 +4934,7 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 		evict_io->segment_base_offset = victim->physical_bases[0];
 		size_t valid_cnt = victim->valid_cnt;  // Actual valid block count
 		evict_io->valid_ratio = (double)valid_cnt / evict_io->segment_size_blocks;
-		evict_io->use_sequential_read = (evict_io->valid_ratio >= 0.5);
+		evict_io->use_sequential_read = (evict_io->valid_ratio >= 0.3);
 
 		SPDK_NOTICELOG("Evict: valid_ratio=%.1f%%, use_sequential_read=%d\n",
 			       evict_io->valid_ratio * 100, evict_io->use_sequential_read);
