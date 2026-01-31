@@ -2094,6 +2094,41 @@ struct GcIo {
 
 	// Batch processing (2MB = 512 blocks at a time for cache device)
 	static constexpr size_t BATCH_BLOCKS = 512;  // 2MB / 4KB
+
+	// Pipeline: double buffering for read/write overlap
+	// buf_idx 0 and 1 alternate between read and write
+	int read_buf_idx;        // Current buffer being read into (0 or 1)
+	int write_buf_idx;       // Current buffer being written from (0 or 1)
+
+	// Per-buffer state (index 0 and 1)
+	size_t buf_batch_start[2];   // Batch start for each buffer
+	size_t buf_batch_count[2];   // Batch count for each buffer
+	void *buf_staging[2];        // Staging buffers
+	size_t buf_staging_size[2];  // Staging buffer sizes
+
+	// Coalesced read tracking per buffer
+	struct CoalescedRead {
+		uint64_t src_offset;   // Start offset
+		size_t num_blocks;     // Number of consecutive blocks
+		size_t first_idx;      // First block index in batch
+	};
+	std::vector<CoalescedRead> buf_coalesced_reads[2];
+	std::atomic<size_t> buf_completed_reads[2];   // Completed coalesced reads per buffer
+	size_t buf_total_reads[2];                    // Total coalesced reads per buffer
+
+	// Write tracking per buffer
+	size_t buf_num_64k_chunks[2];
+	size_t buf_leftover_blocks[2];
+	std::atomic<size_t> buf_completed_64k_writes[2];
+	size_t buf_expected_64k_writes[2];
+	size_t buf_current_leftover_idx[2];
+
+	// Pipeline state
+	std::atomic<bool> read_in_progress;
+	std::atomic<bool> write_in_progress;
+	size_t next_batch_start;     // Next batch to start reading
+
+	// Legacy single-buffer aliases (for compatibility with existing code paths)
 	size_t batch_start;      // Current batch start index in blocks_to_copy
 	size_t batch_count;      // Number of blocks in current batch
 
@@ -2103,7 +2138,7 @@ struct GcIo {
 	uint64_t segment_base_offset;
 	size_t segment_size_blocks;
 
-	// 64KB chunks and leftover tracking (for ZNS write rules)
+	// 64KB chunks and leftover tracking (for ZNS write rules) - legacy
 	static constexpr size_t BLOCKS_PER_64K = 16;  // 64KB / 4KB
 	size_t num_64k_chunks;       // Number of 64KB aligned chunks in current batch
 	size_t leftover_blocks;      // Number of leftover blocks (0-15)
@@ -2111,12 +2146,7 @@ struct GcIo {
 	size_t expected_64k_writes;  // Total expected writes (including stripe-split individual writes)
 	size_t current_leftover_idx; // Current leftover index being written (sequential)
 
-	// Coalesced read tracking (back merge) - for scattered read mode
-	struct CoalescedRead {
-		uint64_t src_offset;   // Start offset
-		size_t num_blocks;     // Number of consecutive blocks
-		size_t first_idx;      // First block index in batch
-	};
+	// Legacy coalesced read (for seq mode compatibility)
 	std::vector<CoalescedRead> coalesced_reads;
 	size_t completed_coalesced_reads;
 
@@ -2145,14 +2175,16 @@ struct GcIo {
 	std::vector<PendingGcWrite> pending_gc_writes;
 	size_t pending_gc_write_idx;       // Current index in pending_gc_writes
 
-	// Staging buffer for current batch (DMA-capable, hugepage)
+	// Staging buffer for current batch (DMA-capable, hugepage) - legacy for seq mode
 	void *staging;
 	size_t staging_size;
 
 	// Completion callback for pending writes
 	std::function<void(int)> on_complete;
 
-	GcIo() : batch_start(0), batch_count(0), valid_ratio(0), use_sequential_read(false),
+	GcIo() : read_buf_idx(0), write_buf_idx(-1),
+	         read_in_progress(false), write_in_progress(false), next_batch_start(0),
+	         batch_start(0), batch_count(0), valid_ratio(0), use_sequential_read(false),
 	         segment_base_offset(0), segment_size_blocks(0),
 	         num_64k_chunks(0), leftover_blocks(0),
 	         completed_64k_writes(0), expected_64k_writes(0), current_leftover_idx(0),
@@ -2162,10 +2194,29 @@ struct GcIo {
 	         pending_gc_write_idx(0),
 	         staging(nullptr), staging_size(0),
 	         start_ticks(0), total_gc_bytes(0), read_ticks(0), write_ticks(0),
-	         read_start(0), write_start(0) {}
+	         read_start(0), write_start(0) {
+		buf_staging[0] = buf_staging[1] = nullptr;
+		buf_staging_size[0] = buf_staging_size[1] = 0;
+		buf_batch_start[0] = buf_batch_start[1] = 0;
+		buf_batch_count[0] = buf_batch_count[1] = 0;
+		buf_completed_reads[0] = buf_completed_reads[1] = 0;
+		buf_total_reads[0] = buf_total_reads[1] = 0;
+		buf_num_64k_chunks[0] = buf_num_64k_chunks[1] = 0;
+		buf_leftover_blocks[0] = buf_leftover_blocks[1] = 0;
+		buf_completed_64k_writes[0] = buf_completed_64k_writes[1] = 0;
+		buf_expected_64k_writes[0] = buf_expected_64k_writes[1] = 0;
+		buf_current_leftover_idx[0] = buf_current_leftover_idx[1] = 0;
+	}
 	~GcIo() {
+		// Free legacy staging
 		if (staging) {
 			icache::dma_pool_free(staging, staging_size);
+		}
+		// Free pipeline staging buffers
+		for (int i = 0; i < 2; i++) {
+			if (buf_staging[i]) {
+				icache::dma_pool_free(buf_staging[i], buf_staging_size[i]);
+			}
 		}
 	}
 };
@@ -3655,13 +3706,20 @@ static void cache_io_run_host_write(CacheIo *io)
 }
 
 //==============================================================================
-// GC State Machine (batch-based: 1MB at a time for cache device)
+// GC State Machine (batch-based: 2MB at a time for cache device)
+// Pipeline: read batch N+1 while writing batch N
 //==============================================================================
 static void gc_coalesced_read_done(void *cb_arg, int status);
 static void gc_write_done(void *cb_arg, int status);
 static void gc_start_batch(GcIo *io);
 static void gc_submit_next_leftover(GcIo *io);
 static void gc_start_writes(GcIo *io);
+// Pipeline functions
+static void gc_pipeline_start_read(GcIo *io, int buf_idx);
+static void gc_pipeline_start_write(GcIo *io, int buf_idx);
+static void gc_pipeline_read_done(void *cb_arg, int status);
+static void gc_pipeline_write_done(void *cb_arg, int status);
+static void gc_pipeline_check_next_step(GcIo *io);
 // Sequential read mode (128k chunks, pipeline read->write)
 static void gc_start_seq_batch(GcIo *io);
 static void gc_seq_read_done(void *cb_arg, int status);
@@ -3753,8 +3811,16 @@ static void gc_start_reads(GcIo *io)
 		return;
 	}
 
-	// Scattered read mode: start first batch
-	gc_start_batch(io);
+	// Scattered read mode: use pipelined read/write
+	// Initialize pipeline state
+	io->read_buf_idx = 0;
+	io->write_buf_idx = -1;  // No write yet
+	io->next_batch_start = 0;
+	io->read_in_progress.store(false);
+	io->write_in_progress.store(false);
+
+	// Start first read (no write to overlap with yet)
+	gc_pipeline_start_read(io, 0);
 }
 
 // Start reading current batch (up to 1MB = 256 blocks)
@@ -4173,6 +4239,476 @@ static void gc_write_done(void *cb_arg, int status)
 		io->current_leftover_idx++;
 		gc_submit_next_leftover(io);
 	}
+}
+
+//==============================================================================
+// GC Pipeline Mode (read batch N+1 while writing batch N)
+//==============================================================================
+
+// Context for pipeline read callback
+struct GcPipelineReadCtx {
+	GcIo *io;
+	int buf_idx;
+	size_t coalesced_idx;
+};
+
+// Context for pipeline write callback
+struct GcPipelineWriteCtx {
+	GcIo *io;
+	int buf_idx;
+	struct iovec *iovs;
+	bool is_leftover;
+};
+
+// Forward declarations for pipeline functions
+static void gc_pipeline_submit_leftover(GcIo *io, int buf_idx);
+static void gc_pipeline_check_next_step(GcIo *io);
+
+// Start reading into buffer buf_idx
+static void gc_pipeline_start_read(GcIo *io, int buf_idx)
+{
+	auto &blocks = io->prepare_result.blocks_to_copy;
+
+	// Check if all batches done
+	if (io->next_batch_start >= blocks.size()) {
+		io->read_in_progress.store(false);
+		gc_pipeline_check_next_step(io);
+		return;
+	}
+
+	io->read_in_progress.store(true);
+	io->read_buf_idx = buf_idx;
+
+	// Calculate batch size
+	size_t remaining = blocks.size() - io->next_batch_start;
+	size_t batch_count = std::min(remaining, GcIo::BATCH_BLOCKS);
+
+	io->buf_batch_start[buf_idx] = io->next_batch_start;
+	io->buf_batch_count[buf_idx] = batch_count;
+	io->next_batch_start += batch_count;
+
+	uint32_t block_size = io->ctx->block_size;
+
+	// Free previous staging buffer if any
+	if (io->buf_staging[buf_idx]) {
+		icache::dma_pool_free(io->buf_staging[buf_idx], io->buf_staging_size[buf_idx]);
+		io->buf_staging[buf_idx] = nullptr;
+	}
+
+	// Allocate DMA-capable staging buffer
+	io->buf_staging_size[buf_idx] = batch_count * block_size;
+	io->buf_staging[buf_idx] = icache::dma_pool_alloc(io->buf_staging_size[buf_idx]);
+	if (!io->buf_staging[buf_idx]) {
+		SPDK_ERRLOG("GC-PIPE: Failed to allocate staging buffer %d\n", buf_idx);
+		io->last_status = -ENOMEM;
+		io->read_in_progress.store(false);
+		gc_pipeline_check_next_step(io);
+		return;
+	}
+
+	// Build coalesced reads
+	io->buf_coalesced_reads[buf_idx].clear();
+	io->buf_completed_reads[buf_idx].store(0);
+
+	size_t batch_start = io->buf_batch_start[buf_idx];
+	for (size_t i = 0; i < batch_count; ++i) {
+		size_t block_idx = batch_start + i;
+		auto &blk = blocks[block_idx];
+
+		if (io->buf_coalesced_reads[buf_idx].empty()) {
+			io->buf_coalesced_reads[buf_idx].push_back({blk.src_offset, 1, i});
+		} else {
+			auto &last = io->buf_coalesced_reads[buf_idx].back();
+			uint64_t expected_offset = last.src_offset + last.num_blocks * block_size;
+			if (blk.src_offset == expected_offset) {
+				last.num_blocks++;
+			} else {
+				io->buf_coalesced_reads[buf_idx].push_back({blk.src_offset, 1, i});
+			}
+		}
+	}
+
+	io->buf_total_reads[buf_idx] = io->buf_coalesced_reads[buf_idx].size();
+
+	// Submit coalesced reads
+	for (size_t r = 0; r < io->buf_coalesced_reads[buf_idx].size(); ++r) {
+		auto &cr = io->buf_coalesced_reads[buf_idx][r];
+		uint8_t *dest = static_cast<uint8_t*>(io->buf_staging[buf_idx]) + cr.first_idx * block_size;
+		size_t read_len = cr.num_blocks * block_size;
+
+		auto *read_ctx = new (std::nothrow) GcPipelineReadCtx{io, buf_idx, r};
+		if (!read_ctx) {
+			io->last_status = -ENOMEM;
+			io->buf_completed_reads[buf_idx]++;
+			continue;
+		}
+
+		int rc = io->ctx->device->read_cache_async(cr.src_offset, dest, read_len,
+							   gc_pipeline_read_done, read_ctx);
+		if (rc != 0) {
+			SPDK_ERRLOG("GC-PIPE: read failed buf=%d, offset=0x%lx, len=%zu, rc=%d\n",
+				    buf_idx, cr.src_offset, read_len, rc);
+			delete read_ctx;
+			io->last_status = rc;
+			io->buf_completed_reads[buf_idx]++;
+		}
+	}
+
+	// Check if all reads completed synchronously (error case)
+	if (io->buf_completed_reads[buf_idx].load() >= io->buf_total_reads[buf_idx]) {
+		io->read_in_progress.store(false);
+		gc_pipeline_check_next_step(io);
+	}
+}
+
+static void gc_pipeline_read_done(void *cb_arg, int status)
+{
+	auto *ctx = static_cast<GcPipelineReadCtx *>(cb_arg);
+	GcIo *io = ctx->io;
+	int buf_idx = ctx->buf_idx;
+	delete ctx;
+
+	if (status != 0) {
+		SPDK_ERRLOG("GC-PIPE: read_done failed buf=%d, status=%d\n", buf_idx, status);
+		if (io->last_status == 0) {
+			io->last_status = status;
+		}
+	}
+
+	size_t done = ++io->buf_completed_reads[buf_idx];
+
+	if (done >= io->buf_total_reads[buf_idx]) {
+		// All reads for this buffer done
+		io->read_in_progress.store(false);
+		gc_pipeline_check_next_step(io);
+	}
+}
+
+// Start writing from buffer buf_idx
+static void gc_pipeline_start_write(GcIo *io, int buf_idx)
+{
+	auto &blocks = io->prepare_result.blocks_to_copy;
+	uint32_t block_size = io->ctx->block_size;
+
+	io->write_in_progress.store(true);
+	io->write_buf_idx = buf_idx;
+
+	size_t batch_start = io->buf_batch_start[buf_idx];
+	size_t batch_count = io->buf_batch_count[buf_idx];
+
+	// Calculate 64KB chunks and leftover
+	io->buf_num_64k_chunks[buf_idx] = batch_count / GcIo::BLOCKS_PER_64K;
+	io->buf_leftover_blocks[buf_idx] = batch_count % GcIo::BLOCKS_PER_64K;
+	io->buf_completed_64k_writes[buf_idx].store(0);
+	io->buf_current_leftover_idx[buf_idx] = 0;
+
+	// Pre-calculate expected writes
+	io->buf_expected_64k_writes[buf_idx] = 0;
+	for (size_t chunk = 0; chunk < io->buf_num_64k_chunks[buf_idx]; ++chunk) {
+		size_t chunk_start = chunk * GcIo::BLOCKS_PER_64K;
+		size_t first_block_idx = batch_start + chunk_start;
+		size_t last_block_in_chunk = first_block_idx + GcIo::BLOCKS_PER_64K - 1;
+
+		if (last_block_in_chunk >= blocks.size()) {
+			io->buf_expected_64k_writes[buf_idx] += 1;
+			continue;
+		}
+
+		size_t first_dst_idx = blocks[first_block_idx].dst_idx;
+		size_t last_dst_idx = blocks[last_block_in_chunk].dst_idx;
+		bool crosses_stripe = (first_dst_idx / STRIPE_CHUNK_BLOCKS) != (last_dst_idx / STRIPE_CHUNK_BLOCKS);
+		io->buf_expected_64k_writes[buf_idx] += crosses_stripe ? GcIo::BLOCKS_PER_64K : 1;
+	}
+
+	// If no 64KB chunks, start leftover immediately
+	if (io->buf_num_64k_chunks[buf_idx] == 0) {
+		if (io->buf_leftover_blocks[buf_idx] > 0) {
+			gc_pipeline_submit_leftover(io, buf_idx);
+		} else {
+			io->write_in_progress.store(false);
+			gc_pipeline_check_next_step(io);
+		}
+		return;
+	}
+
+	int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
+
+	// Submit 64KB chunks
+	for (size_t chunk = 0; chunk < io->buf_num_64k_chunks[buf_idx]; ++chunk) {
+		size_t chunk_start = chunk * GcIo::BLOCKS_PER_64K;
+		size_t first_block_idx = batch_start + chunk_start;
+		size_t last_block_in_chunk = first_block_idx + GcIo::BLOCKS_PER_64K - 1;
+
+		if (last_block_in_chunk >= blocks.size()) {
+			io->buf_completed_64k_writes[buf_idx]++;
+			continue;
+		}
+
+		size_t first_dst_idx = blocks[first_block_idx].dst_idx;
+		size_t last_dst_idx = blocks[last_block_in_chunk].dst_idx;
+		bool crosses_stripe = (first_dst_idx / STRIPE_CHUNK_BLOCKS) != (last_dst_idx / STRIPE_CHUNK_BLOCKS);
+
+		if (crosses_stripe) {
+			// Write each block individually
+			for (size_t i = 0; i < GcIo::BLOCKS_PER_64K; ++i) {
+				size_t block_idx = first_block_idx + i;
+				uint8_t *src = static_cast<uint8_t*>(io->buf_staging[buf_idx]) + (chunk_start + i) * block_size;
+				uint64_t dst_offset = blocks[block_idx].dst_offset;
+
+				struct iovec *single_iov = static_cast<struct iovec*>(malloc(sizeof(struct iovec)));
+				if (!single_iov) {
+					io->last_status = -ENOMEM;
+					io->buf_completed_64k_writes[buf_idx]++;
+					continue;
+				}
+				single_iov->iov_base = src;
+				single_iov->iov_len = block_size;
+
+				auto *write_ctx = new (std::nothrow) GcPipelineWriteCtx{io, buf_idx, single_iov, false};
+				if (!write_ctx) {
+					free(single_iov);
+					io->last_status = -ENOMEM;
+					io->buf_completed_64k_writes[buf_idx]++;
+					continue;
+				}
+
+				int rc = io->ctx->device->writev_cache_async(dst_offset, single_iov, 1,
+									     block_size, gc_pipeline_write_done,
+									     write_ctx, gc_placement_handle);
+				if (rc == 0) {
+					io->ctx->cache->add_gc_write_bytes(block_size);
+					io->ctx->cache->add_cache_write_bytes(block_size);
+				} else {
+					free(single_iov);
+					delete write_ctx;
+					io->last_status = rc;
+					io->buf_completed_64k_writes[buf_idx]++;
+				}
+			}
+			continue;
+		}
+
+		// Normal 64KB write
+		struct iovec *iovs = static_cast<struct iovec*>(calloc(GcIo::BLOCKS_PER_64K, sizeof(struct iovec)));
+		if (!iovs) {
+			io->last_status = -ENOMEM;
+			io->buf_completed_64k_writes[buf_idx]++;
+			continue;
+		}
+
+		uint64_t first_dst_offset = blocks[first_block_idx].dst_offset;
+		for (size_t i = 0; i < GcIo::BLOCKS_PER_64K; ++i) {
+			uint8_t *src = static_cast<uint8_t*>(io->buf_staging[buf_idx]) + (chunk_start + i) * block_size;
+			iovs[i].iov_base = src;
+			iovs[i].iov_len = block_size;
+		}
+
+		auto *write_ctx = new (std::nothrow) GcPipelineWriteCtx{io, buf_idx, iovs, false};
+		if (!write_ctx) {
+			free(iovs);
+			io->last_status = -ENOMEM;
+			io->buf_completed_64k_writes[buf_idx]++;
+			continue;
+		}
+
+		int rc = io->ctx->device->writev_cache_async(first_dst_offset, iovs, GcIo::BLOCKS_PER_64K,
+							     GcIo::BLOCKS_PER_64K * block_size, gc_pipeline_write_done,
+							     write_ctx, gc_placement_handle);
+		if (rc == 0) {
+			io->ctx->cache->add_gc_write_bytes(GcIo::BLOCKS_PER_64K * block_size);
+			io->ctx->cache->add_cache_write_bytes(GcIo::BLOCKS_PER_64K * block_size);
+		} else {
+			free(iovs);
+			delete write_ctx;
+			io->last_status = rc;
+			io->buf_completed_64k_writes[buf_idx]++;
+		}
+	}
+
+	// Check if all 64KB writes completed synchronously
+	if (io->buf_completed_64k_writes[buf_idx].load() >= io->buf_expected_64k_writes[buf_idx]) {
+		if (io->buf_leftover_blocks[buf_idx] > 0) {
+			gc_pipeline_submit_leftover(io, buf_idx);
+		} else {
+			io->write_in_progress.store(false);
+			gc_pipeline_check_next_step(io);
+		}
+	}
+}
+
+static void gc_pipeline_write_done(void *cb_arg, int status)
+{
+	auto *ctx = static_cast<GcPipelineWriteCtx *>(cb_arg);
+	GcIo *io = ctx->io;
+	int buf_idx = ctx->buf_idx;
+	bool is_leftover = ctx->is_leftover;
+
+	if (ctx->iovs) {
+		free(ctx->iovs);
+	}
+	delete ctx;
+
+	if (status != 0) {
+		SPDK_ERRLOG("GC-PIPE: write_done failed buf=%d, is_leftover=%d, status=%d\n",
+			    buf_idx, is_leftover, status);
+		if (io->last_status == 0) {
+			io->last_status = status;
+		}
+	}
+
+	if (!is_leftover) {
+		// 64KB write completed
+		size_t done = ++io->buf_completed_64k_writes[buf_idx];
+
+		if (done >= io->buf_expected_64k_writes[buf_idx]) {
+			if (io->buf_leftover_blocks[buf_idx] > 0) {
+				gc_pipeline_submit_leftover(io, buf_idx);
+			} else {
+				io->write_in_progress.store(false);
+				gc_pipeline_check_next_step(io);
+			}
+		}
+	} else {
+		// Leftover write completed
+		io->buf_current_leftover_idx[buf_idx]++;
+		gc_pipeline_submit_leftover(io, buf_idx);
+	}
+}
+
+static void gc_pipeline_submit_leftover(GcIo *io, int buf_idx)
+{
+	auto &blocks = io->prepare_result.blocks_to_copy;
+	uint32_t block_size = io->ctx->block_size;
+
+	size_t batch_start = io->buf_batch_start[buf_idx];
+	size_t batch_count = io->buf_batch_count[buf_idx];
+	size_t leftover_start = io->buf_num_64k_chunks[buf_idx] * GcIo::BLOCKS_PER_64K;
+
+	if (io->buf_current_leftover_idx[buf_idx] >= io->buf_leftover_blocks[buf_idx]) {
+		// All leftovers done
+		io->write_in_progress.store(false);
+		gc_pipeline_check_next_step(io);
+		return;
+	}
+
+	size_t local_idx = leftover_start + io->buf_current_leftover_idx[buf_idx];
+	size_t block_idx = batch_start + local_idx;
+
+	if (block_idx >= blocks.size()) {
+		io->write_in_progress.store(false);
+		gc_pipeline_check_next_step(io);
+		return;
+	}
+
+	uint8_t *src = static_cast<uint8_t*>(io->buf_staging[buf_idx]) + local_idx * block_size;
+	uint64_t dst_offset = blocks[block_idx].dst_offset;
+
+	struct iovec *single_iov = static_cast<struct iovec*>(malloc(sizeof(struct iovec)));
+	if (!single_iov) {
+		io->last_status = -ENOMEM;
+		io->buf_current_leftover_idx[buf_idx]++;
+		gc_pipeline_submit_leftover(io, buf_idx);
+		return;
+	}
+	single_iov->iov_base = src;
+	single_iov->iov_len = block_size;
+
+	auto *write_ctx = new (std::nothrow) GcPipelineWriteCtx{io, buf_idx, single_iov, true};
+	if (!write_ctx) {
+		free(single_iov);
+		io->last_status = -ENOMEM;
+		io->buf_current_leftover_idx[buf_idx]++;
+		gc_pipeline_submit_leftover(io, buf_idx);
+		return;
+	}
+
+	int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
+
+	int rc = io->ctx->device->writev_cache_async(dst_offset, single_iov, 1,
+						     block_size, gc_pipeline_write_done,
+						     write_ctx, gc_placement_handle);
+	if (rc == 0) {
+		io->ctx->cache->add_gc_write_bytes(block_size);
+		io->ctx->cache->add_cache_write_bytes(block_size);
+	} else {
+		SPDK_ERRLOG("GC-PIPE: leftover write failed buf=%d, idx=%zu, rc=%d\n",
+			    buf_idx, io->buf_current_leftover_idx[buf_idx], rc);
+		free(single_iov);
+		delete write_ctx;
+		io->last_status = rc;
+		io->buf_current_leftover_idx[buf_idx]++;
+		gc_pipeline_submit_leftover(io, buf_idx);
+	}
+}
+
+// Check if we can proceed to next pipeline step
+static void gc_pipeline_check_next_step(GcIo *io)
+{
+	auto &blocks = io->prepare_result.blocks_to_copy;
+
+	bool read_done = !io->read_in_progress.load();
+	bool write_done = !io->write_in_progress.load();
+
+	// Error handling: if error occurred, wait for both to finish then abort
+	if (io->last_status != 0) {
+		if (read_done && write_done) {
+			SPDK_ERRLOG("GC-PIPE: Aborting due to error status=%d\n", io->last_status);
+			io->ctx->cache->cache()->abort_gc(io->prepare_result);
+			io->ctx->cache->set_gc_in_progress(false);
+			gc_io_complete(io, io->last_status);
+		}
+		return;
+	}
+
+	// Case 1: First batch just finished reading, no write running yet
+	if (read_done && io->write_buf_idx == -1) {
+		int finished_read_buf = io->read_buf_idx;
+		io->write_buf_idx = finished_read_buf;
+
+		// Start write for the buffer we just read
+		gc_pipeline_start_write(io, finished_read_buf);
+
+		// Start next read into other buffer (if more batches)
+		if (io->next_batch_start < blocks.size()) {
+			int next_read_buf = 1 - finished_read_buf;
+			gc_pipeline_start_read(io, next_read_buf);
+		}
+		return;
+	}
+
+	// Case 2: Both read and write finished
+	if (read_done && write_done) {
+		int finished_write_buf = io->write_buf_idx;
+		int finished_read_buf = io->read_buf_idx;
+
+		// Check if all batches done
+		bool all_reads_done = (io->next_batch_start >= blocks.size()) &&
+		                      (io->buf_completed_reads[finished_read_buf].load() >= io->buf_total_reads[finished_read_buf] || io->buf_total_reads[finished_read_buf] == 0);
+
+		if (all_reads_done && finished_write_buf == finished_read_buf) {
+			// Truly all done - finalize
+			io->state = GcIoState::GC_SEGMENT_DONE;
+			io->ctx->cache->cache()->finalize_gc_async(io->prepare_result, gc_finalize_done, io);
+			return;
+		}
+
+		if (all_reads_done) {
+			// No more reads, but we have one more buffer to write
+			gc_pipeline_start_write(io, finished_read_buf);
+			return;
+		}
+
+		// More work to do: swap buffers
+		// Write the buffer we just finished reading
+		// Read into the buffer we just finished writing
+		gc_pipeline_start_write(io, finished_read_buf);
+		gc_pipeline_start_read(io, finished_write_buf);
+		return;
+	}
+
+	// Case 3: Only write finished, read still in progress
+	// Case 4: Only read finished, write still in progress
+	// Just wait - no action needed
 }
 
 //==============================================================================
