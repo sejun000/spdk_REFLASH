@@ -2153,7 +2153,7 @@ struct GcIo {
 	// Sequential read mode (128k chunks) - for high valid_ratio
 	static constexpr size_t SEQ_CHUNK_BLOCKS = 32;  // 128KB / 4KB
 	static constexpr size_t SEQ_PARALLEL_CHUNKS = 8;  // 8 * 128KB = 1MB parallel reads
-	static constexpr size_t GC_WRITES_PER_YIELD = 8;  // Yield after 8 writes (32KB)
+	static constexpr size_t GC_WRITES_PER_YIELD = 8;  // Yield every 8 writes
 	struct SeqChunk {
 		size_t chunk_idx;      // 128k chunk index in segment
 		std::vector<size_t> valid_block_indices;  // indices in blocks_to_copy
@@ -2241,7 +2241,7 @@ struct EvictIo {
 	// Parallel chunk processing - process N 128k chunks at once
 	static constexpr size_t PARALLEL_CHUNKS = 16;   // 16 * 128k = 2MB
 	static constexpr size_t CHUNK_SIZE = 32 * 4096; // 128k per chunk
-	static constexpr size_t EVICT_WRITES_PER_YIELD = 8;  // Yield after 8 writes (32KB)
+	static constexpr size_t EVICT_WRITES_PER_YIELD = 8;  // Yield every 8 merged writes
 	size_t parallel_batch_start;   // Start index of current parallel batch
 	size_t parallel_batch_count;   // Number of chunks in current batch
 	std::atomic<size_t> parallel_reads_done;   // Atomic counter for parallel reads
@@ -2291,6 +2291,32 @@ struct EvictIo {
 	void *staging;
 	size_t staging_size;
 
+	// Pipeline: double buffering for read/write overlap
+	int read_buf_idx;        // Current buffer being read into (0 or 1)
+	int write_buf_idx;       // Current buffer being written from (0 or 1, -1 if none)
+
+	// Per-buffer state
+	size_t buf_batch_start[2];   // Batch start for each buffer (chunk index)
+	size_t buf_batch_count[2];   // Number of chunks in each buffer
+	void *buf_staging[2];        // Staging buffers
+	size_t buf_staging_size[2];  // Staging buffer sizes
+
+	// Per-buffer read tracking
+	std::atomic<size_t> buf_reads_done[2];  // Completed reads per buffer
+	size_t buf_total_reads[2];              // Total reads per buffer
+
+	// Per-buffer write tracking
+	std::vector<PendingEvictWrite> buf_pending_writes[2];
+	std::vector<MergedEvictWrite> buf_merged_writes[2];
+	size_t buf_merged_write_idx[2];
+	std::atomic<size_t> buf_writes_done[2];
+	size_t buf_total_writes[2];
+
+	// Pipeline state
+	std::atomic<bool> read_in_progress;
+	std::atomic<bool> write_in_progress;
+	size_t next_chunk_idx;  // Next chunk to start reading
+
 	// Completion callback
 	std::function<void(int)> on_complete;
 
@@ -2300,10 +2326,28 @@ struct EvictIo {
 	            start_ticks(0), read_total_us(0), write_total_us(0),
 	            batch_read_start_ticks(0), batch_write_start_ticks(0), total_bytes(0), segment_base_offset(0),
 	            segment_size_blocks(0), valid_ratio(0), use_sequential_read(false),
-	            staging(nullptr), staging_size(0) {}
+	            staging(nullptr), staging_size(0),
+	            read_buf_idx(0), write_buf_idx(-1),
+	            read_in_progress(false), write_in_progress(false), next_chunk_idx(0) {
+		buf_batch_start[0] = buf_batch_start[1] = 0;
+		buf_batch_count[0] = buf_batch_count[1] = 0;
+		buf_staging[0] = buf_staging[1] = nullptr;
+		buf_staging_size[0] = buf_staging_size[1] = 0;
+		buf_reads_done[0].store(0); buf_reads_done[1].store(0);
+		buf_total_reads[0] = buf_total_reads[1] = 0;
+		buf_merged_write_idx[0] = buf_merged_write_idx[1] = 0;
+		buf_writes_done[0].store(0); buf_writes_done[1].store(0);
+		buf_total_writes[0] = buf_total_writes[1] = 0;
+	}
 	~EvictIo() {
 		if (staging) {
 			icache::dma_pool_free(staging, staging_size);
+		}
+		if (buf_staging[0]) {
+			icache::dma_pool_free(buf_staging[0], buf_staging_size[0]);
+		}
+		if (buf_staging[1]) {
+			icache::dma_pool_free(buf_staging[1], buf_staging_size[1]);
 		}
 	}
 };
@@ -2699,9 +2743,9 @@ private:
 	// Throttle constants
 	static constexpr size_t THROTTLE_START_SEGS = 9;      // Start throttle at <= 9 free segs
 	static constexpr size_t THROTTLE_CRITICAL_SEGS = 2;   // Critical - block all at <= 2
-	static constexpr double THROTTLE_STEP_DOWN = 0.05;    // 5% decrease when free_segs drops
-	static constexpr double THROTTLE_STEP_UP = 0.05;      // 5% increase when free_segs rises or unchanged
-	static constexpr uint64_t THROTTLE_INTERVAL_MS = 500; // 500ms interval
+	static constexpr double THROTTLE_STEP_DOWN = 0.07;    // 7% decrease when free_segs drops
+	static constexpr double THROTTLE_STEP_UP = 0.07;      // 7% increase when free_segs rises or unchanged
+	static constexpr uint64_t THROTTLE_INTERVAL_MS = 2000; // 2s interval
 
 public:
 	// Initialize throttle (call after device ready)
@@ -2737,7 +2781,11 @@ public:
 
 		size_t current_free = free_segment_count();
 		size_t prev_free = t.prev_free_segs;
-		uint64_t current_perf = t.blocks_submitted > 0 ? t.blocks_submitted : 1;
+		// Use actual submitted blocks, or fall back to previous limit if no writes happened
+		// Minimum 600000 blocks (~2.4GB) to avoid getting stuck at low values
+		static constexpr uint64_t MIN_THROTTLE_BLOCKS = 600000;
+		uint64_t base_perf = t.blocks_submitted > 0 ? t.blocks_submitted : t.blocks_limit;
+		uint64_t current_perf = std::max(base_perf, MIN_THROTTLE_BLOCKS);
 
 		// Determine level for logging
 		Throttle::Level cur_level;
@@ -2759,23 +2807,34 @@ public:
 		if (current_free > THROTTLE_START_SEGS) {
 			// Above threshold (>9): no throttle
 			if (t.blocks_limit > 0) {
-				SPDK_NOTICELOG("THROTTLE: Recovered to unlimited (free_segs=%zu)\n", current_free);
+				SPDK_NOTICELOG("THROTTLE: Recovered to unlimited (free_segs=%zu, current_perf=%lu)\n",
+					       current_free, current_perf);
 			}
 			t.blocks_limit = 0;  // 0 = no limit
 		} else {
 			// In throttle zone (<=9)
-			if (current_free < prev_free) {
-				// Free segments decreased -> next limit = current_perf * 0.95
-				t.blocks_limit = static_cast<uint64_t>(current_perf * (1.0 - THROTTLE_STEP_DOWN));
-				if (t.blocks_limit < 1) t.blocks_limit = 1;
-				SPDK_NOTICELOG("THROTTLE: Decreased limit to %lu (was %lu, free_segs=%zu->%zu)\n",
-					       t.blocks_limit, current_perf, prev_free, current_free);
+			if (t.blocks_limit == 0) {
+				// First time entering (or re-entering) throttle zone
+				// Start from current_perf with STEP_DOWN applied
+				uint64_t new_limit = static_cast<uint64_t>(current_perf * (1.0 - THROTTLE_STEP_DOWN));
+				new_limit = std::max(new_limit, MIN_THROTTLE_BLOCKS);
+				SPDK_NOTICELOG("THROTTLE: Entering throttle zone, limit=%lu (current_perf=%lu, free_segs=%zu)\n",
+					       new_limit, current_perf, current_free);
+				t.blocks_limit = new_limit;
+			} else if (current_free < prev_free) {
+				// Free segments decreased -> decrease limit by STEP_DOWN %
+				uint64_t new_limit = static_cast<uint64_t>(t.blocks_limit * (1.0 - THROTTLE_STEP_DOWN));
+				new_limit = std::max(new_limit, MIN_THROTTLE_BLOCKS);
+				SPDK_NOTICELOG("THROTTLE: Decreased limit to %lu (was %lu, current_perf=%lu, free_segs=%zu->%zu)\n",
+					       new_limit, t.blocks_limit, current_perf, prev_free, current_free);
+				t.blocks_limit = new_limit;
 			} else {
-				// Free segments increased or unchanged -> next limit = current_perf * 1.03
-				t.blocks_limit = static_cast<uint64_t>(current_perf * (1.0 + THROTTLE_STEP_UP));
+				// Free segments increased or unchanged -> increase limit by STEP_UP %
+				uint64_t new_limit = static_cast<uint64_t>(t.blocks_limit * (1.0 + THROTTLE_STEP_UP));
 				// No upper cap here - limit removed when free_segs > 9
-				SPDK_NOTICELOG("THROTTLE: Increased limit to %lu (was %lu, free_segs=%zu->%zu)\n",
-					       t.blocks_limit, current_perf, prev_free, current_free);
+				SPDK_NOTICELOG("THROTTLE: Increased limit to %lu (was %lu, current_perf=%lu, free_segs=%zu->%zu)\n",
+					       new_limit, t.blocks_limit, current_perf, prev_free, current_free);
+				t.blocks_limit = new_limit;
 			}
 		}
 
@@ -4715,10 +4774,12 @@ static void gc_pipeline_check_next_step(GcIo *io)
 // GC Sequential Read Mode (128k chunks, pipeline read->write)
 //==============================================================================
 
-// Context for sequential read - includes chunk index
+// Context for sequential read/write
 struct GcSeqReadCtx {
 	GcIo *io;
-	size_t batch_idx;  // Which chunk in current parallel batch
+	size_t batch_idx;      // Which chunk in current parallel batch (for reads)
+	size_t block_count;    // Number of blocks in this write (for writes, 1 or 16)
+	struct iovec *iovs;    // iovec array to free on completion (can be nullptr)
 };
 
 static void gc_start_seq_batch(GcIo *io)
@@ -4794,10 +4855,10 @@ static void gc_start_seq_batch(GcIo *io)
 		// Calculate cache offset for this 128k chunk
 		uint64_t cache_offset = victim->get_block_offset(sc.chunk_idx * GcIo::SEQ_CHUNK_BLOCKS, block_size);
 
-		auto *read_ctx = new (std::nothrow) GcSeqReadCtx{io, batch_idx};
+		auto *read_ctx = new (std::nothrow) GcSeqReadCtx{io, batch_idx, 0, nullptr};
 		if (!read_ctx) {
 			io->last_status = -ENOMEM;
-			io->seq_reads_done++;
+			io->seq_reads_done.fetch_add(1);
 			io->seq_writes_done.fetch_add(sc.valid_block_indices.size());
 			continue;
 		}
@@ -4807,7 +4868,7 @@ static void gc_start_seq_batch(GcIo *io)
 		if (rc != 0) {
 			delete read_ctx;
 			io->last_status = rc;
-			io->seq_reads_done++;
+			io->seq_reads_done.fetch_add(1);
 			io->seq_writes_done.fetch_add(sc.valid_block_indices.size());
 		}
 	}
@@ -4889,13 +4950,19 @@ static void gc_seq_write_done(void *cb_arg, int status)
 {
 	auto *ctx = static_cast<GcSeqReadCtx *>(cb_arg);
 	GcIo *io = ctx->io;
+	size_t block_count = ctx->block_count;
+
+	// Free iovec if allocated
+	if (ctx->iovs) {
+		free(ctx->iovs);
+	}
 	delete ctx;
 
 	if (status != 0 && io->last_status == 0) {
 		io->last_status = status;
 	}
 
-	size_t done = ++io->seq_writes_done;
+	size_t done = io->seq_writes_done.fetch_add(block_count) + block_count;
 	if (done >= io->seq_total_writes) {
 		// io->write_ticks += spdk_get_ticks() - io->write_start;
 		io->seq_current_chunk += io->seq_parallel_count;
@@ -4904,48 +4971,93 @@ static void gc_seq_write_done(void *cb_arg, int status)
 	}
 }
 
-// Yield-based GC write dispatcher - submits up to GC_WRITES_PER_YIELD writes, then yields
-// Uses writev_cache_async to go through global outstanding cmd limiting
+// Yield-based GC write dispatcher - submits 64KB merged writes, then yields
+// Groups 16 consecutive 4KB blocks into one 64KB scatter-gather write
 static void gc_dispatch_writes(GcIo *io)
 {
 	auto &writes = io->pending_gc_writes;
 	size_t submitted = 0;
+	int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
+	uint32_t block_size = io->ctx->block_size;
 
 	while (io->pending_gc_write_idx < writes.size() && submitted < GcIo::GC_WRITES_PER_YIELD) {
-		auto &w = writes[io->pending_gc_write_idx++];
+		size_t remaining = writes.size() - io->pending_gc_write_idx;
 
-		// Allocate iovec for single block write
-		struct iovec *iov = static_cast<struct iovec*>(malloc(sizeof(struct iovec)));
-		if (!iov) {
-			io->last_status = -ENOMEM;
-			++io->seq_writes_done;
-			continue;
-		}
-		iov->iov_base = w.src;
-		iov->iov_len = w.block_size;
+		if (remaining >= GcIo::BLOCKS_PER_64K) {
+			// 64KB merged write (16 blocks)
+			struct iovec *iovs = static_cast<struct iovec*>(calloc(GcIo::BLOCKS_PER_64K, sizeof(struct iovec)));
+			if (!iovs) {
+				io->last_status = -ENOMEM;
+				io->seq_writes_done.fetch_add(GcIo::BLOCKS_PER_64K);
+				io->pending_gc_write_idx += GcIo::BLOCKS_PER_64K;
+				continue;
+			}
 
-		auto *write_ctx = new (std::nothrow) GcSeqReadCtx{io, 0};
-		if (!write_ctx) {
-			free(iov);
-			io->last_status = -ENOMEM;
-			++io->seq_writes_done;
-			continue;
-		}
+			uint64_t first_dst_offset = writes[io->pending_gc_write_idx].dst_offset;
+			size_t total_len = 0;
+			for (size_t i = 0; i < GcIo::BLOCKS_PER_64K; ++i) {
+				auto &w = writes[io->pending_gc_write_idx + i];
+				iovs[i].iov_base = w.src;
+				iovs[i].iov_len = w.block_size;
+				total_len += w.block_size;
+			}
 
-		// Use writev_cache_async to respect global outstanding cmd limit
-		// GC uses placement handles 2~6 (host uses 0, 1)
-		int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
-		int rc = io->ctx->device->writev_cache_async(w.dst_offset, iov, 1, w.block_size,
-							     gc_seq_write_done, write_ctx, gc_placement_handle);
-		if (rc == 0) {
-			io->ctx->cache->add_gc_write_bytes(w.block_size);
-			io->ctx->cache->add_cache_write_bytes(w.block_size);
-			++submitted;
+			auto *write_ctx = new (std::nothrow) GcSeqReadCtx{io, 0, GcIo::BLOCKS_PER_64K, iovs};
+			if (!write_ctx) {
+				free(iovs);
+				io->last_status = -ENOMEM;
+				io->seq_writes_done.fetch_add(GcIo::BLOCKS_PER_64K);
+				io->pending_gc_write_idx += GcIo::BLOCKS_PER_64K;
+				continue;
+			}
+
+			int rc = io->ctx->device->writev_cache_async(first_dst_offset, iovs, GcIo::BLOCKS_PER_64K,
+								     total_len, gc_seq_write_done, write_ctx, gc_placement_handle);
+			if (rc == 0) {
+				io->ctx->cache->add_gc_write_bytes(total_len);
+				io->ctx->cache->add_cache_write_bytes(total_len);
+				io->pending_gc_write_idx += GcIo::BLOCKS_PER_64K;
+				++submitted;
+			} else {
+				free(iovs);
+				delete write_ctx;
+				io->last_status = rc;
+				io->seq_writes_done.fetch_add(GcIo::BLOCKS_PER_64K);
+				io->pending_gc_write_idx += GcIo::BLOCKS_PER_64K;
+			}
 		} else {
-			free(iov);
-			delete write_ctx;
-			io->last_status = rc;
-			++io->seq_writes_done;
+			// Leftover blocks (< 16): write individually
+			auto &w = writes[io->pending_gc_write_idx++];
+
+			struct iovec *iov = static_cast<struct iovec*>(malloc(sizeof(struct iovec)));
+			if (!iov) {
+				io->last_status = -ENOMEM;
+				io->seq_writes_done.fetch_add(1);
+				continue;
+			}
+			iov->iov_base = w.src;
+			iov->iov_len = w.block_size;
+
+			auto *write_ctx = new (std::nothrow) GcSeqReadCtx{io, 0, 1, iov};
+			if (!write_ctx) {
+				free(iov);
+				io->last_status = -ENOMEM;
+				io->seq_writes_done.fetch_add(1);
+				continue;
+			}
+
+			int rc = io->ctx->device->writev_cache_async(w.dst_offset, iov, 1, w.block_size,
+								     gc_seq_write_done, write_ctx, gc_placement_handle);
+			if (rc == 0) {
+				io->ctx->cache->add_gc_write_bytes(w.block_size);
+				io->ctx->cache->add_cache_write_bytes(w.block_size);
+				++submitted;
+			} else {
+				free(iov);
+				delete write_ctx;
+				io->last_status = rc;
+				io->seq_writes_done.fetch_add(1);
+			}
 		}
 	}
 
@@ -4991,8 +5103,13 @@ static void evict_finalize_done(void *cb_arg, int status)
 		// Accumulate total_bytes for accurate throughput calculation
 		io->total_bytes += io->prepare_result.chunks.size() * 32 * io->ctx->block_size;
 
-		// Continue with next chunk
-		io->current_chunk_idx = 0;  // Reset chunk index for new batch
+		// Continue with next chunk - reset pipeline state
+		io->current_chunk_idx = 0;
+		io->next_chunk_idx = 0;
+		io->read_buf_idx = 0;
+		io->write_buf_idx = -1;
+		io->read_in_progress.store(false);
+		io->write_in_progress.store(false);
 		evict_start_chunk(io);
 		return;
 	}
@@ -5008,21 +5125,41 @@ struct CoalescedReadCtx {
 	struct iovec *iovs;
 	int iovcnt;
 	size_t batch_idx;  // Which chunk in the batch this read is for
+	int buf_idx;       // Which pipeline buffer (0 or 1)
 };
 
+// Legacy non-pipelined evict functions (kept for reference but not used)
 static void coalesced_read_done(void *cb_arg, int status);
 static void evict_merge_writes(EvictIo *io);
 static void evict_dispatch_writes(EvictIo *io);
 static void evict_dispatch_writes_msg(void *arg);
 
+// Pipelined evict functions
+static void evict_pipeline_start_read(EvictIo *io, int buf_idx);
+static void evict_pipeline_read_done(void *cb_arg, int status);
+static void evict_pipeline_start_write(EvictIo *io, int buf_idx);
+static void evict_pipeline_write_done(void *cb_arg, int status);
+static void evict_pipeline_check_next_step(EvictIo *io);
+static void evict_pipeline_merge_writes(EvictIo *io, int buf_idx);
+static void evict_pipeline_dispatch_writes(EvictIo *io, int buf_idx);
+
 static void evict_start_chunk(EvictIo *io)
 {
 	auto &chunks = io->prepare_result.chunks;
 
-	if (io->current_chunk_idx >= chunks.size()) {
-		// All chunks processed
+	// Check if all chunks already processed (called at init or after last batch)
+	if (io->next_chunk_idx >= chunks.size()) {
+		// All chunks processed - wait for any in-flight operations
+		bool read_done = !io->read_in_progress.load();
+		bool write_done = !io->write_in_progress.load();
+
+		if (!read_done || !write_done) {
+			// Still have in-flight ops - will be called again from check_next_step
+			return;
+		}
+
 		io->state = EvictIoState::EVICT_SEGMENT_DONE;
-		// CRITICAL: Do NOT finalize if writes failed - would erase mapping for data not written to backend
+		// CRITICAL: Do NOT finalize if writes failed
 		if (io->last_status != 0) {
 			SPDK_ERRLOG("EVICT: Skipping finalize due to write failure (status=%d), keeping cache mappings\n", io->last_status);
 			io->ctx->cache->cache()->abort_evict(io->prepare_result);
@@ -5034,98 +5171,371 @@ static void evict_start_chunk(EvictIo *io)
 		return;
 	}
 
+	// Initialize pipeline state
 	io->state = EvictIoState::BACKEND_READ_BLOCK;
-	// io->batch_read_start_ticks = spdk_get_ticks();
-	io->batch_write_start_ticks = 0;
+	io->read_buf_idx = 0;
+	io->write_buf_idx = -1;  // No write yet
+	io->read_in_progress.store(false);
+	io->write_in_progress.store(false);
+
+	// Start first read into buffer 0
+	evict_pipeline_start_read(io, 0);
+}
+
+//==============================================================================
+// Evict Pipeline Implementation
+//==============================================================================
+
+static void evict_pipeline_start_read(EvictIo *io, int buf_idx)
+{
+	auto &chunks = io->prepare_result.chunks;
 	uint32_t block_size = io->ctx->block_size;
 	constexpr size_t CHUNK_BLOCKS = 32;  // 128k = 32 * 4k
-	size_t chunk_size = CHUNK_BLOCKS * block_size;  // 128k
+	size_t chunk_size = CHUNK_BLOCKS * block_size;
 
-	// Calculate batch size (8 chunks = 1MB)
-	size_t remaining = chunks.size() - io->current_chunk_idx;
-	io->parallel_batch_start = io->current_chunk_idx;
-	io->parallel_batch_count = std::min(remaining, EvictIo::PARALLEL_CHUNKS);
-
-	// Free previous staging buffer
-	if (io->staging) {
-		icache::dma_pool_free(io->staging, io->staging_size);
-		io->staging = nullptr;
-	}
-
-	// Allocate staging for 128k * batch_count
-	io->staging_size = io->parallel_batch_count * chunk_size;
-	io->staging = icache::dma_pool_alloc(io->staging_size);
-	if (!io->staging) {
-		io->ctx->cache->set_evict_in_progress(false);
-		evict_io_complete(io, -ENOMEM);
+	// Check if more chunks to read
+	if (io->next_chunk_idx >= chunks.size()) {
+		// No more reads - check if we can finalize
+		evict_pipeline_check_next_step(io);
 		return;
 	}
 
-	// Count total valid blocks for write completion tracking
-	size_t total_valid_blocks = 0;
-	for (size_t i = 0; i < io->parallel_batch_count; ++i) {
-		auto &chunk = chunks[io->parallel_batch_start + i];
-		for (bool valid : chunk.valid_mask) {
-			if (valid) total_valid_blocks++;
-		}
+	// Calculate batch size for this buffer
+	size_t remaining = chunks.size() - io->next_chunk_idx;
+	size_t batch_count = std::min(remaining, EvictIo::PARALLEL_CHUNKS);
+
+	io->buf_batch_start[buf_idx] = io->next_chunk_idx;
+	io->buf_batch_count[buf_idx] = batch_count;
+	io->next_chunk_idx += batch_count;
+
+	// Free previous staging buffer if any
+	if (io->buf_staging[buf_idx]) {
+		icache::dma_pool_free(io->buf_staging[buf_idx], io->buf_staging_size[buf_idx]);
+		io->buf_staging[buf_idx] = nullptr;
 	}
 
-	io->parallel_reads_done.store(0);
-	io->parallel_writes_done.store(0);
-	io->coalesced_writes_total = total_valid_blocks;
-	io->pending_evict_writes.clear();
-	io->merged_evict_writes.clear();
-	io->merged_evict_write_idx = 0;
+	// Allocate staging for this batch
+	io->buf_staging_size[buf_idx] = batch_count * chunk_size;
+	io->buf_staging[buf_idx] = icache::dma_pool_alloc(io->buf_staging_size[buf_idx]);
+	if (!io->buf_staging[buf_idx]) {
+		io->last_status = -ENOMEM;
+		evict_pipeline_check_next_step(io);
+		return;
+	}
+
+	// Initialize per-buffer tracking
+	io->buf_reads_done[buf_idx].store(0);
+	io->buf_total_reads[buf_idx] = batch_count;
+	io->buf_pending_writes[buf_idx].clear();
+	io->buf_merged_writes[buf_idx].clear();
+	io->buf_merged_write_idx[buf_idx] = 0;
+	io->buf_writes_done[buf_idx].store(0);
+	io->buf_total_writes[buf_idx] = 0;
+
+	io->read_buf_idx = buf_idx;
+	io->read_in_progress.store(true);
 
 	LogCacheSegment *victim = io->prepare_result.victim_seg;
 
-	// Issue 8 x 128k reads in parallel
-	for (size_t batch_idx = 0; batch_idx < io->parallel_batch_count; ++batch_idx) {
-		size_t chunk_idx = io->parallel_batch_start + batch_idx;
+	// Issue reads for this batch
+	for (size_t batch_idx = 0; batch_idx < batch_count; ++batch_idx) {
+		size_t chunk_idx = io->buf_batch_start[buf_idx] + batch_idx;
 		auto &chunk = chunks[chunk_idx];
 
-		void *buf = static_cast<uint8_t*>(io->staging) + batch_idx * chunk_size;
+		void *buf = static_cast<uint8_t*>(io->buf_staging[buf_idx]) + batch_idx * chunk_size;
 
-		// Calculate cache offset: first block of this 128k chunk
 		size_t first_seg_idx = chunk.cache_chunk_idx * CHUNK_BLOCKS;
 		uint64_t cache_offset = victim->get_block_offset(first_seg_idx, block_size);
 
-		auto *read_ctx = new (std::nothrow) CoalescedReadCtx{io, nullptr, 0, batch_idx};
+		auto *read_ctx = new (std::nothrow) CoalescedReadCtx{io, nullptr, 0, batch_idx, buf_idx};
 		if (!read_ctx) {
 			io->last_status = -ENOMEM;
-			io->parallel_reads_done++;
-			// Count all valid blocks in this chunk as done
-			for (bool valid : chunk.valid_mask) {
-				if (valid) io->parallel_writes_done++;
-			}
+			io->buf_reads_done[buf_idx]++;
 			continue;
 		}
 
-		// Read 128k from cache
 		int rc = io->ctx->device->read_cache_async(cache_offset, buf, chunk_size,
-							   coalesced_read_done, read_ctx);
+							   evict_pipeline_read_done, read_ctx);
 		if (rc != 0) {
 			delete read_ctx;
 			io->last_status = rc;
-			io->parallel_reads_done++;
-			for (bool valid : chunk.valid_mask) {
-				if (valid) io->parallel_writes_done++;
-			}
+			io->buf_reads_done[buf_idx]++;
 		}
 	}
 
-	// Check if all completed synchronously (error case)
-	// BUG FIX: Must also check reads are done to avoid use-after-free on staging buffer
-	if ((io->coalesced_writes_total == 0 ||
-	     io->parallel_writes_done.load() >= io->coalesced_writes_total) &&
-	    io->parallel_reads_done.load() >= io->parallel_batch_count) {
-		SPDK_NOTICELOG("EVICT: batch sync complete, moving to next (writes=%zu/%zu, reads=%zu/%zu)\n",
-			       io->parallel_writes_done.load(), io->coalesced_writes_total,
-			       io->parallel_reads_done.load(), io->parallel_batch_count);
-		io->current_chunk_idx += io->parallel_batch_count;
-		evict_start_chunk(io);
+	// Check if all reads completed synchronously (error case)
+	if (io->buf_reads_done[buf_idx].load() >= batch_count) {
+		io->read_in_progress.store(false);
+		evict_pipeline_check_next_step(io);
 	}
 }
+
+static void evict_pipeline_read_done(void *cb_arg, int status)
+{
+	auto *ctx = static_cast<CoalescedReadCtx *>(cb_arg);
+	EvictIo *io = ctx->io;
+	size_t batch_idx = ctx->batch_idx;
+	int buf_idx = ctx->buf_idx;
+
+	delete[] ctx->iovs;
+	delete ctx;
+
+	auto &chunks = io->prepare_result.chunks;
+	size_t chunk_idx = io->buf_batch_start[buf_idx] + batch_idx;
+	auto &chunk = chunks[chunk_idx];
+	uint32_t block_size = io->ctx->block_size;
+	constexpr size_t CHUNK_BLOCKS = 32;
+	size_t chunk_size = CHUNK_BLOCKS * block_size;
+
+	if (status != 0) {
+		if (io->last_status == 0) io->last_status = status;
+	} else {
+		// Queue writes for this chunk into per-buffer pending list
+		void *chunk_buf = static_cast<uint8_t*>(io->buf_staging[buf_idx]) + batch_idx * chunk_size;
+
+		for (size_t i = 0; i < CHUNK_BLOCKS && i < chunk.valid_mask.size(); ++i) {
+			if (!chunk.valid_mask[i]) continue;
+
+			uint64_t backend_key = chunk.backend_keys[i];
+			uint64_t backend_offset = backend_key * block_size;
+			void *blk_buf = static_cast<uint8_t*>(chunk_buf) + i * block_size;
+			io->buf_pending_writes[buf_idx].push_back({backend_offset, blk_buf, block_size});
+		}
+	}
+
+	size_t reads_done = ++io->buf_reads_done[buf_idx];
+
+	if (reads_done >= io->buf_total_reads[buf_idx]) {
+		// All reads for this buffer done
+		io->read_in_progress.store(false);
+		evict_pipeline_check_next_step(io);
+	}
+}
+
+static void evict_pipeline_start_write(EvictIo *io, int buf_idx)
+{
+	// Merge adjacent writes
+	evict_pipeline_merge_writes(io, buf_idx);
+
+	// Always set write_buf_idx to prevent infinite recursion in check_next_step
+	io->write_buf_idx = buf_idx;
+
+	if (io->buf_merged_writes[buf_idx].empty()) {
+		// No writes to do - write is "completed" immediately
+		// Note: write_in_progress stays false, so check_next_step sees write as done
+		io->buf_total_writes[buf_idx] = 0;
+		io->buf_writes_done[buf_idx].store(0);
+		evict_pipeline_check_next_step(io);
+		return;
+	}
+
+	io->write_in_progress.store(true);
+	io->buf_total_writes[buf_idx] = io->buf_merged_writes[buf_idx].size();
+	io->buf_writes_done[buf_idx].store(0);
+	io->buf_merged_write_idx[buf_idx] = 0;
+
+	// Dispatch writes
+	evict_pipeline_dispatch_writes(io, buf_idx);
+}
+
+static void evict_pipeline_write_done(void *cb_arg, int status)
+{
+	auto *ctx = static_cast<CoalescedReadCtx *>(cb_arg);
+	EvictIo *io = ctx->io;
+	int buf_idx = ctx->buf_idx;
+	delete ctx;
+
+	if (status != 0 && io->last_status == 0) {
+		io->last_status = status;
+	}
+
+	size_t done = ++io->buf_writes_done[buf_idx];
+
+	if (done >= io->buf_total_writes[buf_idx]) {
+		// All writes for this buffer done
+		io->write_in_progress.store(false);
+		io->buf_pending_writes[buf_idx].clear();
+		io->buf_merged_writes[buf_idx].clear();
+		evict_pipeline_check_next_step(io);
+	}
+}
+
+static void evict_pipeline_check_next_step(EvictIo *io)
+{
+	auto &chunks = io->prepare_result.chunks;
+
+	bool read_done = !io->read_in_progress.load();
+	bool write_done = !io->write_in_progress.load();
+
+	// Error handling: wait for both to finish then abort
+	if (io->last_status != 0) {
+		if (read_done && write_done) {
+			SPDK_ERRLOG("EVICT-PIPE: Aborting due to error status=%d\n", io->last_status);
+			io->ctx->cache->cache()->abort_evict(io->prepare_result);
+			io->ctx->cache->set_evict_in_progress(false);
+			evict_io_complete(io, io->last_status);
+		}
+		return;
+	}
+
+	// Case 1: First batch just finished reading, no write running yet
+	if (read_done && io->write_buf_idx == -1) {
+		int finished_read_buf = io->read_buf_idx;
+
+		// Start next read FIRST (if more chunks) - before write to handle empty write batches
+		// If write has no data, it will call check_next_step immediately, but read will be in progress
+		if (io->next_chunk_idx < chunks.size()) {
+			int next_read_buf = 1 - finished_read_buf;
+			evict_pipeline_start_read(io, next_read_buf);
+		}
+
+		// Then start write for the buffer we just read
+		evict_pipeline_start_write(io, finished_read_buf);
+		return;
+	}
+
+	// Case 2: Both read and write finished
+	if (read_done && write_done) {
+		int finished_write_buf = io->write_buf_idx;
+		int finished_read_buf = io->read_buf_idx;
+
+		// Check if all work done
+		bool all_reads_done = (io->next_chunk_idx >= chunks.size());
+
+		if (all_reads_done && finished_write_buf == finished_read_buf) {
+			// Truly all done - finalize
+			io->state = EvictIoState::EVICT_SEGMENT_DONE;
+			io->ctx->cache->cache()->finalize_evict_async(io->prepare_result, evict_finalize_done, io);
+			return;
+		}
+
+		if (all_reads_done) {
+			// No more reads, but we have one more buffer to write
+			evict_pipeline_start_write(io, finished_read_buf);
+			return;
+		}
+
+		// More work to do: swap buffers - start read FIRST to handle empty write batches
+		evict_pipeline_start_read(io, finished_write_buf);
+		evict_pipeline_start_write(io, finished_read_buf);
+		return;
+	}
+
+	// Case 3/4: Only one finished - just wait
+}
+
+static void evict_pipeline_merge_writes(EvictIo *io, int buf_idx)
+{
+	auto &writes = io->buf_pending_writes[buf_idx];
+	auto &merged = io->buf_merged_writes[buf_idx];
+	merged.clear();
+
+	if (writes.empty()) return;
+
+	// Sort by backend_offset
+	std::sort(writes.begin(), writes.end(),
+		  [](const EvictIo::PendingEvictWrite &a, const EvictIo::PendingEvictWrite &b) {
+			  return a.backend_offset < b.backend_offset;
+		  });
+
+	// Merge adjacent blocks
+	merged.push_back({writes[0].backend_offset, {}, 0});
+	merged.back().iovs.push_back({writes[0].src, writes[0].block_size});
+	merged.back().total_len = writes[0].block_size;
+
+	for (size_t i = 1; i < writes.size(); ++i) {
+		auto &prev = merged.back();
+		auto &cur = writes[i];
+
+		if (prev.backend_offset + prev.total_len == cur.backend_offset) {
+			prev.iovs.push_back({cur.src, cur.block_size});
+			prev.total_len += cur.block_size;
+		} else {
+			merged.push_back({cur.backend_offset, {}, 0});
+			merged.back().iovs.push_back({cur.src, cur.block_size});
+			merged.back().total_len = cur.block_size;
+		}
+	}
+}
+
+// Helper struct for dispatch msg - must be defined before use
+struct EvictDispatchMsgCtx {
+	EvictIo *io;
+	int buf_idx;
+};
+
+static void evict_pipeline_dispatch_writes_msg(void *arg);
+
+static void evict_pipeline_dispatch_writes(EvictIo *io, int buf_idx)
+{
+	auto &merged = io->buf_merged_writes[buf_idx];
+	size_t submitted = 0;
+
+	while (io->buf_merged_write_idx[buf_idx] < merged.size() &&
+	       submitted < EvictIo::EVICT_WRITES_PER_YIELD) {
+		auto &w = merged[io->buf_merged_write_idx[buf_idx]++];
+
+		auto *write_ctx = new (std::nothrow) CoalescedReadCtx{io, nullptr, 0, 0, buf_idx};
+		if (!write_ctx) {
+			io->last_status = -ENOMEM;
+			++io->buf_writes_done[buf_idx];
+			continue;
+		}
+
+		int rc;
+		if (w.iovs.size() == 1) {
+			rc = io->ctx->device->write_backend_async(w.backend_offset, w.iovs[0].iov_base,
+								  w.total_len, evict_pipeline_write_done, write_ctx);
+		} else {
+			rc = io->ctx->device->writev_backend_async(w.backend_offset, w.iovs.data(),
+								   static_cast<int>(w.iovs.size()),
+								   w.total_len, evict_pipeline_write_done, write_ctx);
+		}
+
+		if (rc == 0) {
+			io->ctx->cache->add_backend_write_bytes(w.total_len);
+			++submitted;
+		} else {
+			delete write_ctx;
+			io->last_status = rc;
+			++io->buf_writes_done[buf_idx];
+		}
+	}
+
+	// If more writes pending, yield and continue
+	if (io->buf_merged_write_idx[buf_idx] < merged.size()) {
+		auto *msg_ctx = new (std::nothrow) EvictDispatchMsgCtx{io, buf_idx};
+		if (msg_ctx) {
+			spdk_thread_send_msg(spdk_get_thread(), evict_pipeline_dispatch_writes_msg, msg_ctx);
+		} else {
+			// Allocation failed - complete remaining writes as errors
+			size_t remaining = merged.size() - io->buf_merged_write_idx[buf_idx];
+			io->buf_writes_done[buf_idx].fetch_add(remaining);
+			io->last_status = -ENOMEM;
+			if (io->buf_writes_done[buf_idx].load() >= io->buf_total_writes[buf_idx]) {
+				io->write_in_progress.store(false);
+				evict_pipeline_check_next_step(io);
+			}
+		}
+	} else if (io->buf_writes_done[buf_idx].load() >= io->buf_total_writes[buf_idx]) {
+		// All writes already completed synchronously
+		io->write_in_progress.store(false);
+		io->buf_pending_writes[buf_idx].clear();
+		io->buf_merged_writes[buf_idx].clear();
+		evict_pipeline_check_next_step(io);
+	}
+}
+
+static void evict_pipeline_dispatch_writes_msg(void *arg)
+{
+	auto *ctx = static_cast<EvictDispatchMsgCtx *>(arg);
+	evict_pipeline_dispatch_writes(ctx->io, ctx->buf_idx);
+	delete ctx;
+}
+
+//==============================================================================
+// Legacy Evict Functions (kept for reference, not used in pipeline mode)
+//==============================================================================
 
 // Write completion callback for pipelined read->write
 static void pipelined_write_done(void *cb_arg, int status);
@@ -5404,7 +5814,7 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 			gc_io->segment_size_blocks = victim->blocks.size();
 			gc_io->segment_base_offset = victim->physical_bases[0];
 			gc_io->valid_ratio = (double)victim->valid_cnt / gc_io->segment_size_blocks;
-			gc_io->use_sequential_read = (gc_io->valid_ratio >= 0.3);
+			gc_io->use_sequential_read = (gc_io->valid_ratio >= 0.3);  // Use seq mode when valid_ratio >= 30%
 
 			// Calculate score for debugging
 			double u = (double)victim->valid_cnt / victim->blocks.size();
@@ -5470,17 +5880,23 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 		evict_io->segment_base_offset = victim->physical_bases[0];
 		size_t valid_cnt = victim->valid_cnt;  // Actual valid block count
 		evict_io->valid_ratio = (double)valid_cnt / evict_io->segment_size_blocks;
-		evict_io->use_sequential_read = (evict_io->valid_ratio >= 0.3);
+		evict_io->use_sequential_read = (evict_io->valid_ratio >= 0.3);  // Use seq mode when valid_ratio >= 30%
 
 		SPDK_NOTICELOG("Evict: valid_ratio=%.1f%%, use_sequential_read=%d\n",
 			       evict_io->valid_ratio * 100, evict_io->use_sequential_read);
 
 		evict_io->prepare_result = std::move(evict_result);
 		evict_io->current_chunk_idx = 0;
+		evict_io->next_chunk_idx = 0;  // Pipeline: start from first chunk
 		evict_io->completed_reads = 0;
 		evict_io->completed_writes = 0;
 		evict_io->last_status = 0;
 		evict_io->on_complete = std::move(on_complete);
+		// Reset pipeline state
+		evict_io->read_buf_idx = 0;
+		evict_io->write_buf_idx = -1;
+		evict_io->read_in_progress.store(false);
+		evict_io->write_in_progress.store(false);
 
 		evict_io_state_machine(evict_io);
 		return;
