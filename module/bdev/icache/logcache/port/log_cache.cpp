@@ -1273,6 +1273,7 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
 
                 // If no more segments available, fall back to evict-only
                 if (!result.target_seg) {
+                    SPDK_ERRLOG("BUG: No target segment available during incremental GC\n");
                     result.do_evict_only = true;
                     result.blocks_to_copy.clear();
                     break;

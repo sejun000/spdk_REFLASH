@@ -2080,8 +2080,6 @@ struct GcIo {
 	LogCache::GcPrepareResult prepare_result;
 
 	// Progress tracking
-	size_t completed_reads;
-	size_t completed_writes;
 	int last_status;
 
 	// Timing for QoS throttle
@@ -2234,8 +2232,6 @@ struct EvictIo {
 
 	// Progress tracking
 	size_t current_chunk_idx;
-	size_t completed_reads;
-	size_t completed_writes;
 	int last_status;
 
 	// Parallel chunk processing - process N 128k chunks at once
@@ -3484,40 +3480,6 @@ static void cache_io_run_host_read(CacheIo *io)
 static void host_write_next_block(CacheIo *io);
 static void cache_io_run_host_write(CacheIo *io);
 
-static void host_write_block_done(void *cb_arg, int status)
-{
-	CacheIo *io = static_cast<CacheIo *>(cb_arg);
-
-
-	if (status != 0 && io->last_status == 0) {
-		SPDK_ERRLOG("WRITE_BLK_DONE: error status=%d\n", status);
-		io->last_status = status;
-	}
-
-	io->current_block_idx++;
-
-	LogCacheAsync *cache = io->ctx->cache.get();
-
-	// Check if we need GC/Evict after this write
-	if (cache->need_gc_or_evict() && !cache->gc_in_progress() && !cache->evict_in_progress()) {
-		// Need to trigger GC/Evict
-		io->state = CacheIoState::HOST_WRITE_WAIT_GC_EVICT;
-		cache->pending_writes().push_back(io);
-		static uint64_t wait_gc_count = 0;
-		if (++wait_gc_count % 1000 == 1) {
-			SPDK_WARNLOG("BLOCKED: host_write waiting for GC, pending_writes=%zu (blocked %lu times)\n",
-			       cache->pending_writes().size(), wait_gc_count);
-		}
-
-		start_gc_or_evict(io->ctx, [ctx = io->ctx](int status) {
-			process_pending_writes(ctx);
-		});
-		return;
-	}
-
-	host_write_next_block(io);
-}
-
 static void host_write_next_block(CacheIo *io)
 {
 	log_cache_ctx *ctx = io->ctx;
@@ -3758,8 +3720,6 @@ static void gc_finalize_done(void *cb_arg, int status)
 		}
 
 		// Continue with next chunk
-		io->completed_reads = 0;
-		io->completed_writes = 0;
 		io->total_gc_bytes += io->prepare_result.blocks_to_copy.size() * io->ctx->block_size;
 		gc_start_reads(io);
 		return;
@@ -3811,16 +3771,8 @@ static void gc_start_reads(GcIo *io)
 		return;
 	}
 
-	// Scattered read mode: use pipelined read/write
-	// Initialize pipeline state
-	io->read_buf_idx = 0;
-	io->write_buf_idx = -1;  // No write yet
-	io->next_batch_start = 0;
-	io->read_in_progress.store(false);
-	io->write_in_progress.store(false);
-
-	// Start first read (no write to overlap with yet)
-	gc_pipeline_start_read(io, 0);
+	// Scattered read mode: use batch processing (non-pipelined for now)
+	gc_start_batch(io);
 }
 
 // Start reading current batch (up to 1MB = 256 blocks)
@@ -3850,8 +3802,6 @@ static void gc_start_batch(GcIo *io)
 	}
 
 	io->state = GcIoState::READ_GC_SUBMIT;
-	io->completed_reads = 0;
-	io->completed_writes = 0;
 	// io->read_start = spdk_get_ticks();  // Start read timing
 
 	// Calculate batch size
@@ -3985,7 +3935,6 @@ static void gc_start_writes(GcIo *io)
 	io->leftover_blocks = io->batch_count % GcIo::BLOCKS_PER_64K;
 	io->completed_64k_writes = 0;
 	io->current_leftover_idx = 0;
-	io->completed_writes = 0;
 
 	// Pre-calculate expected writes (accounting for stripe boundary splits)
 	// STRIPE_CHUNK_BLOCKS is defined as 32 in log_cache_segment.h
@@ -5392,8 +5341,6 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 			gc_io->state = GcIoState::GC_SEGMENT_SUBMIT;
 			gc_io->ctx = ctx;
 			gc_io->prepare_result = std::move(gc_result);
-			gc_io->completed_reads = 0;
-			gc_io->completed_writes = 0;
 			gc_io->last_status = 0;
 			gc_io->on_complete = std::move(on_complete);
 			// gc_io->start_ticks = spdk_get_ticks();
@@ -5477,8 +5424,6 @@ static void start_gc_or_evict(log_cache_ctx *ctx, std::function<void(int)> on_co
 
 		evict_io->prepare_result = std::move(evict_result);
 		evict_io->current_chunk_idx = 0;
-		evict_io->completed_reads = 0;
-		evict_io->completed_writes = 0;
 		evict_io->last_status = 0;
 		evict_io->on_complete = std::move(on_complete);
 
