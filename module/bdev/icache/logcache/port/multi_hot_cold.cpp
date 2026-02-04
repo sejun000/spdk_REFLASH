@@ -1,4 +1,5 @@
 #include "multi_hot_cold.h"
+#include <cfloat>
 
 MultiHotCold::MultiHotCold(int max_gc_streams, int timestamp_granularity, bool check_created_timestamp_only, bool classify_for_host_append, bool classfy_for_gc_append){
     mMaxGcStreams = max_gc_streams;
@@ -6,12 +7,22 @@ MultiHotCold::MultiHotCold(int max_gc_streams, int timestamp_granularity, bool c
     mCheckCreatedTimestampOnly = check_created_timestamp_only;
     mClassifyForHostAppend = classify_for_host_append;
     mClassifyForGcAppend = classfy_for_gc_append;
+    mAvgLifespan = DBL_MAX;
 }
 
 extern uint64_t g_threshold;
 
 int MultiHotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) {
     uint64_t time_diff = global_timestamp - created_timestamp;
+    if (!isGcAppend) {
+        uint64_t lifespan = global_timestamp - created_timestamp;
+        if (lifespan != 0 && lifespan < mAvgLifespan) {
+            return 0;
+        }
+        else {
+            return 1;
+        }
+    }
     if (mCheckCreatedTimestampOnly) {
         time_diff = created_timestamp;
     }
@@ -60,4 +71,20 @@ int MultiHotCold::GetVictimStreamId(uint64_t global_timestamp, uint64_t threshol
         }
     }
     return -1;
+}
+
+void MultiHotCold::CollectSegment(Segment *segment, uint64_t global_timestamp) {
+  static uint64_t totLifespan = 0;
+  static int nCollects = 0;
+  if (segment->get_class_num() == 0) {
+    //printf("CollectSegment: %lu, class_num: %d\n mAvgLifespan %f\n", segment->get_create_time(), segment->get_class_num(), mAvgLifespan);
+    totLifespan += global_timestamp - segment->get_create_time();
+    nCollects += 1;
+  }
+  if (nCollects == 16) {
+    mAvgLifespan = 1.0 * totLifespan / nCollects;
+    nCollects = 0;
+    totLifespan = 0;
+    //std::cout << "AvgLifespan: " << mAvgLifespan << std::endl;
+  }
 }

@@ -30,7 +30,6 @@
 #include <mutex>
 #include <vector>
 #include <unordered_map>
-#include <unordered_set>
 #include <string>
 #include <chrono>
 #include <queue>
@@ -49,7 +48,7 @@ constexpr int IO_BLOCK_SIZE = 4096;
 constexpr int MAX_IO_SIZE = 1024 * 1024;  // 1MB
 constexpr uint64_t MAX_PENDING_BYTES = 1 * 1024 * 1024;  // 1MB total pending limit
 constexpr int REPORT_INTERVAL = 100000;
-constexpr double DEFAULT_MAX_TB = 4.0;
+constexpr double DEFAULT_MAX_TB = 10.0;
 constexpr const char* DEFAULT_TRACE = "/home/sejun000/alibaba_dwpd1.trace.head30p";
 
 // Global state
@@ -93,17 +92,13 @@ public:
 
         uint64_t ios_since_last = total_ios_ - last_report_ios_;
         if (ios_since_last >= REPORT_INTERVAL || force) {
-            // Calculate interval throughput (not cumulative)
-            uint64_t bytes_since_last = total_bytes_ - last_report_bytes_;
-            double interval_secs = std::chrono::duration<double>(now - last_report_time_).count();
-            if (interval_secs < 0.001) interval_secs = 0.001;
-            double interval_throughput_mb = (bytes_since_last / (1024.0*1024)) / interval_secs;
-            double interval_iops = ios_since_last / interval_secs;
-            double total_gb = total_bytes_ / (1024.0*1024*1024);
+            // All metrics are cumulative averages
+            double avg_iops = total_ios_ / elapsed;
+            double avg_throughput_mb = (total_bytes_ / (1024.0*1024)) / elapsed;
+            double throughput_gb = total_bytes_ / (1024.0*1024*1024);
             printf("[%7.1fs] IOs: %12lu  IOPS: %8.0f  Throughput: %7.1f MB/s  Total: %7.2f GB\n",
-                   elapsed, total_ios_, interval_iops, interval_throughput_mb, total_gb);
+                   elapsed, total_ios_, avg_iops, avg_throughput_mb, throughput_gb);
             last_report_ios_ = total_ios_;
-            last_report_bytes_ = total_bytes_;
             last_report_time_ = now;
         }
     }
@@ -148,13 +143,11 @@ private:
     uint64_t last_report_bytes_ = 0;
 };
 
-// LBA Mapper: maps trace LBAs to device LBAs using hash with linear probing
-// This preserves the spatial distribution of the trace better than sequential allocation
+// LBA Mapper: maps trace LBAs to sequential device LBAs
 class LbaMapper {
 public:
     LbaMapper(uint64_t device_size_bytes)
-        : max_lba_(device_size_bytes / IO_BLOCK_SIZE),
-          used_count_(0) {}
+        : max_lba_(device_size_bytes / IO_BLOCK_SIZE) {}
 
     // Returns mapped device offset for a single 4KB LBA, or -1 if device is full
     int64_t map(uint64_t trace_offset) {
@@ -162,79 +155,45 @@ public:
 
         uint64_t trace_lba = trace_offset / IO_BLOCK_SIZE;
 
-        // Check if already mapped
         auto it = lba_map_.find(trace_lba);
         if (it != lba_map_.end()) {
-            // Already mapped - return existing mapping
+            // Already mapped
             return it->second * IO_BLOCK_SIZE;
         }
 
-        // Device full check
-        if (used_count_ >= max_lba_) {
+        // New LBA - assign next sequential device LBA
+        if (next_device_lba_ >= max_lba_) {
+            // Device full
             skipped_ios_++;
             skipped_bytes_ += IO_BLOCK_SIZE;
             return -1;
         }
 
-        // Hash to get initial position
-        uint64_t initial_pos = hash(trace_lba) % max_lba_;
-        uint64_t device_lba = initial_pos;
-        uint64_t probes = 0;
-
-        // Linear probing to find empty slot
-        while (used_lbas_.count(device_lba) > 0) {
-            device_lba = (device_lba + 1) % max_lba_;
-            probes++;
-
-            // Safety check: if we've probed all slots, device is full
-            // (Should not happen if used_count_ < max_lba_, but just in case)
-            if (probes >= max_lba_) {
-                skipped_ios_++;
-                skipped_bytes_ += IO_BLOCK_SIZE;
-                return -1;
-            }
-        }
-
-        // Record mapping
+        uint64_t device_lba = next_device_lba_++;
         lba_map_[trace_lba] = device_lba;
-        used_lbas_.insert(device_lba);
-        used_count_++;
-        total_probes_ += probes;
-
         return device_lba * IO_BLOCK_SIZE;
     }
 
     void print_stats() {
         std::lock_guard<std::mutex> lock(mutex_);
         uint64_t unique_bytes = lba_map_.size() * IO_BLOCK_SIZE;
-        double avg_probes = lba_map_.size() > 0 ? (double)total_probes_ / lba_map_.size() : 0;
-        double fill_ratio = max_lba_ > 0 ? (double)used_count_ / max_lba_ * 100.0 : 0;
-        printf("\n  LBA Mapping Stats (Hash-based):\n");
+        printf("\n  LBA Mapping Stats:\n");
         printf("    Unique LBAs mapped: %lu (%.2f GB)\n", lba_map_.size(), unique_bytes / (1024.0*1024*1024));
-        printf("    Device fill ratio:  %.2f%%\n", fill_ratio);
-        printf("    Avg probes/insert:  %.2f\n", avg_probes);
         printf("    Skipped IOs:        %lu\n", skipped_ios_);
         printf("    Skipped bytes:      %.2f GB\n", skipped_bytes_ / (1024.0*1024*1024));
     }
 
     uint64_t get_skipped_ios() const { return skipped_ios_; }
-    uint64_t get_unique_lbas() const { return used_count_; }
-    uint64_t get_unique_bytes() const { return used_count_ * IO_BLOCK_SIZE; }
+    uint64_t get_unique_lbas() const { return next_device_lba_; }
+    uint64_t get_unique_bytes() const { return next_device_lba_ * IO_BLOCK_SIZE; }
 
 private:
-    // Knuth's multiplicative hash - good distribution
-    uint64_t hash(uint64_t key) {
-        return key * 2654435761ULL;
-    }
-
     std::mutex mutex_;
-    std::unordered_map<uint64_t, uint64_t> lba_map_;  // trace_lba -> device_lba
-    std::unordered_set<uint64_t> used_lbas_;          // set of used device_lbas
+    std::unordered_map<uint64_t, uint64_t> lba_map_;
     uint64_t max_lba_;
-    uint64_t used_count_;
+    uint64_t next_device_lba_ = 0;
     uint64_t skipped_ios_ = 0;
     uint64_t skipped_bytes_ = 0;
-    uint64_t total_probes_ = 0;  // for stats
 };
 
 // Work item

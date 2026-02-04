@@ -2813,6 +2813,7 @@ public:
 			t.blocks_limit = 0;  // 0 = no limit
 		} else {
 			// In throttle zone (<=9)
+			// Always use current_perf as base for +/- 7% adjustment
 			if (t.blocks_limit == 0) {
 				// First time entering (or re-entering) throttle zone
 				// Start from current_perf with STEP_DOWN applied
@@ -2822,15 +2823,15 @@ public:
 					       new_limit, current_perf, current_free);
 				t.blocks_limit = new_limit;
 			} else if (current_free < prev_free) {
-				// Free segments decreased -> decrease limit by STEP_DOWN %
-				uint64_t new_limit = static_cast<uint64_t>(t.blocks_limit * (1.0 - THROTTLE_STEP_DOWN));
+				// Free segments decreased -> current_perf - 7%
+				uint64_t new_limit = static_cast<uint64_t>(current_perf * (1.0 - THROTTLE_STEP_DOWN));
 				new_limit = std::max(new_limit, MIN_THROTTLE_BLOCKS);
 				SPDK_NOTICELOG("THROTTLE: Decreased limit to %lu (was %lu, current_perf=%lu, free_segs=%zu->%zu)\n",
 					       new_limit, t.blocks_limit, current_perf, prev_free, current_free);
 				t.blocks_limit = new_limit;
 			} else {
-				// Free segments increased or unchanged -> increase limit by STEP_UP %
-				uint64_t new_limit = static_cast<uint64_t>(t.blocks_limit * (1.0 + THROTTLE_STEP_UP));
+				// Free segments increased or unchanged -> current_perf + 7%
+				uint64_t new_limit = static_cast<uint64_t>(current_perf * (1.0 + THROTTLE_STEP_UP));
 				// No upper cap here - limit removed when free_segs > 9
 				SPDK_NOTICELOG("THROTTLE: Increased limit to %lu (was %lu, current_perf=%lu, free_segs=%zu->%zu)\n",
 					       new_limit, t.blocks_limit, current_perf, prev_free, current_free);

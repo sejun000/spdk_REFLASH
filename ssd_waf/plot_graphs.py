@@ -26,9 +26,9 @@ plt.rcParams['legend.fontsize'] = 18
 # Consistent color mapping for configs
 CONFIG_COLORS = {
     "SepBIT": "#1f77b4",           # blue
-    "REFLASH_COLD_FIXED": "#ff7f0e", # orange
-    "REFLASH_WARM_FIXED": "#2ca02c", # green
-    "REFLASH": "#d62728",           # red
+    "REFlash_COLD_FIXED": "#ff7f0e", # orange
+    "REFlash_WARM_FIXED": "#2ca02c", # green
+    "REFlash": "#d62728",           # red
     "CSAL": "#9467bd",              # purple
     "OpenCAS": "#17becf",           # cyan
 }
@@ -226,7 +226,7 @@ def plot_graph_c():
 
 def plot_graph_d():
     """Graph D: Bar chart - Normalized cost (normalized to CSAL)
-    Cost = TLC writes + 6.73 * QLC writes
+    Cost = TLC writes + 2.8 * QLC writes
     """
     fig, ax = plt.subplots(figsize=(14, 10))
 
@@ -247,7 +247,7 @@ def plot_graph_d():
 
     ax.set_xlabel("Config")
     ax.set_ylabel("Normalized Cost (CSAL = 1.0)")
-    ax.set_title("Graph D: Normalized Cost (TLC + 6.73 * QLC)")
+    ax.set_title("Graph D: Normalized Cost (TLC + 2.8 * QLC)")
     ax.set_xticks(x)
     ax.set_xticklabels(ALL_CONFIGS, rotation=45, ha='right')
     ax.axhline(y=1.0, color='red', linestyle='--', linewidth=2, label='CSAL baseline')
@@ -271,7 +271,7 @@ def plot_graph_d():
 
 def plot_graph_d2():
     """Graph D-2: Bar chart - Actual cost (not normalized)
-    Cost = TLC writes + 6.73 * QLC writes
+    Cost = TLC writes + 2.8 * QLC writes
     """
     fig, ax = plt.subplots(figsize=(14, 10))
 
@@ -287,7 +287,7 @@ def plot_graph_d2():
                   edgecolor='black', linewidth=1.5)
 
     ax.set_ylabel("Cost (GB)")
-    ax.set_title("Graph D-2: Actual Cost (TLC + 6.73 * QLC)")
+    ax.set_title("Graph D-2: Actual Cost (TLC + 2.8 * QLC)")
     ax.set_xticks(x)
     ax.set_xticklabels(ALL_CONFIGS, rotation=45, ha='right')
     ax.grid(True, alpha=0.3, axis='y')

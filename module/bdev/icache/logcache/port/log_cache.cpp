@@ -440,10 +440,15 @@ bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64
     write_size_to_cache += lba_sz;
 
     *cache_offset = dst_offset;
-    // Return the current host_write_handle for FDP placement
-    // (this block will be written with this handle)
+    // Return placement handle for FDP
     if (out_stream_id) {
-        *out_stream_id = host_write_handle_;
+        if (stream_policy) {
+            // Use stream policy's classification as placement handle
+            *out_stream_id = seg->get_class_num();
+        } else {
+            // Legacy toggle mode
+            *out_stream_id = host_write_handle_;
+        }
     }
 
     // Check if segment became full after this write - add to evictor immediately
@@ -452,8 +457,10 @@ bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64
     if (segment_full) {
         evict_policy_add(seg);
         active_seg.erase(seg->get_class_num());
-        // Toggle for next block (after segment full)
-        toggle_host_write_handle();
+        // Toggle only when not using stream_policy (legacy mode)
+        if (!stream_policy) {
+            toggle_host_write_handle();
+        }
     }
     if (out_segment_full) {
         *out_segment_full = segment_full;
@@ -580,7 +587,7 @@ LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key,
 {
     LogCacheSegment *seg = nullptr;
     uint64_t previous_blk_create_timestamp = log_cache_timestamp;  // Default to current timestamp for new keys
-    if (gc && exists(key))
+    if (exists(key))
     {
         auto loc = mapping[key];
         assert(loc.seg != nullptr);

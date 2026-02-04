@@ -18,22 +18,22 @@ CONFIGS = {
         "replay_trace": os.path.join(BASE_DIR, "replay_trace_sepbit.log"),
         "csv_type": "icache",  # icache or ftl or ocf
     },
-    "REFLASH_COLD_FIXED": {
+    "REFlash_COLD_FIXED": {
         "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_COLD_20260127_000704.csv"),
         "stat_log": os.path.join(BASE_DIR, "stat.log.20260127_000703"),
         "replay_trace": os.path.join(BASE_DIR, "replay_trace_cold.log"),
         "csv_type": "icache",
     },
-    "REFLASH_WARM_FIXED": {
+    "REFlash_WARM_FIXED": {
         "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_WARM_20260126_135917.csv"),
         "stat_log": os.path.join(BASE_DIR, "stat.log.20260126_135916"),
         "replay_trace": os.path.join(BASE_DIR, "replay_trace_warm_fixed.log"),
         "csv_type": "icache",
     },
-    "REFLASH": {
-        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260126_062111.csv"),
-        "stat_log": os.path.join(BASE_DIR, "stat.log.20260126_062110"),
-        "replay_trace": os.path.join(BASE_DIR, "replay_trace_fdp.log"),
+    "REFlash": {
+        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260130_124017.csv"),
+        "stat_log": os.path.join(BASE_DIR, "stat.log.20260130_124016"),
+        "replay_trace": os.path.join(BASE_DIR, "replay_trace_ghost.log"),
         "csv_type": "icache",
     },
     "CSAL": {
@@ -76,17 +76,17 @@ CSV_COLUMNS = {
     },
 }
 
-# Cost formula: TLC writes + 6.73 * QLC writes
-QLC_COST_MULTIPLIER = 6.73
+# Cost formula: TLC writes + 2.8 * QLC writes
+QLC_COST_MULTIPLIER = 2.8
 
 # Normalization base for Graph D
 NORMALIZATION_BASE = "CSAL"
 
 # Configs that have histogram data (for Graphs E, F)
-HISTOGRAM_CONFIGS = ["SepBIT", "REFLASH_COLD_FIXED", "REFLASH_WARM_FIXED", "REFLASH"]
+HISTOGRAM_CONFIGS = ["SepBIT", "REFlash_COLD_FIXED", "REFlash_WARM_FIXED", "REFlash"]
 
 # All configs for Graphs A, B, C, D, G
-ALL_CONFIGS = ["SepBIT", "REFLASH_COLD_FIXED", "REFLASH_WARM_FIXED", "REFLASH", "CSAL", "OpenCAS"]
+ALL_CONFIGS = ["SepBIT", "REFlash_COLD_FIXED", "REFlash_WARM_FIXED", "REFlash", "CSAL", "OpenCAS"]
 
 # Output file names
 OUTPUT_FILES = {
