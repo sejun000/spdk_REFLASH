@@ -147,6 +147,10 @@ ftl_invalidate_addr(struct spdk_ftl_dev *dev, ftl_addr addr)
 	}
 
 	if (ftl_addr_in_nvc(dev, addr)) {
+		if (ftl_bitmap_get(dev->valid_map, addr)) {
+			assert(dev->nv_cache.nv_cache_valid_blocks > 0);
+			dev->nv_cache.nv_cache_valid_blocks--;
+		}
 		ftl_bitmap_clear(dev->valid_map, addr);
 		return;
 	}

@@ -13,34 +13,46 @@ OUTPUT_DIR = BASE_DIR
 # Config definitions
 CONFIGS = {
     "SepBIT": {
-        "csv": os.path.join(LOGGING_DIR, "LOG_SEPBIT_FIFO_20260126_120619.csv"),
+        "csv": os.path.join(LOGGING_DIR, "LOG_SEPBIT_FIFO_20260203_122659.csv"),
         "stat_log": os.path.join(BASE_DIR, "stat.log.20260126_120618"),
         "replay_trace": os.path.join(BASE_DIR, "replay_trace_sepbit.log"),
         "csv_type": "icache",  # icache or ftl or ocf
+        "cache_size_gb": 580,
     },
     "REFlash_COLD_FIXED": {
         "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_COLD_20260127_000704.csv"),
         "stat_log": os.path.join(BASE_DIR, "stat.log.20260127_000703"),
         "replay_trace": os.path.join(BASE_DIR, "replay_trace_cold.log"),
         "csv_type": "icache",
+        "cache_size_gb": 580,
     },
     "REFlash_WARM_FIXED": {
-        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_WARM_20260126_135917.csv"),
+        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_WARM_20260204_044917.csv"),
         "stat_log": os.path.join(BASE_DIR, "stat.log.20260126_135916"),
         "replay_trace": os.path.join(BASE_DIR, "replay_trace_warm_fixed.log"),
         "csv_type": "icache",
+        "cache_size_gb": 580,
     },
     "REFlash": {
-        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260130_124017.csv"),
+        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260203_182203.csv"),
         "stat_log": os.path.join(BASE_DIR, "stat.log.20260130_124016"),
         "replay_trace": os.path.join(BASE_DIR, "replay_trace_ghost.log"),
         "csv_type": "icache",
+        "cache_size_gb": 580,
+    },
+    "REFlash_Beta_Control": {
+        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260204_112415.csv"),
+        "stat_log": None,
+        "replay_trace": None,
+        "csv_type": "icache",
+        "cache_size_gb": 580,
     },
     "CSAL": {
         "csv": os.path.join(LOGGING_DIR, "ftl0_20260126_110949.csv"),
         "stat_log": None,  # No histogram for CSAL
         "replay_trace": os.path.join(BASE_DIR, "replay_trace_ftl.log"),
         "csv_type": "ftl",
+        "cache_size_gb": 580,
     },
     "OpenCAS": {
         "csv": os.path.join(LOGGING_DIR, "ocf0_20260126_082458.csv"),
@@ -88,6 +100,9 @@ HISTOGRAM_CONFIGS = ["SepBIT", "REFlash_COLD_FIXED", "REFlash_WARM_FIXED", "REFl
 # All configs for Graphs A, B, C, D, G
 ALL_CONFIGS = ["SepBIT", "REFlash_COLD_FIXED", "REFlash_WARM_FIXED", "REFlash", "CSAL", "OpenCAS"]
 
+# Configs for Graph H (valid block rate) - must have valid_blocks column and cache_size_gb
+GRAPH_H_CONFIGS = ["REFlash_WARM_FIXED", "REFlash", "REFlash_Beta_Control", "CSAL"]
+
 # Output file names
 OUTPUT_FILES = {
     "graph_a": os.path.join(OUTPUT_DIR, "graph_A_scatter.png"),
@@ -98,4 +113,5 @@ OUTPUT_FILES = {
     "graph_f": os.path.join(OUTPUT_DIR, "graph_F_compacted_histogram.png"),
     "graph_g": os.path.join(OUTPUT_DIR, "graph_G_throughput.png"),
     "graph_d2": os.path.join(OUTPUT_DIR, "graph_D2_actual_cost.png"),
+    "graph_h": os.path.join(OUTPUT_DIR, "graph_H_valid_block_rate.png"),
 }

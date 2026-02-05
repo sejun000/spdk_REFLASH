@@ -2,14 +2,15 @@
 
 ## Config 목록
 
-| Config Name | CSV 파일 | stat.log 파일 | replay_trace 파일 |
-|-------------|----------|---------------|-------------------|
-| SepBIT | LOG_SEPBIT_FIFO_20260126_120619.csv | stat.log.20260126_120618 | replay_trace_sepbit.log |
-| REFLASH_COLD_FIXED | LOG_GREEDY_COST_BENEFIT_COLD_20260127_000704.csv | stat.log.20260127_000703 | replay_trace_cold.log |
-| REFLASH_WARM_FIXED | LOG_GREEDY_COST_BENEFIT_10_WARM_20260126_135917.csv | stat.log.20260126_135916 | replay_trace_warm_fixed.log |
-| REFLASH | LOG_GREEDY_COST_BENEFIT_10_20260126_062111.csv | stat.log.20260126_062110 | replay_trace_fdp.log |
-| CSAL | ftl0_20260126_110949.csv | N/A | replay_trace_ftl.log |
-| OpenCAS | ocf0_20260126_082458.csv | N/A | replay_trace_ocf.log |
+| Config Name | CSV 파일 | stat.log 파일 | replay_trace 파일 | cache_size_gb |
+|-------------|----------|---------------|-------------------|---------------|
+| SepBIT | LOG_SEPBIT_FIFO_20260126_120619.csv | stat.log.20260126_120618 | replay_trace_sepbit.log | 10 |
+| REFLASH_COLD_FIXED | LOG_GREEDY_COST_BENEFIT_COLD_20260127_000704.csv | stat.log.20260127_000703 | replay_trace_cold.log | 10 |
+| REFLASH_WARM_FIXED | LOG_GREEDY_COST_BENEFIT_10_WARM_20260126_135917.csv | stat.log.20260126_135916 | replay_trace_warm_fixed.log | 10 |
+| REFLASH | LOG_GREEDY_COST_BENEFIT_10_20260126_062111.csv | stat.log.20260126_062110 | replay_trace_fdp.log | 10 |
+| REFlash_Beta_Control | LOG_GREEDY_COST_BENEFIT_10_20260204_112415.csv | N/A | N/A | 10 |
+| CSAL | ftl0_20260126_110949.csv | N/A | replay_trace_ftl.log | 10 |
+| OpenCAS | ocf0_20260126_082458.csv | N/A | replay_trace_ocf.log | N/A |
 
 ## 파일 경로
 - CSV 파일: `ssd_waf/logging/`
@@ -134,6 +135,18 @@
 
 ---
 
+## Graph H: Valid Block Rate (Time Series)
+- **타입**: 시계열 꺾은선 그래프
+- **x축**: Host Writes (GB)
+- **y축**: Valid Block Rate = `valid_blocks * 4KB / cache_size`
+- **공식**: `(valid_blocks * 4 / 1024 / 1024) / cache_size_gb`
+- **대상 Config**: SepBIT, REFlash_COLD_FIXED, REFlash_WARM_FIXED, REFlash, CSAL (valid_blocks 컬럼이 있는 CSV만)
+- **설정**: 각 config에 `cache_size_gb` (GB 단위) 지정 필요
+- **데이터**: stats_logger.cpp가 출력하는 CSV의 `valid_blocks` 컬럼
+- **필터**: host_write > 0 인 구간만 표시
+
+---
+
 ## 공통 설정
 
 ### 폰트 크기
@@ -154,6 +167,7 @@
 | REFLASH_COLD_FIXED | 주황 | #ff7f0e |
 | REFLASH_WARM_FIXED | 초록 | #2ca02c |
 | REFLASH | 빨강 | #d62728 |
+| REFlash_Beta_Control | 갈색 | #8c564b |
 | CSAL | 보라 | #9467bd |
 | OpenCAS | 시안 | #17becf |
 
@@ -176,7 +190,20 @@
 - `graph_E_evicted_histogram.png`
 - `graph_F_compacted_histogram.png`
 - `graph_G_throughput.png`
+- `graph_H_valid_block_rate.png`
 
 ## 스크립트 파일
 - `plot_config.py`: 설정 파일 (파일 경로, 컬럼 매핑 등)
 - `plot_graphs.py`: 그래프 생성 스크립트
+
+## 실행 방법
+```bash
+# 전체 그래프 생성
+python plot_graphs.py
+
+# 특정 그래프만 생성
+python plot_graphs.py --graph h
+python plot_graphs.py --graph a b h
+
+# 사용 가능한 그래프: a, b, c, d, d2, e, f, g, h
+```

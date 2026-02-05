@@ -274,6 +274,9 @@ private:
     EwmaRatio eviction_ratio;
     EwmaRatio eviction_ratio_in_ghost_cache;
     EwmaRatio compaction_ratio_in_ghost_cache;
+    static constexpr size_t TCO_HISTORY_SIZE = 1;
+    std::deque<double> tco_history;
+    bool tco_policy_higher = true;  // initial policy: HIGHER (increase valid block rate)
     uint64_t ghost_compacted_blocks = 0;
     int last_ghost_m = 0;  // 마지막으로 계산된 m 값 (for logging)
     GhostCache ghost_cache;

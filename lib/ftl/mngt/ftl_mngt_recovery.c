@@ -575,6 +575,9 @@ ftl_mngt_recovery_iteration_restore_valid_map(struct spdk_ftl_dev *dev,
 			return;
 		} else {
 			ftl_bitmap_set(dev->valid_map, addr);
+			if (ftl_addr_in_nvc(dev, addr)) {
+				dev->nv_cache.nv_cache_valid_blocks++;
+			}
 		}
 	}
 

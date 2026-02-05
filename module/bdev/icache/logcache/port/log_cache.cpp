@@ -295,13 +295,19 @@ void LogCache::evict_policy_update(LogCacheSegment *s) {
 void LogCache::periodic() {
     if (is_ghost_cache){
         if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
+#ifdef GHOST_CACHE
             compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
             eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
             uint64_t evicted_in_ghost = ghost_cache.evictCount();
             eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
             compaction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, ghost_compacted_blocks);
+#else
+            compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
+            eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
+#endif
         }
         if (log_cache_timestamp % (segment_size_blocks * 4) == 0) {
+#ifdef GHOST_CACHE
             if (compaction_ratio.has_value() &&
                 eviction_ratio.has_value() &&
                 compaction_ratio_in_ghost_cache.has_value() &&
@@ -325,6 +331,37 @@ void LogCache::periodic() {
                                    target_valid_blk_rate, 2.8 * eviction_ratio.value(), compaction_ratio.value(), current_tco, ghost_tco);
                 }
             }
+#else
+            if (compaction_ratio.has_value() && eviction_ratio.has_value()) {
+                double current_tco = compaction_ratio.value() + 2.8 * eviction_ratio.value();
+                double old_tco = tco_history.size() >= TCO_HISTORY_SIZE ? tco_history.front() : 0.0;
+
+                if (compaction_ratio.value() > 1.3) {
+                    tco_policy_higher = false;
+                    target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.02);
+                    SPDK_NOTICELOG("periodic: LOWER (compact>1.3) target=%.4f, evict_val=%.6f, compact_val=%.6f, current_tco=%.6f old_tco=%.6f\n",
+                                   target_valid_blk_rate, 2.8 * eviction_ratio.value(), compaction_ratio.value(), current_tco, old_tco);
+                } else if (old_tco > 0.0) {
+                    if (current_tco >= old_tco) {
+                        tco_policy_higher = !tco_policy_higher;
+                    }
+
+                    if (tco_policy_higher) {
+                        target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double)global_valid_blocks / total_cache_block_count + 0.02);
+                    } else {
+                        target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.02);
+                    }
+                    SPDK_NOTICELOG("periodic: %s target=%.4f, evict_val=%.6f, compact_val=%.6f, current_tco=%.6f old_tco=%.6f (-%zu cycles)\n",
+                                   tco_policy_higher ? "HIGHER" : "LOWER",
+                                   target_valid_blk_rate, 2.8 * eviction_ratio.value(), compaction_ratio.value(), current_tco, old_tco, tco_history.size());
+                }
+
+                tco_history.push_back(current_tco);
+                if (tco_history.size() > TCO_HISTORY_SIZE) {
+                    tco_history.pop_front();
+                }
+            }
+#endif
         }
     }
 }

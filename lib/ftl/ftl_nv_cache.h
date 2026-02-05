@@ -236,6 +236,9 @@ struct ftl_nv_cache {
 		uint64_t blocks_submitted;
 		uint64_t blocks_submitted_limit;
 	} throttle;
+
+	/* Number of valid 4K blocks currently in nv_cache */
+	uint64_t nv_cache_valid_blocks;
 };
 
 typedef void (*nvc_scrub_cb)(struct spdk_ftl_dev *dev, void *cb_ctx, int status);

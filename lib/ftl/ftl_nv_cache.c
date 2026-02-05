@@ -1459,6 +1459,9 @@ ftl_nv_cache_set_addr(struct spdk_ftl_dev *dev, uint64_t lba, ftl_addr addr)
 	assert(lba != FTL_LBA_INVALID);
 
 	ftl_nv_cache_chunk_set_addr(chunk, lba, addr);
+	if (!ftl_bitmap_get(dev->valid_map, addr)) {
+		dev->nv_cache.nv_cache_valid_blocks++;
+	}
 	ftl_bitmap_set(dev->valid_map, addr);
 }
 
@@ -1523,6 +1526,8 @@ ftl_nv_cache_process(struct spdk_ftl_dev *dev)
 	compaction_process(nv_cache);
 	ftl_chunk_persist_free_state(nv_cache);
 	ftl_nv_cache_process_throttle(nv_cache);
+
+	ftl_stats_logger_set_valid_blocks(dev->stats_logger, nv_cache->nv_cache_valid_blocks);
 
 	if (nv_cache->nvc_type->ops.process) {
 		nv_cache->nvc_type->ops.process(dev);

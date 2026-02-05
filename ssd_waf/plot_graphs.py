@@ -3,6 +3,7 @@
 Graph plotting script for various performance metrics.
 """
 
+import argparse
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,7 +11,7 @@ import re
 import os
 from plot_config import (
     CONFIGS, CSV_COLUMNS, QLC_COST_MULTIPLIER, NORMALIZATION_BASE,
-    HISTOGRAM_CONFIGS, ALL_CONFIGS, OUTPUT_FILES
+    HISTOGRAM_CONFIGS, ALL_CONFIGS, GRAPH_H_CONFIGS, OUTPUT_FILES
 )
 
 # Set style
@@ -29,6 +30,7 @@ CONFIG_COLORS = {
     "REFlash_COLD_FIXED": "#ff7f0e", # orange
     "REFlash_WARM_FIXED": "#2ca02c", # green
     "REFlash": "#d62728",           # red
+    "REFlash_Beta_Control": "#8c564b", # brown
     "CSAL": "#9467bd",              # purple
     "OpenCAS": "#17becf",           # cyan
 }
@@ -415,22 +417,73 @@ def plot_graph_g():
     print(f"Saved: {OUTPUT_FILES['graph_g']}")
 
 
+def plot_graph_h():
+    """Graph H: Time series - x: Host writes, y: Valid block rate (valid_blocks * 4KB / cache_size)"""
+    fig, ax = plt.subplots(figsize=(14, 10))
+
+    for config_name in GRAPH_H_CONFIGS:
+        config = CONFIGS[config_name]
+        cache_size_gb = config.get("cache_size_gb")
+        if not cache_size_gb:
+            print(f"  Skipping {config_name}: no cache_size_gb")
+            continue
+
+        csv_path = config["csv"]
+        df = pd.read_csv(csv_path)
+
+        csv_type = config["csv_type"]
+        columns = CSV_COLUMNS[csv_type]
+        host_write_gb = df[columns["host_write"]].values / 1024
+
+        # valid_blocks * 4KB in GB, then divide by cache_size_gb
+        valid_blocks = df["valid_blocks"].values.astype(float)
+        valid_block_rate = (valid_blocks * 4 / 1024 / 1024) / cache_size_gb
+
+        # Filter where host_write > 0
+        mask = host_write_gb > 0
+        ax.plot(host_write_gb[mask], valid_block_rate[mask],
+                label=config_name, linewidth=3, color=CONFIG_COLORS[config_name])
+
+    ax.set_xlabel("Host Writes (GB)")
+    ax.set_ylabel("Valid Block Rate")
+    ax.set_title("Graph H: Valid Block Rate over Host Writes")
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(OUTPUT_FILES["graph_h"], dpi=150)
+    plt.close()
+    print(f"Saved: {OUTPUT_FILES['graph_h']}")
+
+
+GRAPH_FUNCTIONS = {
+    "a": plot_graph_a,
+    "b": plot_graph_b,
+    "c": plot_graph_c,
+    "d": plot_graph_d,
+    "d2": plot_graph_d2,
+    "e": plot_graph_e,
+    "f": plot_graph_f,
+    "g": plot_graph_g,
+    "h": plot_graph_h,
+}
+
+
 def main():
-    print("Generating graphs...")
+    parser = argparse.ArgumentParser(description="Plot performance graphs")
+    parser.add_argument("--graph", nargs="+", choices=list(GRAPH_FUNCTIONS.keys()),
+                        help="Specific graph(s) to plot (e.g. --graph h or --graph a b h). Default: all")
+    args = parser.parse_args()
 
-    plot_graph_a()
-    plot_graph_b()
-    plot_graph_c()
-    plot_graph_d()
-    plot_graph_d2()
-    plot_graph_e()
-    plot_graph_f()
-    plot_graph_g()
+    graphs = args.graph if args.graph else list(GRAPH_FUNCTIONS.keys())
 
-    print("\nAll graphs generated successfully!")
-    print("\nOutput files:")
-    for name, path in OUTPUT_FILES.items():
-        print(f"  {name}: {path}")
+    print(f"Generating graphs: {', '.join(g.upper() for g in graphs)}...")
+    for g in graphs:
+        GRAPH_FUNCTIONS[g]()
+
+    print("\nDone!")
 
 
 if __name__ == "__main__":
