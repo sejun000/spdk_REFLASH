@@ -41,8 +41,8 @@ CONFIGS = {
         "cache_size_gb": 580,
     },
     "REFlash_Beta_Control": {
-        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260204_112415.csv"),
-        "stat_log": None,
+        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260205_035041.csv"),
+        "stat_log": os.path.join(BASE_DIR, "stat.log.20260130_124016"),
         "replay_trace": None,
         "csv_type": "icache",
         "cache_size_gb": 580,
@@ -95,10 +95,10 @@ QLC_COST_MULTIPLIER = 2.8
 NORMALIZATION_BASE = "CSAL"
 
 # Configs that have histogram data (for Graphs E, F)
-HISTOGRAM_CONFIGS = ["SepBIT", "REFlash_COLD_FIXED", "REFlash_WARM_FIXED", "REFlash"]
+HISTOGRAM_CONFIGS = ["SepBIT", "REFlash_COLD_FIXED", "REFlash_WARM_FIXED", "REFlash_Beta_Control", "REFlash"]
 
 # All configs for Graphs A, B, C, D, G
-ALL_CONFIGS = ["SepBIT", "REFlash_COLD_FIXED", "REFlash_WARM_FIXED", "REFlash", "CSAL", "OpenCAS"]
+ALL_CONFIGS = ["SepBIT", "REFlash_COLD_FIXED", "REFlash_WARM_FIXED", "REFlash_Beta_Control", "REFlash", "CSAL", "OpenCAS"]
 
 # Configs for Graph H (valid block rate) - must have valid_blocks column and cache_size_gb
 GRAPH_H_CONFIGS = ["REFlash_WARM_FIXED", "REFlash", "REFlash_Beta_Control", "CSAL"]
