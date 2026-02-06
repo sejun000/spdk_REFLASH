@@ -145,6 +145,9 @@ struct ftl_nv_cache {
 	/* Flag indicating halt request */
 	bool halt;
 
+	/* Skip metadata writes during runtime IO (tail md, chunk state persist, P2L log) */
+	bool skip_md_write;
+
 	/* NV cache device type */
 	const struct ftl_nv_cache_device_type *nvc_type;
 
@@ -275,6 +278,7 @@ static inline void
 ftl_nv_cache_resume(struct ftl_nv_cache *nv_cache)
 {
 	nv_cache->halt = false;
+	nv_cache->skip_md_write = true;
 }
 
 bool ftl_nv_cache_is_halted(struct ftl_nv_cache *nv_cache);

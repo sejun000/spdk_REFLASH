@@ -661,6 +661,23 @@ ftl_chunk_persist_free_state(struct ftl_nv_cache *nv_cache)
 
 		TAILQ_REMOVE(&nv_cache->needs_free_persist_list, chunk, entry);
 
+		if (nv_cache->skip_md_write) {
+			nv_cache->chunk_free_persist_count--;
+
+			rc = spdk_bdev_unmap_blocks(nv_cache->bdev_desc, nv_cache->cache_ioch,
+						    chunk->offset, nv_cache->chunk_blocks,
+						    chunk_trim_cb, chunk);
+			if (rc != 0) {
+				TAILQ_INSERT_TAIL(&nv_cache->chunk_free_list, chunk, entry);
+				nv_cache->chunk_free_count++;
+				nv_cache->chunk_full_count--;
+				chunk->md->state = FTL_CHUNK_STATE_FREE;
+				chunk->md->close_seq_id = 0;
+				ftl_chunk_free_chunk_free_entry(chunk);
+			}
+			continue;
+		}
+
 		memcpy(p2l_map->chunk_dma_md, chunk->md, region->entry_size * FTL_BLOCK_SIZE);
 		p2l_map->chunk_dma_md->state = FTL_CHUNK_STATE_FREE;
 		p2l_map->chunk_dma_md->close_seq_id = 0;
@@ -1994,6 +2011,11 @@ ftl_chunk_open(struct ftl_nv_cache_chunk *chunk)
 		dev->nv_cache.nvc_type->ops.on_chunk_open(dev, chunk);
 	}
 
+	if (chunk->nv_cache->skip_md_write) {
+		chunk->md->state = FTL_CHUNK_STATE_OPEN;
+		return;
+	}
+
 	memcpy(p2l_map->chunk_dma_md, chunk->md, region->entry_size * FTL_BLOCK_SIZE);
 	p2l_map->chunk_dma_md->state = FTL_CHUNK_STATE_OPEN;
 	p2l_map->chunk_dma_md->p2l_map_checksum = 0;
@@ -2072,10 +2094,34 @@ static void
 ftl_chunk_close(struct ftl_nv_cache_chunk *chunk)
 {
 	struct spdk_ftl_dev *dev = SPDK_CONTAINEROF(chunk->nv_cache, struct spdk_ftl_dev, nv_cache);
+	struct ftl_nv_cache *nv_cache = chunk->nv_cache;
 	struct ftl_basic_rq *brq = &chunk->metadata_rq;
 	void *metadata = chunk->p2l_map.chunk_map;
 
 	chunk->md->close_seq_id = ftl_get_next_seq_id(dev);
+
+	if (nv_cache->skip_md_write) {
+		/* Skip tail md write and CLOSED state persist */
+		chunk->md->write_pointer += nv_cache->tail_md_chunk_blocks;
+		chunk->md->blocks_written += nv_cache->tail_md_chunk_blocks;
+
+		chunk_free_p2l_map(chunk);
+
+		assert(nv_cache->chunk_open_count > 0);
+		nv_cache->chunk_open_count--;
+
+		TAILQ_INSERT_TAIL(&nv_cache->chunk_full_list, chunk, entry);
+		nv_cache->chunk_full_count++;
+
+		nv_cache->last_seq_id = chunk->md->close_seq_id;
+		chunk->md->state = FTL_CHUNK_STATE_CLOSED;
+
+		if (nv_cache->nvc_type->ops.on_chunk_closed) {
+			nv_cache->nvc_type->ops.on_chunk_closed(dev, chunk);
+		}
+		return;
+	}
+
 	ftl_basic_rq_init(dev, brq, metadata, chunk->nv_cache->tail_md_chunk_blocks);
 	ftl_basic_rq_set_owner(brq, chunk_map_write_cb, chunk);
 
@@ -2515,6 +2561,7 @@ ftl_nv_cache_halt(struct ftl_nv_cache *nv_cache)
 	struct ftl_nv_cache_chunk *chunk;
 	uint64_t free_space;
 
+	nv_cache->skip_md_write = false;
 	nv_cache->halt = true;
 
 	/* Set chunks on open list back to free state since no user data has been written to it */

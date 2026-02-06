@@ -74,8 +74,12 @@ write_io_cb(struct spdk_bdev_io *bdev_io, bool success, void *ctx)
 	spdk_bdev_free_io(bdev_io);
 
 	if (spdk_likely(success)) {
-		struct ftl_p2l_log *log = io->nv_cache_chunk->p2l_log;
-		ftl_p2l_log_io(log, io);
+		if (io->dev->nv_cache.skip_md_write) {
+			ftl_nv_cache_write_complete(io, true);
+		} else {
+			struct ftl_p2l_log *log = io->nv_cache_chunk->p2l_log;
+			ftl_p2l_log_io(log, io);
+		}
 	} else {
 		ftl_nv_cache_write_complete(io, false);
 	}
