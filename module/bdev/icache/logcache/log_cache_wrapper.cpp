@@ -39,6 +39,7 @@ extern "C" struct spdk_nvme_ctrlr *bdev_nvme_get_ctrlr(struct spdk_bdev *bdev);
 #include "port/evict_policy_cost_benefit.h"
 #include "port/evict_policy_fifo.h"
 #include "port/istream.h"
+#include "port/multi_hot_cold.h"
 #include "port/log_cache.h"
 #include "port/log_cache_segment.h"
 #include "logging/stats_logger.h"
@@ -55,7 +56,26 @@ static double score_age_evict(Segment *seg) {
 extern uint64_t g_threshold;
 extern uint64_t g_timestamp;
 
+// Check if segment is from an old cycle for its stream → protect from compaction
+// Uses seg->create_timestamp (= oldest block's timestamp after compaction) instead of seg->cycle
+static inline bool is_old_cycle_segment(Segment *seg) {
+    if (g_cycle_length == 0 || interval == 0) return false;
+    int seg_cycle = static_cast<int>(seg->create_timestamp / g_cycle_length);
+    int idx = seg->class_num - Segment::GC_STREAM_START;
+    if (idx < 0 || idx >= IStream::MAX_STREAMS) {
+        // Host segment: estimate which GC stream its blocks would map to
+        idx = static_cast<int>((seg->create_timestamp % g_cycle_length) / interval);
+    }
+    if (idx >= 0 && idx < IStream::MAX_STREAMS) {
+        if (seg_cycle < g_stream_cycles[idx]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static double score_warm_first(Segment *seg) {
+    if (is_old_cycle_segment(seg)) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
         // Fallback to simple age-based score if globals not set
         return -static_cast<double>(seg->create_timestamp);
@@ -70,6 +90,7 @@ static double score_warm_first(Segment *seg) {
 
 // Score function: prefer HOT segments (recently created) for compaction
 static double score_hot_first(Segment *seg) {
+    if (is_old_cycle_segment(seg)) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
         return -static_cast<double>(seg->create_timestamp);
     }
@@ -82,6 +103,7 @@ static double score_hot_first(Segment *seg) {
 
 // Score function: prefer COLD segments (old) for compaction
 static double score_cold_first(Segment *seg) {
+    if (is_old_cycle_segment(seg)) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
         return -static_cast<double>(seg->create_timestamp);
     }
@@ -94,13 +116,14 @@ static double score_cold_first(Segment *seg) {
 
 // Score function for SEPBIT: sqrt of age for balanced selection
 static double score_sepbit_age(Segment *seg) {
+    //if (is_old_cycle_segment(seg)) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
         return -static_cast<double>(seg->create_timestamp);
     }
     double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
     double u = seg->valid_cnt / segment_size;
     if (u < 0.0001) u = 0.0001;
-    return std::sqrt(static_cast<double>(g_timestamp - seg->create_timestamp)) * (1 - u) / u;
+    return (g_timestamp - seg->create_timestamp) * (1 - u) / u;
 }
 
 namespace icache {
@@ -2171,6 +2194,7 @@ struct GcIo {
 		uint64_t dst_offset;
 		void *src;
 		uint32_t block_size;
+		int gc_placement_handle;
 	};
 	std::vector<PendingGcWrite> pending_gc_writes;
 	size_t pending_gc_write_idx;       // Current index in pending_gc_writes
@@ -2440,26 +2464,25 @@ public:
 		else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_WARM") {
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_warm_first);
-			effective_valid_rate = 0.8;
+			effective_valid_rate = 0.85;
 			score_low_valid_first = false;
 		} else if (cache_type == "LOG_GREEDY_COST_BENEFIT_HOT") {
 			// Hot-first compaction: prefer recently created segments
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_hot_first);
-			effective_valid_rate = 0.8;
+			effective_valid_rate = 0.85;
 			score_low_valid_first = false;
 		} else if (cache_type == "LOG_GREEDY_COST_BENEFIT_COLD") {
 			// Cold-first compaction: prefer older segments
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_cold_first);
-			effective_valid_rate = 0.8;
+			effective_valid_rate = 0.85;
 			score_low_valid_first = false;
 		} else if (cache_type == "LOG_SEPBIT_FIFO") {
 			// SEPBIT with FIFO eviction and sqrt-age compaction
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_sepbit_age);
-			effective_valid_rate = 0.8;
-			istream_policy_name = "sepbit";
+			effective_valid_rate = 0.85;
 			score_low_valid_first = false;
 		} else if (cache_type == "LOG_COST_BENEFIT") {
 			evictor = std::make_unique<CbEvictPolicy>();
@@ -2530,6 +2553,9 @@ public:
 
 	// Host write placement handle (toggle between 0 and 1) - delegated to LogCache
 	int get_host_write_handle() const { return cache_->get_host_write_handle(); }
+
+	// Number of host streams (for dynamic GC PH base offset)
+	int getNumHostStreams() const { return cache_->getNumHostStreams(); }
 
 	// Pending writes waiting for GC/Evict
 	std::list<CacheIo*>& pending_writes() { return pending_writes_; }
@@ -4064,7 +4090,11 @@ static void gc_start_writes(GcIo *io)
 		size_t first_dst_idx = blocks[first_block_idx].dst_idx;
 		size_t last_dst_idx = blocks[last_block_in_chunk].dst_idx;
 		bool crosses_stripe = (first_dst_idx / STRIPE_CHUNK_BLOCKS) != (last_dst_idx / STRIPE_CHUNK_BLOCKS);
-		io->expected_64k_writes += crosses_stripe ? GcIo::BLOCKS_PER_64K : 1;
+		bool different_dst_seg = false;
+		for (size_t di = first_block_idx + 1; di <= last_block_in_chunk; ++di) {
+			if (blocks[di].dst_seg != blocks[first_block_idx].dst_seg) { different_dst_seg = true; break; }
+		}
+		io->expected_64k_writes += (crosses_stripe || different_dst_seg) ? GcIo::BLOCKS_PER_64K : 1;
 	}
 
 	// If no 64KB chunks, start leftover immediately (sequential)
@@ -4098,16 +4128,20 @@ static void gc_start_writes(GcIo *io)
 		size_t last_dst_idx = blocks[last_block_in_chunk].dst_idx;
 
 		// Check if they're in the same stripe chunk (STRIPE_CHUNK_BLOCKS = 32)
+		// Also check if all blocks go to the same dst_seg (same placement handle)
 		bool crosses_stripe = (first_dst_idx / STRIPE_CHUNK_BLOCKS) != (last_dst_idx / STRIPE_CHUNK_BLOCKS);
+		bool different_dst_seg = false;
+		for (size_t di = first_block_idx + 1; di <= last_block_in_chunk; ++di) {
+			if (blocks[di].dst_seg != blocks[first_block_idx].dst_seg) { different_dst_seg = true; break; }
+		}
 
-		if (crosses_stripe) {
-			// Stripe boundary crossed - write each block individually
-			// GC uses placement handles 2~6 (host uses 0, 1)
-			int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
+		if (crosses_stripe || different_dst_seg) {
+			// Stripe boundary crossed or different target segments - write each block individually
 			for (size_t i = 0; i < GcIo::BLOCKS_PER_64K; ++i) {
 				size_t block_idx = first_block_idx + i;
 				uint8_t *src = static_cast<uint8_t*>(io->staging) + (chunk_start + i) * block_size;
 				uint64_t dst_offset = blocks[block_idx].dst_offset;
+				int gc_placement_handle = io->ctx->cache->getNumHostStreams() + (blocks[block_idx].dst_seg->get_class_num() % (FDP_NUM_PLACEMENT_HANDLES - io->ctx->cache->getNumHostStreams()));
 
 				// Allocate single iovec for this block
 				struct iovec *single_iov = static_cast<struct iovec*>(malloc(sizeof(struct iovec)));
@@ -4168,9 +4202,8 @@ static void gc_start_writes(GcIo *io)
 			continue;
 		}
 
-		// 64KB scatter-gather write with FDP placement handle
-		// GC uses placement handles 2~6 (host uses 0, 1)
-		int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
+		// 64KB scatter-gather write with FDP placement handle (same segment → same handle)
+		int gc_placement_handle = io->ctx->cache->getNumHostStreams() + (blocks[first_block_idx].dst_seg->get_class_num() % (FDP_NUM_PLACEMENT_HANDLES - io->ctx->cache->getNumHostStreams()));
 		int rc = io->ctx->device->writev_cache_async(first_dst_offset, iovs, GcIo::BLOCKS_PER_64K,
 							     GcIo::BLOCKS_PER_64K * block_size,
 							     gc_write_done, write_ctx, gc_placement_handle);
@@ -4239,9 +4272,8 @@ static void gc_submit_next_leftover(GcIo *io)
 		return;
 	}
 
-	// 4KB sequential write with GC placement handle
-	// GC uses placement handles 2~6 (host uses 0, 1)
-	int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
+	// 4KB sequential write with per-block FDP placement handle
+	int gc_placement_handle = io->ctx->cache->getNumHostStreams() + (blk.dst_seg->get_class_num() % (FDP_NUM_PLACEMENT_HANDLES - io->ctx->cache->getNumHostStreams()));
 	int rc = io->ctx->device->writev_cache_async(blk.dst_offset, single_iov, 1, block_size,
 	                                             gc_write_done, write_ctx, gc_placement_handle);
 	if (rc == 0) {
@@ -4477,7 +4509,11 @@ static void gc_pipeline_start_write(GcIo *io, int buf_idx)
 		size_t first_dst_idx = blocks[first_block_idx].dst_idx;
 		size_t last_dst_idx = blocks[last_block_in_chunk].dst_idx;
 		bool crosses_stripe = (first_dst_idx / STRIPE_CHUNK_BLOCKS) != (last_dst_idx / STRIPE_CHUNK_BLOCKS);
-		io->buf_expected_64k_writes[buf_idx] += crosses_stripe ? GcIo::BLOCKS_PER_64K : 1;
+		bool different_dst_seg = false;
+		for (size_t di = first_block_idx + 1; di <= last_block_in_chunk; ++di) {
+			if (blocks[di].dst_seg != blocks[first_block_idx].dst_seg) { different_dst_seg = true; break; }
+		}
+		io->buf_expected_64k_writes[buf_idx] += (crosses_stripe || different_dst_seg) ? GcIo::BLOCKS_PER_64K : 1;
 	}
 
 	// If no 64KB chunks, start leftover immediately
@@ -4490,8 +4526,6 @@ static void gc_pipeline_start_write(GcIo *io, int buf_idx)
 		}
 		return;
 	}
-
-	int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
 
 	// Submit 64KB chunks
 	for (size_t chunk = 0; chunk < io->buf_num_64k_chunks[buf_idx]; ++chunk) {
@@ -4507,13 +4541,18 @@ static void gc_pipeline_start_write(GcIo *io, int buf_idx)
 		size_t first_dst_idx = blocks[first_block_idx].dst_idx;
 		size_t last_dst_idx = blocks[last_block_in_chunk].dst_idx;
 		bool crosses_stripe = (first_dst_idx / STRIPE_CHUNK_BLOCKS) != (last_dst_idx / STRIPE_CHUNK_BLOCKS);
+		bool different_dst_seg = false;
+		for (size_t di = first_block_idx + 1; di <= last_block_in_chunk; ++di) {
+			if (blocks[di].dst_seg != blocks[first_block_idx].dst_seg) { different_dst_seg = true; break; }
+		}
 
-		if (crosses_stripe) {
-			// Write each block individually
+		if (crosses_stripe || different_dst_seg) {
+			// Stripe boundary crossed or different target segments - write each block individually
 			for (size_t i = 0; i < GcIo::BLOCKS_PER_64K; ++i) {
 				size_t block_idx = first_block_idx + i;
 				uint8_t *src = static_cast<uint8_t*>(io->buf_staging[buf_idx]) + (chunk_start + i) * block_size;
 				uint64_t dst_offset = blocks[block_idx].dst_offset;
+				int gc_placement_handle = io->ctx->cache->getNumHostStreams() + (blocks[block_idx].dst_seg->get_class_num() % (FDP_NUM_PLACEMENT_HANDLES - io->ctx->cache->getNumHostStreams()));
 
 				struct iovec *single_iov = static_cast<struct iovec*>(malloc(sizeof(struct iovec)));
 				if (!single_iov) {
@@ -4548,7 +4587,8 @@ static void gc_pipeline_start_write(GcIo *io, int buf_idx)
 			continue;
 		}
 
-		// Normal 64KB write
+		// Normal 64KB write (same segment → same placement handle)
+		int gc_placement_handle = io->ctx->cache->getNumHostStreams() + (blocks[first_block_idx].dst_seg->get_class_num() % (FDP_NUM_PLACEMENT_HANDLES - io->ctx->cache->getNumHostStreams()));
 		struct iovec *iovs = static_cast<struct iovec*>(calloc(GcIo::BLOCKS_PER_64K, sizeof(struct iovec)));
 		if (!iovs) {
 			io->last_status = -ENOMEM;
@@ -4682,7 +4722,7 @@ static void gc_pipeline_submit_leftover(GcIo *io, int buf_idx)
 		return;
 	}
 
-	int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
+	int gc_placement_handle = io->ctx->cache->getNumHostStreams() + (blocks[block_idx].dst_seg->get_class_num() % (FDP_NUM_PLACEMENT_HANDLES - io->ctx->cache->getNumHostStreams()));
 
 	int rc = io->ctx->device->writev_cache_async(dst_offset, single_iov, 1,
 						     block_size, gc_pipeline_write_done,
@@ -4924,7 +4964,8 @@ static void gc_seq_read_done(void *cb_arg, int status)
 		auto &blk = blocks[idx];
 		size_t block_in_chunk = blk.src_idx % GcIo::SEQ_CHUNK_BLOCKS;
 		uint8_t *src = static_cast<uint8_t*>(io->staging) + batch_idx * CHUNK_SIZE + block_in_chunk * block_size;
-		io->pending_gc_writes.push_back({blk.dst_offset, src, block_size});
+		int ph = io->ctx->cache->getNumHostStreams() + (blk.dst_seg->get_class_num() % (FDP_NUM_PLACEMENT_HANDLES - io->ctx->cache->getNumHostStreams()));
+		io->pending_gc_writes.push_back({blk.dst_offset, src, block_size, ph});
 	}
 
 	size_t reads_done = ++io->seq_reads_done;
@@ -4978,14 +5019,30 @@ static void gc_dispatch_writes(GcIo *io)
 {
 	auto &writes = io->pending_gc_writes;
 	size_t submitted = 0;
-	int gc_placement_handle = 2 + (io->prepare_result.gc_stream_id % (FDP_NUM_PLACEMENT_HANDLES - 2));
 	uint32_t block_size = io->ctx->block_size;
 
 	while (io->pending_gc_write_idx < writes.size() && submitted < GcIo::GC_WRITES_PER_YIELD) {
 		size_t remaining = writes.size() - io->pending_gc_write_idx;
 
+		// Check if 16 blocks available AND contiguous (no zone/stripe boundary crossing)
+		// AND same placement handle (same target segment)
+		bool do_merged = false;
 		if (remaining >= GcIo::BLOCKS_PER_64K) {
-			// 64KB merged write (16 blocks)
+			uint64_t first_off = writes[io->pending_gc_write_idx].dst_offset;
+			int first_ph = writes[io->pending_gc_write_idx].gc_placement_handle;
+			do_merged = true;
+			for (size_t k = 1; k < GcIo::BLOCKS_PER_64K; ++k) {
+				auto &w = writes[io->pending_gc_write_idx + k];
+				if (w.dst_offset != first_off + k * block_size || w.gc_placement_handle != first_ph) {
+					do_merged = false;
+					break;
+				}
+			}
+		}
+
+		if (do_merged) {
+			// 64KB merged write (16 contiguous blocks, same placement handle)
+			int gc_placement_handle = writes[io->pending_gc_write_idx].gc_placement_handle;
 			struct iovec *iovs = static_cast<struct iovec*>(calloc(GcIo::BLOCKS_PER_64K, sizeof(struct iovec)));
 			if (!iovs) {
 				io->last_status = -ENOMEM;
@@ -5027,7 +5084,7 @@ static void gc_dispatch_writes(GcIo *io)
 				io->pending_gc_write_idx += GcIo::BLOCKS_PER_64K;
 			}
 		} else {
-			// Leftover blocks (< 16): write individually
+			// Leftover blocks (< 16 or different placement handles): write individually
 			auto &w = writes[io->pending_gc_write_idx++];
 
 			struct iovec *iov = static_cast<struct iovec*>(malloc(sizeof(struct iovec)));
@@ -5048,7 +5105,7 @@ static void gc_dispatch_writes(GcIo *io)
 			}
 
 			int rc = io->ctx->device->writev_cache_async(w.dst_offset, iov, 1, w.block_size,
-								     gc_seq_write_done, write_ctx, gc_placement_handle);
+								     gc_seq_write_done, write_ctx, w.gc_placement_handle);
 			if (rc == 0) {
 				io->ctx->cache->add_gc_write_bytes(w.block_size);
 				io->ctx->cache->add_cache_write_bytes(w.block_size);

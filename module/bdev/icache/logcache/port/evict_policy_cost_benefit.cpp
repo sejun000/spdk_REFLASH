@@ -77,3 +77,21 @@ uint64_t CbEvictPolicy::get_mth_score_valid_pages(int m) const
     }
     return sum / count;
 }
+
+uint64_t CbEvictPolicy::get_kth_segment_valid_cnt_for_free_segments(double m) const
+{
+    if (m <= 0.0 || heap_.empty()) return 0;
+
+    double free_sum = 0.0;
+    uint64_t last_valid_cnt = 0;
+
+    // score 순서(max→min)로 순회, (1-U_i) 누적하여 m 이상이 되면 마지막 segment의 valid_cnt 반환
+    for (auto it = heap_.ordered_begin(); it != heap_.ordered_end(); ++it) {
+        double u_i = static_cast<double>(it->seg->valid_cnt) / pages_in_segment;
+        free_sum += (1.0 - u_i);
+        last_valid_cnt = it->seg->valid_cnt;
+        if (free_sum >= m) break;
+    }
+
+    return last_valid_cnt;
+}

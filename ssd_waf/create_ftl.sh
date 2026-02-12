@@ -11,8 +11,8 @@ export PYTHONPATH="${PYTHONPATH:-}:$ROOT_DIR/python"
 # FDP mode: same as icache tier
 # Cache: 06:00.0 (FDP SSD)
 # Backend (base device): 07:00.0 (regular SSD)
-CACHE_BDF=${CACHE_BDF:-0001:10:00.0}
-BACKEND_BDF=${BACKEND_BDF:-0000:01:00.0}
+CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
+BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
 CACHE_CTRL=${CACHE_CTRL:-ftl_cache_ctrl}
 BACKEND_CTRL=${BACKEND_CTRL:-ftl_backend_ctrl}
 CACHE_NS=${CACHE_NS:-${CACHE_CTRL}n1}
@@ -94,7 +94,7 @@ cat <<MSG
 Creating FTL bdev "${FTL_NAME}"...
 MSG
 
-# Create FTL bdev
+# Create FTL bdev (no --uuid → SPDK_FTL_MODE_CREATE → always fresh init)
 # --base-bdev: base device (regular SSD)
 # --cache: cache device (FDP SSD)
 rpc_call "create FTL ${FTL_NAME}" \
@@ -103,7 +103,7 @@ rpc_call "create FTL ${FTL_NAME}" \
     --base-bdev "${BACKEND_NS}" \
     --cache "${CACHE_BDEV}" \
     --overprovisioning "${FTL_OVERPROV}" \
-    --l2p-dram-limit "${FTL_L2P_DRAM}" 
+    --l2p-dram-limit "${FTL_L2P_DRAM}"
 
 # Track if device exposure succeeded
 DEVICE_EXPOSED=0

@@ -1,4 +1,5 @@
 #include "log_cache.h"
+#include "multi_hot_cold.h"
 #include "../log_cache_config.h"
 
 #include <cassert>
@@ -52,6 +53,7 @@ LogCache::LogCache(uint64_t              cold_capacity,
       eviction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       eviction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       compaction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      ghost_miss_rate_ewma(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       ghost_cache(cache_block_count * GHOST_CACHE_RATIO),
       device_io_(device_io)
 {
@@ -83,6 +85,7 @@ LogCache::LogCache(uint64_t              cold_capacity,
     compaction_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
     eviction_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
     eviction_ratio_in_ghost_cache = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
+    ghost_miss_rate_ewma = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
 
     evictor->init(&log_cache_timestamp, segment_size_blocks, total_segments);
 
@@ -301,6 +304,11 @@ void LogCache::periodic() {
             uint64_t evicted_in_ghost = ghost_cache.evictCount();
             eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
             compaction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, ghost_compacted_blocks);
+            // ghost miss rate EWMA: ratio = d(push - hit) / d(push)
+            if (ghost_cache.pushCount() > 0) {
+                uint64_t ghost_misses = ghost_cache.pushCount() - ghost_cache.accessHitCount();
+                ghost_miss_rate_ewma.updateFromCumulative(ghost_cache.pushCount(), ghost_misses);
+            }
 #else
             compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
             eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
@@ -636,6 +644,22 @@ LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key,
     }
     int stream_id = stream_policy->Classify(key, gc, log_cache_timestamp, previous_blk_create_timestamp);
     assert (!gc || (gc && stream_id >= Segment::GC_STREAM_START));
+
+    // Cycle wrap detected → dummy fill old active GC segments before reuse
+    if (gc) {
+        int victim_id = stream_policy->GetVictimStreamId(log_cache_timestamp, 0);
+        while (victim_id >= Segment::GC_STREAM_START) {
+            auto vit = gc_active_seg.find(victim_id);
+            if (vit != gc_active_seg.end()) {
+                SPDK_NOTICELOG("Cycle wrap: dummy fill stream %d, seg=%p, write_ptr=%zu\n",
+                        victim_id, (void*)vit->second, vit->second->write_ptr);
+                dummy_fill_segment(vit->second);
+                gc_active_seg.erase(vit);
+            }
+            victim_id = stream_policy->GetVictimStreamId(log_cache_timestamp, 0);
+        }
+    }
+
     std::unordered_map<int, LogCacheSegment*>*  active_table = &active_seg;
     if (gc) {
         active_table = &gc_active_seg;
@@ -1232,17 +1256,20 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
         evictor->add(victim, log_cache_timestamp);
         if (compact) {
             victim = (LogCacheSegment *)compactor->choose_segment();
-            // ghost compaction 추정: m번째 segment의 valid_cnt 누적
-            double g_u = ghost_cache.utilization();
-            /*f (victim->valid_cnt >= 0.8 * victim->blocks.size()) {
-                return false;
-            }*/
+            // ghost compaction 추정: util_step% 더 보유 시 필요한 GC write cost
+            // U(util_step) = ghost miss rate (EWMA), fallback to cumulative
+            double g_u = ghost_miss_rate_ewma.has_value()
+                         ? ghost_miss_rate_ewma.value()
+                         : ghost_cache.utilization();
             if (g_u > 0.0) {
-                last_ghost_m = static_cast<int>(GHOST_CACHE_RATIO * compactor->segment_count() / g_u);
-                uint64_t avg_valid = compactor->get_mth_score_valid_pages(last_ghost_m);
-                ghost_compacted_blocks += avg_valid;
-                SPDK_NOTICELOG("ghost_compact: m=%d, g_u=%.4f, seg_cnt=%zu, avg_valid=%lu, ghost_compacted=%lu\n",
-                               last_ghost_m, g_u, compactor->segment_count(), avg_valid, ghost_compacted_blocks);
+                // m = free segments needed = (util_step * total_blocks) / U / blocks_per_segment
+                double m = GHOST_CACHE_RATIO * total_cache_block_count / g_u / segment_size_blocks;
+                // k = min(k | sum(1-U_i) >= m), k번째 segment의 valid_cnt
+                uint64_t valid_cost = compactor->get_kth_segment_valid_cnt_for_free_segments(m);
+                ghost_compacted_blocks += valid_cost;
+                last_ghost_m = static_cast<int>(m);
+                SPDK_NOTICELOG("ghost_compact: m=%.2f, g_u=%.4f, valid_cost=%lu, ghost_compacted=%lu\n",
+                               m, g_u, valid_cost, ghost_compacted_blocks);
             }
             if (!victim) {
                 return false;
@@ -1271,14 +1298,15 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
         }
 
         // Prepare GC - get target segment for compaction
-        result.target_seg = get_segment_to_active_stream(true, result.gc_stream_id);
-
-        // If no target segment available, fall back to evict-only
-        if (!result.target_seg) {
-            result.do_evict_only = true;
-            result.blocks_to_copy.clear();
-            result.is_final_chunk = true;
-            return true;
+        if (!stream_policy) {
+            result.target_seg = get_segment_to_active_stream(true, result.gc_stream_id);
+            // If no target segment available, fall back to evict-only
+            if (!result.target_seg) {
+                result.do_evict_only = true;
+                result.blocks_to_copy.clear();
+                result.is_final_chunk = true;
+                return true;
+            }
         }
     }
 
@@ -1294,29 +1322,34 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
     result.scan_offset = end;  // Update now for finalize to use
     result.is_final_chunk = (end >= victim->blocks.size());
 
-    if (result.target_seg) {
+    if (result.target_seg || stream_policy) {
         for (std::size_t i = start; i < end; ++i) {
             auto &blk = victim->blocks[i];
             if (!blk.valid) continue;
 
-            // Skip blocks with pending host writes
-           // if (pending_writes_.count(blk.key)) continue;
+            // Per-block stream classification
+            LogCacheSegment *target_seg = nullptr;
+            if (stream_policy) {
+                target_seg = get_segment_with_stream_policy(true, blk.key);
+            } else {
+                target_seg = result.target_seg;
+            }
 
-            // Check if should evict or copy based on threshold
-            /*if (threshold > 0 && log_cache_timestamp - blk.create_timestamp >= threshold) {
-                // Will be evicted, not copied
-                continue;
-            }*/
+            if (!target_seg) {
+                result.do_evict_only = true;
+                result.blocks_to_copy.clear();
+                break;
+            }
 
             // Check if target segment is full
-            if (result.target_seg->full()) {
-                evict_policy_add(result.target_seg);
-                int assigned_class_num = result.target_seg->get_class_num();
-                gc_active_seg.erase(result.target_seg->get_class_num());
-                result.target_seg = get_segment_to_active_stream(true, assigned_class_num);
+            if (target_seg->full()) {
+                evict_policy_add(target_seg);
+                int assigned_class_num = target_seg->get_class_num();
+                gc_active_seg.erase(target_seg->get_class_num());
+                target_seg = get_segment_to_active_stream(true, assigned_class_num);
 
                 // If no more segments available, fall back to evict-only
-                if (!result.target_seg) {
+                if (!target_seg) {
                     SPDK_ERRLOG("BUG: No target segment available during incremental GC\n");
                     result.do_evict_only = true;
                     result.blocks_to_copy.clear();
@@ -1324,18 +1357,23 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
                 }
             }
 
+            // Update result.target_seg for non-stream-policy path
+            if (!stream_policy) {
+                result.target_seg = target_seg;
+            }
+
             GcBlockInfo info;
             info.src_offset = block_offset(victim, i);
-            info.dst_idx = result.target_seg->write_ptr;  // Store index for striping
-            info.dst_offset = block_offset(result.target_seg, info.dst_idx);
+            info.dst_idx = target_seg->write_ptr;  // Store index for striping
+            info.dst_offset = block_offset(target_seg, info.dst_idx);
             info.key = blk.key;
             info.src_idx = i;
             info.create_timestamp = blk.create_timestamp;
-            info.dst_seg = result.target_seg;  // CRITICAL: Store per-block target segment
+            info.dst_seg = target_seg;  // Per-block target segment (stream-classified)
             result.blocks_to_copy.push_back(info);
 
             // Reserve slot in target segment
-            result.target_seg->write_ptr++;
+            target_seg->write_ptr++;
         }
     }
 
@@ -1529,9 +1567,9 @@ void LogCache::finalize_gc(GcPrepareResult &result)
         reset_segment(victim);
 
         // Handle stream policy
-        if (stream_policy) {
+     /*  if (stream_policy) {
             stream_policy->CollectSegment(victim, log_cache_timestamp);
-        }
+        }*/
     }
 }
 
@@ -1575,6 +1613,12 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
     LogCacheSegment *victim = result.victim_seg;
     int compacted_blocks_for_victim = 0;
     int evicted_blocks_for_victim = 0;
+
+    // Collect victim segment lifespan BEFORE GC append/classify
+    // so that mAvgLifespan is up-to-date for stream classification
+    if (stream_policy) {
+        stream_policy->CollectSegment(victim, log_cache_timestamp);
+    }
 
     // Update mapping for copied blocks
     for (auto &info : result.blocks_to_copy) {
@@ -1686,11 +1730,6 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
 
     // Reset victim segment only on final chunk
     if (result.is_final_chunk) {
-        // Handle stream policy before async reset
-        if (stream_policy) {
-            stream_policy->CollectSegment(victim, log_cache_timestamp);
-        }
-
         SPDK_NOTICELOG("GC_ASYNC: Final chunk, resetting victim=%p\n", (void*)victim);
         // Reset victim segment asynchronously
         reset_segment_async(victim, cb, cb_arg);

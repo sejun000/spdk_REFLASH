@@ -2076,9 +2076,15 @@ chunk_map_write_cb(struct ftl_basic_rq *brq)
 		memcpy(p2l_map->chunk_dma_md, chunk->md, region->entry_size * FTL_BLOCK_SIZE);
 		p2l_map->chunk_dma_md->state = FTL_CHUNK_STATE_CLOSED;
 		p2l_map->chunk_dma_md->p2l_map_checksum = chunk_map_crc;
-		ftl_md_persist_entries(md, get_chunk_idx(chunk), 1, chunk->p2l_map.chunk_dma_md,
-				       NULL, chunk_close_cb, chunk,
-				       &chunk->md_persist_entry_ctx);
+
+		if (chunk->nv_cache->skip_md_write) {
+			/* P2L map already written to disk above; skip CLOSED state persist */
+			chunk_close_cb(0, chunk);
+		} else {
+			ftl_md_persist_entries(md, get_chunk_idx(chunk), 1, chunk->p2l_map.chunk_dma_md,
+					       NULL, chunk_close_cb, chunk,
+					       &chunk->md_persist_entry_ctx);
+		}
 	} else {
 #ifdef SPDK_FTL_RETRY_ON_ERROR
 		/* retry */
@@ -2100,28 +2106,8 @@ ftl_chunk_close(struct ftl_nv_cache_chunk *chunk)
 
 	chunk->md->close_seq_id = ftl_get_next_seq_id(dev);
 
-	if (nv_cache->skip_md_write) {
-		/* Skip tail md write and CLOSED state persist */
-		chunk->md->write_pointer += nv_cache->tail_md_chunk_blocks;
-		chunk->md->blocks_written += nv_cache->tail_md_chunk_blocks;
-
-		chunk_free_p2l_map(chunk);
-
-		assert(nv_cache->chunk_open_count > 0);
-		nv_cache->chunk_open_count--;
-
-		TAILQ_INSERT_TAIL(&nv_cache->chunk_full_list, chunk, entry);
-		nv_cache->chunk_full_count++;
-
-		nv_cache->last_seq_id = chunk->md->close_seq_id;
-		chunk->md->state = FTL_CHUNK_STATE_CLOSED;
-
-		if (nv_cache->nvc_type->ops.on_chunk_closed) {
-			nv_cache->nvc_type->ops.on_chunk_closed(dev, chunk);
-		}
-		return;
-	}
-
+	/* Always write tail md (P2L map) - compaction needs it.
+	 * skip_md_write only skips the CLOSED state persist (in chunk_map_write_cb). */
 	ftl_basic_rq_init(dev, brq, metadata, chunk->nv_cache->tail_md_chunk_blocks);
 	ftl_basic_rq_set_owner(brq, chunk_map_write_cb, chunk);
 

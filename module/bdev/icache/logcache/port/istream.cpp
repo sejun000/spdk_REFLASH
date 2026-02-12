@@ -9,11 +9,11 @@
 
 uint64_t interval = 1;
 namespace {
-constexpr int kMultiHotColdStreams = 5;
+constexpr int kMultiHotColdStreams = 6;
 }
 
 void set_stream_interval(uint64_t cache_block_count, uint64_t segment_size_blocks) {
-    uint64_t computed = (uint64_t)(cache_block_count / (3.5));
+    uint64_t computed = (uint64_t)(cache_block_count / (4));
     if (computed == 0) {
         computed = 1;
     }

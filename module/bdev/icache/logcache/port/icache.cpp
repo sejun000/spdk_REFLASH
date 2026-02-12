@@ -10,6 +10,7 @@
 #include "evict_policy_multiqueue.h"
 #include "evict_policy_midas.h"
 #include "istream.h"
+#include "multi_hot_cold.h"
 #include <cassert>
 #include <string>
 #include <vector>
@@ -39,7 +40,26 @@ static double score_age(Segment *seg) {
 uint64_t g_threshold = 0;
 uint64_t g_timestamp = 0;
 
+// Check if segment is from an old cycle for its stream → protect from compaction
+// Uses seg->create_timestamp (= oldest block's timestamp after compaction) instead of seg->cycle
+static inline bool is_old_cycle_segment(Segment *seg) {
+    if (g_cycle_length == 0 || interval == 0) return false;
+    int seg_cycle = static_cast<int>(seg->create_timestamp / g_cycle_length);
+    int idx = seg->class_num - Segment::GC_STREAM_START;
+    if (idx < 0 || idx >= IStream::MAX_STREAMS) {
+        // Host segment: estimate which GC stream its blocks would map to
+        idx = static_cast<int>((seg->create_timestamp % g_cycle_length) / interval);
+    }
+    if (idx >= 0 && idx < IStream::MAX_STREAMS) {
+        if (seg_cycle < g_stream_cycles[idx]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static double score_hot_first(Segment *seg) {
+    if (is_old_cycle_segment(seg)) return 0.0;
     assert(g_threshold > 0 && g_timestamp > 0);
     double u = seg->valid_cnt / segments;
     return (g_threshold - (g_timestamp - seg->create_timestamp)) * (1 - u) / (u);
@@ -47,12 +67,14 @@ static double score_hot_first(Segment *seg) {
 
 
 static double score_cold_first(Segment *seg) {
+    if (is_old_cycle_segment(seg)) return 0.0;
     assert(g_threshold > 0 && g_timestamp > 0);
     double u = seg->valid_cnt / segments;
     return (g_timestamp - seg->create_timestamp) * (1 - u) / (u);
 }
 
 static double score_warm_first(Segment *seg) {
+    if (is_old_cycle_segment(seg)) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
         //printf("g_threshold %d g_timestamp %d\n", g_threshold, g_timestamp);
         assert(g_threshold > 0 && g_timestamp > 0);
@@ -62,6 +84,7 @@ static double score_warm_first(Segment *seg) {
 }
 
 static double score_warm_first_hot_last(Segment *seg) {
+    if (is_old_cycle_segment(seg)) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
         //printf("g_threshold %d g_timestamp %d\n", g_threshold, g_timestamp);
         assert(g_threshold > 0 && g_timestamp > 0);
@@ -74,7 +97,6 @@ static double score_warm_first_hot_last(Segment *seg) {
 }
 
 static double score_sepbit_age(Segment *seg) {
-    
     assert(g_threshold > 0 && g_timestamp > 0);
     double u = seg->valid_cnt / segments;
     return sqrt(g_timestamp - seg->create_timestamp) * (1 - u) / (u);

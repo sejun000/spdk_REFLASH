@@ -24,6 +24,10 @@ public:
         return static_cast<double>(push_count_ - access_hit_count_) / push_count_;
     }
 
+    // cumulative counters (for EWMA)
+    std::size_t pushCount() const { return push_count_; }
+    std::size_t accessHitCount() const { return access_hit_count_; }
+
     // 초기화
     void reset();
 

@@ -9,7 +9,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NVMEV_DIR="/home/sejun000/csd-virt/CSD-Virt"
-TRACE_FILE="../../alibaba_trace/alibaba_dwpd1.trace"
+TRACE_FILE="../../alibaba_dwpd1.trace.head30p"
 LOG_FILE="$SCRIPT_DIR/test.log"
 
 # Initialize log file with timestamp
@@ -24,13 +24,13 @@ log_to_file() {
 
 # Config definitions: "name|command|replay_file"
 declare -a CONFIGS=(
-    "LOG_SEPBIT_FIFO|sudo ICACHE_CACHE_TYPE=LOG_SEPBIT_FIFO CACHE_SPLIT_GB=580 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=720 ./run_tier_fdp.sh|sepbit.replay"
-    "LOG_GREEDY_COST_BENEFIT_10|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_10 CACHE_SPLIT_GB=580 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=720 ./run_tier_fdp.sh|reflash.replay"
-    "LOG_GREEDY_COST_BENEFIT_10_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_10_WARM CACHE_SPLIT_GB=580 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=720 ./run_tier_fdp.sh|reflash_fixed.replay"
-    "LOG_GREEDY_COST_BENEFIT_HOT|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_HOT CACHE_SPLIT_GB=580 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=720 ./run_tier_fdp.sh|reflash_hot_fixed.replay"
-    "LOG_GREEDY_COST_BENEFIT_COLD|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_COLD CACHE_SPLIT_GB=580 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=720 ./run_tier_fdp.sh|reflash_cold_fixed.replay"
-    "FTL|sudo CACHE_SPLIT_GB=580 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=720 ./run_ftl.sh|ftl.replay"
-    "OCF|sudo CACHE_SPLIT_GB=580 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=720 ./run_ocf.sh|ocf.replay"
+    "LOG_SEPBIT_FIFO|sudo PREFILL=1 ICACHE_CACHE_TYPE=LOG_SEPBIT_FIFO CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_tier_fdp.sh|sepbit.replay"
+    "LOG_GREEDY_COST_BENEFIT_10|sudo PREFILL=1 ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_10 CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_tier_fdp.sh|reflash.replay"
+    "LOG_GREEDY_COST_BENEFIT_10_WARM|sudo PREFILL=1 ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_10_WARM CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_tier_fdp.sh|reflash_fixed.replay"
+    "LOG_GREEDY_COST_BENEFIT_HOT|sudo PREFILL=1 ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_HOT CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_tier_fdp.sh|reflash_hot_fixed.replay"
+    "LOG_GREEDY_COST_BENEFIT_COLD|sudo PREFILL=1 ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_COLD CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_tier_fdp.sh|reflash_cold_fixed.replay"
+    "FTL|sudo PREFILL=1 CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_ftl.sh|ftl.replay"
+    "OCF|sudo PREFILL=1 CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_ocf.sh|ocf.replay"
 )
 
 # Colors for output
@@ -108,12 +108,14 @@ run_tgt() {
 
 # Step 4: Run replay_trace and wait for completion
 run_replay_trace() {
-    local replay_file="$1"
+    local base_replay="$1"
+    local timestamp=$(date '+%Y%m%d_%H%M%S')
+    local replay_file="${base_replay%.replay}_${timestamp}.replay"
     log_info "Step 4: Running replay_trace -> $replay_file"
     cd "$SCRIPT_DIR"
 
     # Run replay_trace in background with nohup
-    nohup bash -c "sudo taskset -c 14-18 ./replay_trace --trace $TRACE_FILE" > "$replay_file" 2>&1 &
+    nohup bash -c "sudo taskset -c 14-18 ./replay_trace --trace $TRACE_FILE --max-tb 6" > "$replay_file" 2>&1 &
     local pid=$!
 
     log_info "replay_trace started with PID: $pid"
@@ -145,7 +147,7 @@ run_single_config() {
     echo "========================================" | tee -a "$LOG_FILE"
 
     # Step 1: nvmev reinit
-    nvmev_reinit
+    #nvmev_reinit
 
     # Step 2: Exit all tgt
     exit_all_tgt
@@ -153,8 +155,16 @@ run_single_config() {
     # Step 3: Run tgt
     run_tgt "$cmd"
 
+    # Wait 11 minutes after bringup before replay
+    log_info "Sleeping 11 minutes after bringup..."
+    sleep 660
+
     # Step 4: Run replay_trace
     run_replay_trace "$replay"
+
+    # Wait 11 minutes after replay before cleanup
+    log_info "Sleeping 11 minutes after replay_trace..."
+    sleep 660
 
     # Step 5: Cleanup
     cleanup_after_replay
@@ -164,6 +174,13 @@ run_single_config() {
 
 # Main
 main() {
+    sudo modprobe nvme_tcp
+
+    # Clean up stale hugepage and SHM files from previous runs
+    sudo rm -f /dev/hugepages/ftl_* /dev/hugepages/spdk_*
+    sudo rm -f /dev/shm/spdk_tgt_trace.*
+    log_info "Cleaned up stale hugepage and SHM files"
+
     echo "========================================" | tee -a "$LOG_FILE"
     echo "    Benchmark Automation Script" | tee -a "$LOG_FILE"
     echo "========================================" | tee -a "$LOG_FILE"

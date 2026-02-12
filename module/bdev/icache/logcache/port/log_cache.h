@@ -50,6 +50,7 @@ static constexpr bool INCREMENTAL_GC_ENABLED = false;
 // Free segment thresholds for GC triggering
 static constexpr size_t CRITICAL_FREE_SEGMENTS = 2;   // Block host IO if <= this
 static constexpr size_t LOW_FREE_SEGMENTS = 10;       // Trigger GC if <= this
+#define GHOST_CACHE 1
 
 class LogCache final : public ICache
 {
@@ -194,6 +195,9 @@ public:
     int get_host_write_handle() const { return host_write_handle_; }
     void toggle_host_write_handle() { host_write_handle_ = 1 - host_write_handle_; }
 
+    // Number of host streams (for dynamic GC PH base offset)
+    int getNumHostStreams() const { return stream_policy ? stream_policy->getNumHostStreams() : 2; }
+
     // Stats getters for StatsLogger
     uint64_t get_valid_blocks() const { return global_valid_blocks; }
     uint64_t get_write_hit_count() const { return write_hit_size; }
@@ -267,13 +271,14 @@ private:
     std::unique_ptr<Histogram> evicted_cache_blocks_per_evict;
     static const int HISTOGRAM_BUCKETS = 40;
     static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = (262144 * 6) * 4;
-    static constexpr double GHOST_CACHE_RATIO = 0.05;  // 5% of cache size
+    static constexpr double GHOST_CACHE_RATIO = 0.02;  // 2% of cache size
     bool is_ghost_cache = false;
     uint64_t bypass_blocks_threshold = 128; // 128* 4k bytes = 512K bytes
     EwmaRatio compaction_ratio;
     EwmaRatio eviction_ratio;
     EwmaRatio eviction_ratio_in_ghost_cache;
     EwmaRatio compaction_ratio_in_ghost_cache;
+    EwmaRatio ghost_miss_rate_ewma;  // EWMA of ghost cache miss rate = U(util_step)
     static constexpr size_t TCO_HISTORY_SIZE = 1;
     std::deque<double> tco_history;
     bool tco_policy_higher = true;  // initial policy: HIGHER (increase valid block rate)

@@ -11,7 +11,7 @@ import re
 import os
 from plot_config import (
     CONFIGS, CSV_COLUMNS, QLC_COST_MULTIPLIER, NORMALIZATION_BASE,
-    HISTOGRAM_CONFIGS, ALL_CONFIGS, GRAPH_H_CONFIGS, OUTPUT_FILES
+    HISTOGRAM_CONFIGS, ALL_CONFIGS, GRAPH_G_CONFIGS, GRAPH_H_CONFIGS, OUTPUT_FILES
 )
 
 # Set style
@@ -382,7 +382,7 @@ def plot_graph_g():
     fig, ax = plt.subplots(figsize=(14, 10))
 
     throughputs = {}
-    for config_name in ALL_CONFIGS:
+    for config_name in GRAPH_G_CONFIGS:
         config = CONFIGS[config_name]
         tp = parse_throughput_from_replay_trace(config["replay_trace"])
         if tp:

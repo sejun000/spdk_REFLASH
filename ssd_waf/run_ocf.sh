@@ -8,8 +8,8 @@ RPC_BIN=${RPC_BIN:-"$ROOT_DIR/scripts/rpc.py"}
 RPC=("$RPC_BIN" "-s" "$RPC_SOCKET")
 
 # Device BDFs
-CACHE_BDF=${CACHE_BDF:-0001:10:00.0}
-BACKEND_BDF=${BACKEND_BDF:-0000:01:00.0}
+CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
+BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
 
 # OCF configuration
 OCF_NAME=${OCF_NAME:-ocf0}
@@ -129,12 +129,12 @@ pre_format_devices() {
         local dev=${dev_info#*:}
         if [[ -n "$dev" ]] && [[ -e "/dev/${dev}" ]]; then
             local lbaf_4k=$(sudo nvme id-ns "/dev/${dev}" 2>/dev/null | \
-                grep -E "^lbaf\s+[0-9]+.*lbads:12" | head -1 | \
+                grep -E "^lbaf\s+[0-9]+.*ms:0\s+lbads:12" | head -1 | \
                 sed -E 's/^lbaf\s+([0-9]+).*/\1/')
             if [[ -z "$lbaf_4k" ]]; then
                 lbaf_4k=0
             fi
-            log "Formatting ${role} /dev/${dev} with lbaf=${lbaf_4k}"
+            log "Formatting ${role} /dev/${dev} with lbaf=${lbaf_4k} (4K, ms:0)"
             sudo nvme format "/dev/${dev}" -l "${lbaf_4k}" -f 2>/dev/null || true
         fi
     done
@@ -481,7 +481,7 @@ pre_format_devices
 prefill_cache
 
 log "Binding devices to SPDK with uio_pci_generic..."
-sudo HUGEMEM=16384 DRIVER_OVERRIDE=uio_pci_generic "${ROOT_DIR}/scripts/setup.sh"
+sudo HUGEMEM=16384 "${ROOT_DIR}/scripts/setup.sh"
 
 start_spdk_tgt
 create_ocf

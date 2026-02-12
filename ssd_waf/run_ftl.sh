@@ -15,8 +15,8 @@ NVMF_SUBSYSTEM=${NVMF_SUBSYSTEM:-nqn.2024-11.io.spdk:${FTL_NAME}}
 # FDP mode: same as icache tier
 # Cache: 06:00.0 (FDP SSD) - needs 4K format
 # Backend (base device): 07:00.0 (regular SSD) - needs format
-CACHE_BDF=${CACHE_BDF:-0001:10:00.0}
-BACKEND_BDF=${BACKEND_BDF:-0000:01:00.0}
+CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
+BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
 SKIP_PRE_FORMAT=${SKIP_PRE_FORMAT:-0}
 CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-200}
 
@@ -86,33 +86,32 @@ pre_format_devices() {
 
     log "Pre-formatting devices before SPDK startup..."
 
-    # Cache device (regular NVMe) - format with 4K block size
-    if [[ -n "$cache_dev" ]] && [[ -e "/dev/${cache_dev}n1" ]]; then
-        # Find LBA format index with 4K block size (lbads:12 = 2^12 = 4096)
-        local lbaf_4k=$(sudo nvme id-ns "/dev/${cache_dev}n1" 2>/dev/null | \
-            grep -E "^lbaf\s+[0-9]+.*lbads:12" | head -1 | \
+    # Cache device - format with 4K block size (lbads:12), no metadata (ms:0)
+    if [[ -n "$cache_dev" ]] && [[ -e "/dev/${cache_dev}" ]]; then
+        local lbaf_4k=$(sudo nvme id-ns "/dev/${cache_dev}" 2>/dev/null | \
+            grep -E "^lbaf\s+[0-9]+.*ms:0\s+lbads:12" | head -1 | \
             sed -E 's/^lbaf\s+([0-9]+).*/\1/')
         if [[ -z "$lbaf_4k" ]]; then
-            log "WARNING: No 4K LBA format found, using default (lbaf 0)"
+            log "WARNING: No 4K LBA format with ms:0 found, using default (lbaf 0)"
             lbaf_4k=0
         fi
-        log "Formatting /dev/${cache_dev}n1 with lbaf=${lbaf_4k} (4K block size)"
-        sudo nvme format "/dev/${cache_dev}n1" -l "${lbaf_4k}" -f 2>/dev/null && \
+        log "Formatting /dev/${cache_dev} with lbaf=${lbaf_4k} (4K, ms:0)"
+        sudo nvme format "/dev/${cache_dev}" -l "${lbaf_4k}" -f 2>/dev/null && \
             log "Format completed" || \
             log "Format failed, continuing..."
     fi
 
-    # Backend device (regular SSD) - format with 4K block size
-    if [[ -n "$backend_dev" ]] && [[ -e "/dev/${backend_dev}n1" ]]; then
-        local lbaf_4k=$(sudo nvme id-ns "/dev/${backend_dev}n1" 2>/dev/null | \
-            grep -E "^lbaf\s+[0-9]+.*lbads:12" | head -1 | \
+    # Backend device - format with 4K block size (lbads:12), no metadata (ms:0)
+    if [[ -n "$backend_dev" ]] && [[ -e "/dev/${backend_dev}" ]]; then
+        local lbaf_4k=$(sudo nvme id-ns "/dev/${backend_dev}" 2>/dev/null | \
+            grep -E "^lbaf\s+[0-9]+.*ms:0\s+lbads:12" | head -1 | \
             sed -E 's/^lbaf\s+([0-9]+).*/\1/')
         if [[ -z "$lbaf_4k" ]]; then
-            log "WARNING: No 4K LBA format found for backend, using default (lbaf 0)"
+            log "WARNING: No 4K LBA format with ms:0 found for backend, using default (lbaf 0)"
             lbaf_4k=0
         fi
-        log "Formatting /dev/${backend_dev}n1 with lbaf=${lbaf_4k} (4K block size)"
-        sudo nvme format "/dev/${backend_dev}n1" -l "${lbaf_4k}" -f 2>/dev/null && \
+        log "Formatting /dev/${backend_dev} with lbaf=${lbaf_4k} (4K, ms:0)"
+        sudo nvme format "/dev/${backend_dev}" -l "${lbaf_4k}" -f 2>/dev/null && \
             log "Backend format completed" || \
             log "Backend format failed, continuing..."
     fi
@@ -251,8 +250,8 @@ pre_format_devices
 prefill_cache
 
 # Bind devices to SPDK (uio_pci_generic) so spdk_tgt can use them
-log "Binding devices to SPDK (scripts/setup.sh) with HUGEMEM=8192 and uio_pci_generic..."
-sudo HUGEMEM=8192 DRIVER_OVERRIDE=uio_pci_generic "${ROOT_DIR}/scripts/setup.sh"
+log "Binding devices to SPDK (scripts/setup.sh) with HUGEMEM=12288 and uio_pci_generic..."
+sudo HUGEMEM=12288 "${ROOT_DIR}/scripts/setup.sh"
 
 start_spdk_tgt
 create_ftl
