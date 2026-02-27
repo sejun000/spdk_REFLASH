@@ -25,13 +25,13 @@ extern uint64_t g_threshold;
 int MultiHotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) {
     uint64_t time_diff = global_timestamp - created_timestamp;
     if (!isGcAppend) {
-        /*uint64_t lifespan = mLba2Fifo->Query(blockAddr);
-        if (lifespan != UINT64_MAX && lifespan < mAvgLifespan) {
+        uint64_t lifespan = time_diff;
+        if (lifespan != 0 && lifespan < mAvgLifespan) {
             return 0;
         }
         else {
             return 1;
-        }*/
+        }
        return 0;
     }
     if (mCheckCreatedTimestampOnly) {

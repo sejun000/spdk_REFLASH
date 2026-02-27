@@ -22,11 +22,12 @@ class LogCacheSegment : public Segment
 public:
     struct Block
     {
-        struct {
-            long key = 0;      ///< LBA(block) index (63비트)
-            bool valid = false; ///< 유효성 플래그 (1비트)
-        };
-        uint64_t create_timestamp = UINT64_MAX; ///< 생성 시각
+        int64_t key : 63;       ///< LBA(block) index (63비트)
+        uint64_t valid : 1;     ///< 유효성 플래그 (1비트)
+        uint32_t create_timestamp;   ///< 생성 시각 (4K block 단위, ~16TB)
+        uint32_t gc_copied_timestamp; ///< GC로 최초 복사된 시각 (0 = host write)
+
+        Block() : key(0), valid(0), create_timestamp(UINT32_MAX), gc_copied_timestamp(0) {}
     };
 
     explicit LogCacheSegment(std::size_t blocks_per_segment, uint64_t create_timestamp,
@@ -74,7 +75,8 @@ public:
         create_timestamp = 0;
         for (auto &b : blocks) {
             b.valid = false;
-            b.create_timestamp = UINT64_MAX;
+            b.create_timestamp = UINT32_MAX;
+            b.gc_copied_timestamp = 0;
         }
     }
 };

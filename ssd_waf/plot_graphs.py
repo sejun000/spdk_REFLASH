@@ -11,7 +11,9 @@ import re
 import os
 from plot_config import (
     CONFIGS, CSV_COLUMNS, QLC_COST_MULTIPLIER, NORMALIZATION_BASE,
-    HISTOGRAM_CONFIGS, ALL_CONFIGS, GRAPH_G_CONFIGS, GRAPH_H_CONFIGS, OUTPUT_FILES
+    HISTOGRAM_CONFIGS, ALL_CONFIGS, GRAPH_B2_CONFIGS, GRAPH_C_CONFIGS,
+    GRAPH_C2_CONFIGS, GRAPH_G_CONFIGS, GRAPH_H_CONFIGS, GRAPH_I_CONFIGS,
+    OUTPUT_FILES
 )
 
 # Set style
@@ -83,20 +85,20 @@ def get_final_values(config_name):
     (to exclude flush operations after host writes stop).
     """
     data = load_csv_data(config_name)
-    final_host_write = data["host_write_gb"][-1]
+    # final_host_write = data["host_write_gb"][-1]
 
-    # Traverse backwards to find the first index where host_write equals final value
-    first_idx = len(data["host_write_gb"]) - 1
-    for i in range(len(data["host_write_gb"]) - 1, -1, -1):
-        if data["host_write_gb"][i] == final_host_write:
-            first_idx = i
-        else:
-            break
+    # # Traverse backwards to find the first index where host_write equals final value
+    # first_idx = len(data["host_write_gb"]) - 1
+    # for i in range(len(data["host_write_gb"]) - 1, -1, -1):
+    #     if data["host_write_gb"][i] == final_host_write:
+    #         first_idx = i
+    #     else:
+    #         break
 
     return {
-        "host_write_gb": data["host_write_gb"][first_idx],
-        "tlc_write_gb": data["tlc_write_gb"][first_idx],
-        "qlc_write_gb": data["qlc_write_gb"][first_idx],
+        "host_write_gb": data["host_write_gb"][-1],
+        "tlc_write_gb": data["tlc_write_gb"][-1],
+        "qlc_write_gb": data["qlc_write_gb"][-1],
     }
 
 
@@ -194,7 +196,7 @@ def plot_graph_c():
     """Graph C: Time series - x: Host writes, y: QLC (evict) writes (GB)"""
     fig, ax = plt.subplots(figsize=(14, 10))
 
-    for config_name in ALL_CONFIGS:
+    for config_name in GRAPH_C_CONFIGS:
         data = load_csv_data(config_name)
         # Find the first index where host_write reaches its final value (exclude flush)
         final_host_write = data["host_write_gb"][-1]
@@ -224,6 +226,86 @@ def plot_graph_c():
     plt.savefig(OUTPUT_FILES["graph_c"], dpi=150)
     plt.close()
     print(f"Saved: {OUTPUT_FILES['graph_c']}")
+
+
+def plot_graph_b2():
+    """Graph B2: Bar chart - Final WAF (FDP media / FDP host) per config"""
+    fig, ax = plt.subplots(figsize=(14, 10))
+
+    wafs = {}
+    for config_name in GRAPH_B2_CONFIGS:
+        data = load_csv_data(config_name)
+        # Find final index (where host_write stops)
+        final_host_write = data["host_write_gb"][-1]
+        first_idx = len(data["host_write_gb"]) - 1
+        for i in range(len(data["host_write_gb"]) - 1, -1, -1):
+            if data["host_write_gb"][i] == final_host_write:
+                first_idx = i
+            else:
+                break
+        fdp_host = data["fdp_host_write_gb"][first_idx]
+        fdp_media = data["fdp_media_write_gb"][first_idx]
+        wafs[config_name] = fdp_media / fdp_host if fdp_host > 0 else 0
+
+    x = np.arange(len(GRAPH_B2_CONFIGS))
+    bars = ax.bar(x, [wafs[c] for c in GRAPH_B2_CONFIGS],
+                  color=[CONFIG_COLORS[c] for c in GRAPH_B2_CONFIGS],
+                  edgecolor='black', linewidth=1.5)
+
+    ax.set_ylabel("WAF (FDP Media / FDP Host)")
+    ax.set_title("Graph B2: Final WAF")
+    ax.set_xticks(x)
+    ax.set_xticklabels(GRAPH_B2_CONFIGS, rotation=45, ha='right')
+    ax.axhline(y=1.0, color='red', linestyle='--', linewidth=2, label='WAF = 1.0')
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_ylim(bottom=0)
+
+    for bar, config in zip(bars, GRAPH_B2_CONFIGS):
+        height = bar.get_height()
+        ax.annotate(f'{height:.2f}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 5), textcoords="offset points",
+                    ha='center', va='bottom', fontsize=18)
+
+    plt.tight_layout()
+    plt.savefig(OUTPUT_FILES["graph_b2"], dpi=150)
+    plt.close()
+    print(f"Saved: {OUTPUT_FILES['graph_b2']}")
+
+
+def plot_graph_c2():
+    """Graph C2: Bar chart - Final QLC (evict) writes per config"""
+    fig, ax = plt.subplots(figsize=(14, 10))
+
+    qlc_writes = {}
+    for config_name in GRAPH_C2_CONFIGS:
+        final = get_final_values(config_name)
+        qlc_writes[config_name] = final["qlc_write_gb"]
+
+    x = np.arange(len(GRAPH_C2_CONFIGS))
+    bars = ax.bar(x, [qlc_writes[c] for c in GRAPH_C2_CONFIGS],
+                  color=[CONFIG_COLORS[c] for c in GRAPH_C2_CONFIGS],
+                  edgecolor='black', linewidth=1.5)
+
+    ax.set_ylabel("QLC (Evict) Writes (GB)")
+    ax.set_title("Graph C2: Final QLC Writes")
+    ax.set_xticks(x)
+    ax.set_xticklabels(GRAPH_C2_CONFIGS, rotation=45, ha='right')
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.set_ylim(bottom=0)
+
+    for bar in bars:
+        height = bar.get_height()
+        ax.annotate(f'{height:.0f}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 5), textcoords="offset points",
+                    ha='center', va='bottom', fontsize=18)
+
+    plt.tight_layout()
+    plt.savefig(OUTPUT_FILES["graph_c2"], dpi=150)
+    plt.close()
+    print(f"Saved: {OUTPUT_FILES['graph_c2']}")
 
 
 def plot_graph_d():
@@ -377,6 +459,40 @@ def plot_graph_f():
     print(f"Saved: {OUTPUT_FILES['graph_f']}")
 
 
+def plot_graph_f2():
+    """Graph F2: Histogram subplots - gc_copied_lifetime for each config
+    x-axis: bucket (0-79), y-axis: count
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(18, 14))
+    axes = axes.flatten()
+
+    for i, config_name in enumerate(HISTOGRAM_CONFIGS):
+        ax = axes[i]
+        config = CONFIGS[config_name]
+
+        hist_data = parse_histogram_from_stat_log(
+            config["stat_log"], "gc_copied_lifetime"
+        )
+
+        if hist_data:
+            # Exclude last bucket (overflow bucket)
+            buckets = hist_data["buckets"][:-1]
+            counts = hist_data["counts"][:-1]
+            ax.bar(buckets, counts,
+                   color='mediumpurple', edgecolor='black', linewidth=0.5)
+            ax.set_xlabel("Bucket (0-78)")
+            ax.set_ylabel("Count")
+            ax.set_title(f"{config_name}")
+            ax.grid(True, alpha=0.3, axis='y')
+            ax.set_ylim(bottom=0)
+
+    fig.suptitle("Graph F2: GC Copied Lifetime Histogram", fontsize=28, y=1.02)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_FILES["graph_f2"], dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {OUTPUT_FILES['graph_f2']}")
+
+
 def plot_graph_g():
     """Graph G: Bar chart - Throughput (MB/s) for each config"""
     fig, ax = plt.subplots(figsize=(14, 10))
@@ -437,7 +553,7 @@ def plot_graph_h():
 
         # valid_blocks * 4KB in GB, then divide by cache_size_gb
         valid_blocks = df["valid_blocks"].values.astype(float)
-        valid_block_rate = (valid_blocks * 4 / 1024 / 1024) / cache_size_gb
+        valid_block_rate = (valid_blocks * 4096 / 1000 / 1000 / 1000) / cache_size_gb
 
         # Filter where host_write > 0
         mask = host_write_gb > 0
@@ -458,16 +574,64 @@ def plot_graph_h():
     print(f"Saved: {OUTPUT_FILES['graph_h']}")
 
 
+def plot_graph_i():
+    """Graph I: Scatter - x: Host writes, y: Cache utilization rate"""
+    fig, ax = plt.subplots(figsize=(14, 10))
+
+    for config_name in GRAPH_I_CONFIGS:
+        config = CONFIGS[config_name]
+        csv_path = config["csv"]
+        df = pd.read_csv(csv_path)
+        csv_type = config["csv_type"]
+        columns = CSV_COLUMNS[csv_type]
+        host_write_gb = df[columns["host_write"]].values / 1024
+
+        if csv_type == "ocf":
+            occupancy = df["occupancy_blocks"].values.astype(float)
+            free = df["free_blocks"].values.astype(float)
+            total = occupancy + free
+            utilization = np.where(total > 0, occupancy / total, 0)
+        else:
+            cache_size_gb = config.get("cache_size_gb")
+            if not cache_size_gb:
+                print(f"  Skipping {config_name}: no cache_size_gb")
+                continue
+            valid_blocks = df["valid_blocks"].values.astype(float)
+            utilization = (valid_blocks * 4096 / 1000 / 1000 / 1000) / cache_size_gb
+
+        mask = host_write_gb > 0
+        ax.scatter(host_write_gb[mask], utilization[mask],
+                   label=config_name, color=CONFIG_COLORS[config_name],
+                   s=10, alpha=0.6)
+
+    ax.set_xlabel("Host Writes (GB)")
+    ax.set_ylabel("Cache Utilization")
+    ax.set_title("Graph I: Cache Utilization over Host Writes")
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(OUTPUT_FILES["graph_i"], dpi=150)
+    plt.close()
+    print(f"Saved: {OUTPUT_FILES['graph_i']}")
+
+
 GRAPH_FUNCTIONS = {
     "a": plot_graph_a,
     "b": plot_graph_b,
+    "b2": plot_graph_b2,
     "c": plot_graph_c,
+    "c2": plot_graph_c2,
     "d": plot_graph_d,
     "d2": plot_graph_d2,
     "e": plot_graph_e,
     "f": plot_graph_f,
+    "f2": plot_graph_f2,
     "g": plot_graph_g,
     "h": plot_graph_h,
+    "i": plot_graph_i,
 }
 
 

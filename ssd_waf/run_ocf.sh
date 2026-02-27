@@ -5,7 +5,7 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SPDK_TGT_SCRIPT=${SPDK_TGT_SCRIPT:-"$ROOT_DIR/ssd_waf/spdk_tgt.sh"}
 RPC_SOCKET=${SPDK_RPC_SOCKET:-/var/tmp/spdk.sock}
 RPC_BIN=${RPC_BIN:-"$ROOT_DIR/scripts/rpc.py"}
-RPC=("$RPC_BIN" "-s" "$RPC_SOCKET")
+RPC=("$RPC_BIN" "-s" "$RPC_SOCKET" "-t" "300")
 
 # Device BDFs
 CACHE_BDF=${CACHE_BDF:-0000:06:00.0}
@@ -13,7 +13,7 @@ BACKEND_BDF=${BACKEND_BDF:-0000:07:00.0}
 
 # OCF configuration
 OCF_NAME=${OCF_NAME:-ocf0}
-OCF_MODE=${OCF_MODE:-wb}  # wb, wt, pt, wa, wi, wo
+OCF_MODE=${OCF_MODE:-wo}  # wb, wt, pt, wa, wi, wo
 OCF_CACHE_LINE_SIZE=${OCF_CACHE_LINE_SIZE:-4}  # 4, 8, 16, 32, 64 KiB
 CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-256}  # Split cache device to 256GB
 BACKEND_SPLIT_GB=${BACKEND_SPLIT_GB:-0}  # Split backend device (0 = full capacity)
@@ -480,8 +480,13 @@ sudo "${ROOT_DIR}/scripts/setup.sh" reset
 pre_format_devices
 prefill_cache
 
+log "Compacting memory for hugepage allocation..."
+sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+sudo sh -c 'echo 1 > /proc/sys/vm/compact_memory'
+sleep 2
+
 log "Binding devices to SPDK with uio_pci_generic..."
-sudo HUGEMEM=16384 "${ROOT_DIR}/scripts/setup.sh"
+sudo HUGEMEM=30720 SHRINK_HUGE=yes "${ROOT_DIR}/scripts/setup.sh"
 
 start_spdk_tgt
 create_ocf

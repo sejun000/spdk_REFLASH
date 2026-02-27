@@ -1,56 +1,74 @@
 #!/bin/bash
 
-# FDP Test Script
-# Usage: FDP_PLI=0 ./fio_fdp.sh   (placement handle 0 - expected full BW)
-#        FDP_PLI=1 ./fio_fdp.sh   (placement handle 1 - expected lower BW)
+# FDP Sequential Write Test - 2 threads, split range, FDP PLI 0/1
+# Device: nvme3n1 (SN: 0123456789ABCDEF0000)
 
-TARGET_SN="S77UNG0TC00116"
-FDP_PLI=${FDP_PLI:-0}  # Default to placement handle 0
+TARGET_SN="0123456789ABCDEF0000"
 
 # Find device by serial number
-DEVICE=$(nvme list -o json 2>/dev/null | jq -r ".Devices[] | select(.SerialNumber==\"$TARGET_SN\") | .DevicePath" | head -1)
+DEV=""
+for d in /sys/block/nvme*; do
+    sn=$(cat "$d/device/serial" 2>/dev/null | tr -d ' ')
+    if [ "$sn" == "$TARGET_SN" ]; then
+        DEV="/dev/$(basename $d)"
+        break
+    fi
+done
 
-if [ -z "$DEVICE" ] || [ "$DEVICE" == "null" ]; then
+if [ -z "$DEV" ]; then
     echo "Error: Device with SN=$TARGET_SN not found"
-    echo "Available devices:"
-    nvme list
+    lsblk -o NAME,SERIAL | grep nvme
     exit 1
 fi
 
-echo "============================================"
-echo "FDP Write Test"
-echo "Target SN: $TARGET_SN"
-echo "Device: $DEVICE"
-echo "Placement Handle Index: $FDP_PLI"
-echo "============================================"
+# Get character device for io_uring_cmd (ng device)
+CHAR_DEV=$(echo "$DEV" | sed 's|/dev/nvme|/dev/ng|')
 
-# Get character device (ng*) for io_uring_cmd
-CHAR_DEV=$(echo $DEVICE | sed 's/nvme\([0-9]*\)n\([0-9]*\)/ng\1n\2/')
 if [ ! -e "$CHAR_DEV" ]; then
-    # Fallback: try /dev/ngXnY format
-    CHAR_DEV="/dev/ng${DEVICE#/dev/nvme}"
-    CHAR_DEV=$(echo $CHAR_DEV | sed 's/nvme//')
-    CHAR_DEV="/dev/ng$(echo $DEVICE | grep -o '[0-9]*n[0-9]*')"
+    echo "Error: Character device $CHAR_DEV not found"
+    exit 1
 fi
 
-echo "Character device: $CHAR_DEV"
+TOTAL_SIZE=$(lsblk -b -o SIZE -n "$DEV" | tr -d ' ')
+HALF_SIZE=$((TOTAL_SIZE / 2))
 
-# Run fio with FDP using io_uring_cmd (NVMe passthrough)
-fio --name=fdp_test \
-    --filename=$CHAR_DEV \
+echo "============================================"
+echo "FDP Sequential Write Test"
+echo "  SN:          $TARGET_SN"
+echo "  Block dev:   $DEV"
+echo "  Char dev:    $CHAR_DEV"
+echo "  Total size:  $((TOTAL_SIZE / 1024 / 1024 / 1024)) GiB"
+echo "  Half size:   $((HALF_SIZE / 1024 / 1024 / 1024)) GiB"
+echo "  Job 0:       offset=0, size=$((HALF_SIZE / 1024 / 1024 / 1024)) GiB, fdp_pli=0"
+echo "  Job 1:       offset=$((HALF_SIZE / 1024 / 1024 / 1024)) GiB, size=$((HALF_SIZE / 1024 / 1024 / 1024)) GiB, fdp_pli=1"
+echo "============================================"
+
+fio \
+    --name=fdp_seq_pli0 \
+    --filename="$CHAR_DEV" \
     --ioengine=io_uring_cmd \
     --cmd_type=nvme \
     --rw=write \
     --bs=128k \
-    --iodepth=64 \
-    --numjobs=4 \
+    --iodepth=32 \
+    --offset=0 \
+    --size="$HALF_SIZE" \
     --fdp=1 \
-    --fdp_pli=$FDP_PLI \
-    --size=10G \
-    --runtime=30 \
-    --time_based \
-    --group_reporting \
-    --output-format=normal
+    --fdp_pli=0 \
+    --numjobs=1 \
+    --name=fdp_seq_pli1 \
+    --filename="$CHAR_DEV" \
+    --ioengine=io_uring_cmd \
+    --cmd_type=nvme \
+    --rw=write \
+    --bs=128k \
+    --iodepth=32 \
+    --offset="$HALF_SIZE" \
+    --size="$HALF_SIZE" \
+    --fdp=1 \
+    --fdp_pli=1 \
+    --numjobs=1 \
+    --group_reporting=0
 
 echo ""
-echo "Test completed with FDP PLI=$FDP_PLI"
+echo "Done."

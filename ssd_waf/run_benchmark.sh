@@ -9,8 +9,16 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NVMEV_DIR="/home/sejun000/csd-virt/CSD-Virt"
-TRACE_FILE="../../alibaba_dwpd1.trace.head30p"
+TRACE_FILE="${TRACE_FILE:-../../alibaba_dwpd2_5x.trace}"
 LOG_FILE="$SCRIPT_DIR/test.log"
+
+# Configurable via environment variables
+CACHE_SPLIT_GB="${CACHE_SPLIT_GB:-1800}"
+BACKEND_SPLIT_GB="${BACKEND_SPLIT_GB:-14400}"
+MAX_TB="${MAX_TB:-14}"
+IO_SCALE="${IO_SCALE:-2}"
+REPLAY_EXTRA_ARGS="${REPLAY_EXTRA_ARGS:-}"
+PREFILL="${PREFILL:-1}"
 
 # Initialize log file with timestamp
 echo "========================================" > "$LOG_FILE"
@@ -24,14 +32,25 @@ log_to_file() {
 
 # Config definitions: "name|command|replay_file"
 declare -a CONFIGS=(
-    "LOG_SEPBIT_FIFO|sudo PREFILL=1 ICACHE_CACHE_TYPE=LOG_SEPBIT_FIFO CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_tier_fdp.sh|sepbit.replay"
-    "LOG_GREEDY_COST_BENEFIT_10|sudo PREFILL=1 ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_10 CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_tier_fdp.sh|reflash.replay"
-    "LOG_GREEDY_COST_BENEFIT_10_WARM|sudo PREFILL=1 ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_10_WARM CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_tier_fdp.sh|reflash_fixed.replay"
-    "LOG_GREEDY_COST_BENEFIT_HOT|sudo PREFILL=1 ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_HOT CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_tier_fdp.sh|reflash_hot_fixed.replay"
-    "LOG_GREEDY_COST_BENEFIT_COLD|sudo PREFILL=1 ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_COLD CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_tier_fdp.sh|reflash_cold_fixed.replay"
-    "FTL|sudo PREFILL=1 CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_ftl.sh|ftl.replay"
-    "OCF|sudo PREFILL=1 CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_ocf.sh|ocf.replay"
+    "LOG_SEPBIT_FIFO|sudo ICACHE_CACHE_TYPE=LOG_SEPBIT_FIFO ./run_tier_fdp.sh|sepbit.replay"
+    "LOG_GREEDY_COST_BENEFIT_10|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_10 ./run_tier_fdp.sh|reflash.replay"
+    "LOG_GREEDY_COST_BENEFIT_10_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_10_WARM ./run_tier_fdp.sh|reflash_fixed.replay"
+    "LOG_GREEDY_COST_BENEFIT_COLD|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_COLD ./run_tier_fdp.sh|reflash_fixed.replay"
+    "FTL|sudo ./run_ftl.sh|ftl.replay"
+    "OCF|sudo ./run_ocf.sh|ocf.replay"
+    "LOG_GREEDY_80_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_80_WARM ./run_tier_fdp.sh|reflash_80_warm.replay"
+    "LOG_GREEDY_60_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_60_WARM ./run_tier_fdp.sh|reflash_60_warm.replay"
+    "LOG_GREEDY_40_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_40_WARM ./run_tier_fdp.sh|reflash_40_warm.replay"
 )
+# Split configs (use with CACHE_SPLIT_ENABLE=1):
+#    "LOG_SEPBIT_FIFO|sudo ICACHE_CACHE_TYPE=LOG_SEPBIT_FIFO CACHE_SPLIT_GB=$CACHE_SPLIT_GB CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=$BACKEND_SPLIT_GB ./run_tier_fdp.sh|sepbit.replay"
+#    "LOG_GREEDY_COST_BENEFIT_10|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_10 CACHE_SPLIT_GB=$CACHE_SPLIT_GB CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=$BACKEND_SPLIT_GB ./run_tier_fdp.sh|reflash.replay"
+#    "LOG_GREEDY_COST_BENEFIT_10_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_10_WARM CACHE_SPLIT_GB=$CACHE_SPLIT_GB CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=$BACKEND_SPLIT_GB ./run_tier_fdp.sh|reflash_fixed.replay"
+#    "LOG_GREEDY_COST_BENEFIT_COLD|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_COLD CACHE_SPLIT_GB=$CACHE_SPLIT_GB CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=$BACKEND_SPLIT_GB ./run_tier_fdp.sh|reflash_cold_fixed.replay"
+#    "FTL|sudo CACHE_SPLIT_GB=$CACHE_SPLIT_GB CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=$BACKEND_SPLIT_GB ./run_ftl.sh|ftl.replay"
+#    "OCF|sudo CACHE_SPLIT_GB=$CACHE_SPLIT_GB CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=$BACKEND_SPLIT_GB ./run_ocf.sh|ocf.replay"
+#    "LOG_GREEDY_COST_BENEFIT_HOT|sudo PREFILL=1 ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_HOT CACHE_SPLIT_GB=720 CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=2880 ./run_tier_fdp.sh|reflash_hot_fixed.replay"
+#  "LOG_GREEDY_COST_BENEFIT_COLD|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_COLD ./run_tier_fdp.sh|reflash_cold_fixed.replay"    
 
 # Colors for output
 RED='\033[0;31m'
@@ -98,6 +117,10 @@ exit_all_tgt() {
 # Step 3: Run tgt with specific config
 run_tgt() {
     local cmd="$1"
+    # Inject PREFILL if enabled
+    if [ "$PREFILL" = "1" ]; then
+        cmd="${cmd/sudo /sudo PREFILL=1 }"
+    fi
     log_info "Step 3: Running tgt..."
     log_info "Command: $cmd"
     cd "$SCRIPT_DIR"
@@ -115,7 +138,7 @@ run_replay_trace() {
     cd "$SCRIPT_DIR"
 
     # Run replay_trace in background with nohup
-    nohup bash -c "sudo taskset -c 14-18 ./replay_trace --trace $TRACE_FILE --max-tb 6" > "$replay_file" 2>&1 &
+    nohup bash -c "sudo taskset -c 14-18 ./replay_trace --remap-lba --trace $TRACE_FILE --max-tb $MAX_TB --io-scale $IO_SCALE $REPLAY_EXTRA_ARGS" > "$replay_file" 2>&1 &
     local pid=$!
 
     log_info "replay_trace started with PID: $pid"

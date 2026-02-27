@@ -9,11 +9,11 @@
 
 uint64_t interval = 1;
 namespace {
-constexpr int kMultiHotColdStreams = 6;
+constexpr int kMultiHotColdStreams = 5;
 }
 
 void set_stream_interval(uint64_t cache_block_count, uint64_t segment_size_blocks) {
-    uint64_t computed = (uint64_t)(cache_block_count / (4));
+    uint64_t computed = (uint64_t)(cache_block_count / (3));
     if (computed == 0) {
         computed = 1;
     }
@@ -29,6 +29,9 @@ void set_stream_interval(uint64_t cache_block_count, uint64_t segment_size_block
 }
 
 IStream* createIstreamPolicy(std::string policy_type) {
+    if (policy_type == "none" || policy_type.empty()) {
+        return nullptr;
+    }
     if (policy_type == "sepbit") {
         return new SepBIT();
     }

@@ -13,44 +13,44 @@ OUTPUT_DIR = BASE_DIR
 # Config definitions
 CONFIGS = {
     "SepBIT": {
-        "csv": os.path.join(LOGGING_DIR, "LOG_SEPBIT_FIFO_20260209_112422.csv"),
-        "stat_log": os.path.join(BASE_DIR, "stat.log.20260209_112421"),
-        "replay_trace": os.path.join(BASE_DIR, "sepbit.replay"),
+        "csv": os.path.join(LOGGING_DIR, "LOG_SEPBIT_FIFO_20260226_081216.csv"),
+        "stat_log": os.path.join(BASE_DIR, "stat.log.20260224_232851"),
+        "replay_trace": os.path.join(BASE_DIR, "sepbit_20260224_094450.replay"),
         "csv_type": "icache",  # icache or ftl or ocf
-        "cache_size_gb": 720,
+        "cache_size_gb": 1880,
     },
     "REFlash_COLD_FIXED": {
         "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_COLD_20260209_214756.csv"),
         "stat_log": os.path.join(BASE_DIR, "stat.log.20260209_214755"),
         "replay_trace": os.path.join(BASE_DIR, "reflash_cold_fixed.replay"),
         "csv_type": "icache",
-        "cache_size_gb": 720,
+        "cache_size_gb": 1880,
     },
     "REFlash_WARM_FIXED": {
-        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_WARM_20260209_174546.csv"),
-        "stat_log": os.path.join(BASE_DIR, "stat.log.20260209_174545"),
-        "replay_trace": os.path.join(BASE_DIR, "reflash_fixed.replay"),
+        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_WARM_20260225_231144.csv"),
+        "stat_log": os.path.join(BASE_DIR, "stat.log.20260225_231142"),
+        "replay_trace": os.path.join(BASE_DIR, "reflash_fixed_20260225_232254.replay"),
         "csv_type": "icache",
-        "cache_size_gb": 720,
+        "cache_size_gb": 1880,
     },
     "REFlash": {
-        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260209_032948.csv"),
-        "stat_log": os.path.join(BASE_DIR, "stat.log.20260209_032947"),
-        "replay_trace": os.path.join(BASE_DIR, "reflash.replay.backup"),
+        "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260226_033138.csv"),
+        "stat_log": os.path.join(BASE_DIR, "stat.log.20260226_033136"),
+        "replay_trace": os.path.join(BASE_DIR, "reflash_20260224_180916.replay"),
         "csv_type": "icache",
-        "cache_size_gb": 720,
+        "cache_size_gb": 1880,
     },
     "CSAL": {
-        "csv": os.path.join(LOGGING_DIR, "ftl0_20260210_034555.csv"),
+        "csv": os.path.join(LOGGING_DIR, "ftl0_20260225_082514.csv"),
         "stat_log": None,  # No histogram for CSAL
-        "replay_trace": os.path.join(BASE_DIR, "ftl.replay"),
+        "replay_trace": os.path.join(BASE_DIR, "ftl_20260223_200336.replay"),
         "csv_type": "ftl",
-        "cache_size_gb": 720,
+        "cache_size_gb": 1880,
     },
     "OpenCAS": {
-        "csv": os.path.join(LOGGING_DIR, "ocf0_20260210_064303.csv"),
+        "csv": os.path.join(LOGGING_DIR, "ocf0_20260225_122214.csv"),
         "stat_log": None,  # No histogram for OpenCAS
-        "replay_trace": os.path.join(BASE_DIR, "ocf.replay"),
+        "replay_trace": os.path.join(BASE_DIR, "ocf_20260223_141636.replay"),
         "csv_type": "ocf",
     },
 }
@@ -81,8 +81,8 @@ CSV_COLUMNS = {
     },
 }
 
-# Cost formula: TLC writes + 2.8 * QLC writes
-QLC_COST_MULTIPLIER = 2.8
+# Cost formula: TLC writes + QLC_COST_MULTIPLIER * QLC writes
+QLC_COST_MULTIPLIER = 8.64
 
 # Normalization base for Graph D
 NORMALIZATION_BASE = "CSAL"
@@ -90,13 +90,21 @@ NORMALIZATION_BASE = "CSAL"
 # Configs that have histogram data (for Graphs E, F)
 HISTOGRAM_CONFIGS = ["SepBIT", "REFlash_COLD_FIXED", "REFlash_WARM_FIXED", "REFlash"]
 
-# All configs for Graphs A, B, C, D
-ALL_CONFIGS = ["SepBIT", "REFlash_COLD_FIXED", "REFlash_WARM_FIXED", "REFlash", "CSAL", "OpenCAS"]
+# All configs for Graphs A, B, C, D, etc. (histogram 제외)
+ALL_CONFIGS = ["SepBIT", "REFlash_WARM_FIXED", "REFlash", "CSAL", "OpenCAS"]
 
+# Configs for Graph I (utilization scatter) - ordered for comparison
+GRAPH_I_CONFIGS = ["OpenCAS", "REFlash", "CSAL"]
+# Configs for Graph B2 (WAF bar) - ordered for comparison
+GRAPH_B2_CONFIGS = ["OpenCAS", "REFlash", "CSAL"]
+# Configs for Graph C (QLC writes timeseries) - tiering configs only
+GRAPH_C_CONFIGS = ["REFlash", "CSAL", "OpenCAS"]
+# Configs for Graph C2 (QLC writes bar) - ordered for comparison
+GRAPH_C2_CONFIGS = ["OpenCAS", "REFlash", "CSAL"]
 # Configs for Graph G (throughput)
-GRAPH_G_CONFIGS = ["CSAL", "OpenCAS", "REFlash"]
+GRAPH_G_CONFIGS = ["SepBIT", "REFlash", "CSAL", "OpenCAS"]
 # Configs for Graph H (valid block rate) - must have valid_blocks column and cache_size_gb
-GRAPH_H_CONFIGS = ["CSAL", "OpenCAS", "REFlash"]
+GRAPH_H_CONFIGS = ["SepBIT",  "REFlash_WARM_FIXED", "REFlash", "CSAL", "OpenCAS"]
 
 # Output file names
 OUTPUT_FILES = {
@@ -107,6 +115,10 @@ OUTPUT_FILES = {
     "graph_e": os.path.join(OUTPUT_DIR, "graph_E_evicted_histogram.png"),
     "graph_f": os.path.join(OUTPUT_DIR, "graph_F_compacted_histogram.png"),
     "graph_g": os.path.join(OUTPUT_DIR, "graph_G_throughput.png"),
+    "graph_b2": os.path.join(OUTPUT_DIR, "graph_B2_waf_bar.png"),
+    "graph_c2": os.path.join(OUTPUT_DIR, "graph_C2_qlc_bar.png"),
     "graph_d2": os.path.join(OUTPUT_DIR, "graph_D2_actual_cost.png"),
+    "graph_f2": os.path.join(OUTPUT_DIR, "graph_F2_gc_copied_lifetime.png"),
     "graph_h": os.path.join(OUTPUT_DIR, "graph_H_valid_block_rate.png"),
+    "graph_i": os.path.join(OUTPUT_DIR, "graph_I_utilization.png"),
 }

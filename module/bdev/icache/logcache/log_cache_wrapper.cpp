@@ -52,6 +52,10 @@ static double score_age_evict(Segment *seg) {
     return -static_cast<double>(seg->create_timestamp);
 }
 
+static double score_greedy_first(Segment *seg) {
+    return -static_cast<double>(seg->valid_cnt);
+}
+
 // Global variables for score_warm_first (set by LogCache during GC)
 extern uint64_t g_threshold;
 extern uint64_t g_timestamp;
@@ -75,27 +79,27 @@ static inline bool is_old_cycle_segment(Segment *seg) {
 }
 
 static double score_warm_first(Segment *seg) {
-    if (is_old_cycle_segment(seg)) return 0.0;
-    if (g_threshold <= 0 || g_timestamp <= 0) {
-        // Fallback to simple age-based score if globals not set
-        return -static_cast<double>(seg->create_timestamp);
-    }
-    // Use actual segment size from LogCacheSegment::blocks
+    if (is_old_cycle_segment(seg)) return 1.0;
     double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
     double u = seg->valid_cnt / segment_size;
-    if (u < 0.0001) u = 0.0001;  // Avoid division by zero
+   // if (u > 0.8) return 0.0;  // Too full to compact efficiently
+    if (g_threshold <= 0 || g_timestamp <= 0) {
+        return -static_cast<double>(seg->create_timestamp);
+    }
+    if (u < 0.0001) u = 0.0001;
     return std::min(g_threshold - (g_timestamp - seg->create_timestamp),
                     g_timestamp - seg->create_timestamp) * (1 - u) / u;
 }
 
 // Score function: prefer HOT segments (recently created) for compaction
 static double score_hot_first(Segment *seg) {
-    if (is_old_cycle_segment(seg)) return 0.0;
+    if (is_old_cycle_segment(seg)) return 1.0;
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
+   // if (u > 0.8) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
         return -static_cast<double>(seg->create_timestamp);
     }
-    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
-    double u = seg->valid_cnt / segment_size;
     if (u < 0.0001) u = 0.0001;
     // Hot-first: higher score for segments with smaller age (recently created)
     return (g_threshold - (g_timestamp - seg->create_timestamp)) * (1 - u) / u;
@@ -103,12 +107,13 @@ static double score_hot_first(Segment *seg) {
 
 // Score function: prefer COLD segments (old) for compaction
 static double score_cold_first(Segment *seg) {
-    if (is_old_cycle_segment(seg)) return 0.0;
+    if (is_old_cycle_segment(seg)) return 1.0;
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
+  //  if (u > 0.8) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
         return -static_cast<double>(seg->create_timestamp);
     }
-    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
-    double u = seg->valid_cnt / segment_size;
     if (u < 0.0001) u = 0.0001;
     // Cold-first: higher score for segments with larger age (older)
     return (g_timestamp - seg->create_timestamp) * (1 - u) / u;
@@ -117,11 +122,12 @@ static double score_cold_first(Segment *seg) {
 // Score function for SEPBIT: sqrt of age for balanced selection
 static double score_sepbit_age(Segment *seg) {
     //if (is_old_cycle_segment(seg)) return 0.0;
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
+//    if (u > 0.8) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
         return -static_cast<double>(seg->create_timestamp);
     }
-    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
-    double u = seg->valid_cnt / segment_size;
     if (u < 0.0001) u = 0.0001;
     return (g_timestamp - seg->create_timestamp) * (1 - u) / u;
 }
@@ -2461,29 +2467,56 @@ public:
 			}
 		}
 			// LOG_GREEDY_COST_BENEFIT_11 uses valid_rate_threshold from parameter
+		else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GREEDY") {
+			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
+			compactor = std::make_unique<CbEvictPolicy>(score_greedy_first);
+			effective_valid_rate = 0.80;
+			score_low_valid_first = false;
+		}
 		else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_WARM") {
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_warm_first);
-			effective_valid_rate = 0.85;
+			effective_valid_rate = 0.80;
 			score_low_valid_first = false;
-		} else if (cache_type == "LOG_GREEDY_COST_BENEFIT_HOT") {
+		}
+		else if (cache_type == "LOG_GREEDY_80_WARM") {
+			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
+			compactor = std::make_unique<CbEvictPolicy>(score_greedy_first);
+			effective_valid_rate = 0.80;
+			score_low_valid_first = false;
+			istream_policy_name = "none";
+		}
+		else if (cache_type == "LOG_GREEDY_60_WARM") {
+			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
+			compactor = std::make_unique<CbEvictPolicy>(score_greedy_first);
+			effective_valid_rate = 0.65;
+			score_low_valid_first = false;
+		}
+		else if (cache_type == "LOG_GREEDY_40_WARM") {
+			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
+			compactor = std::make_unique<CbEvictPolicy>(score_greedy_first);
+			effective_valid_rate = 0.40;
+			score_low_valid_first = false;
+		}
+	    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_HOT") {
 			// Hot-first compaction: prefer recently created segments
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_hot_first);
-			effective_valid_rate = 0.85;
+			effective_valid_rate = 0.80;
 			score_low_valid_first = false;
 		} else if (cache_type == "LOG_GREEDY_COST_BENEFIT_COLD") {
 			// Cold-first compaction: prefer older segments
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_cold_first);
-			effective_valid_rate = 0.85;
+			effective_valid_rate = 0.80;
 			score_low_valid_first = false;
 		} else if (cache_type == "LOG_SEPBIT_FIFO") {
 			// SEPBIT with FIFO eviction and sqrt-age compaction
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_sepbit_age);
-			effective_valid_rate = 0.85;
+			effective_valid_rate = 0.80;
 			score_low_valid_first = false;
+			istream_policy_name = "sepbit";
 		} else if (cache_type == "LOG_COST_BENEFIT") {
 			evictor = std::make_unique<CbEvictPolicy>();
 		} else {
@@ -2556,6 +2589,9 @@ public:
 
 	// Number of host streams (for dynamic GC PH base offset)
 	int getNumHostStreams() const { return cache_->getNumHostStreams(); }
+
+	// StatsLogger pointer for GC/Evict callbacks
+	StatsLogger* stats_logger_ptr() { return stats_logger_.get(); }
 
 	// Pending writes waiting for GC/Evict
 	std::list<CacheIo*>& pending_writes() { return pending_writes_; }
@@ -2690,6 +2726,7 @@ public:
 			stats_logger_->stats().write_hit_count.store(cache_->get_write_hit_count(), std::memory_order_relaxed);
 			stats_logger_->stats().gc_victim_blocks.store(cache_->get_compacted_blocks(), std::memory_order_relaxed);
 			stats_logger_->stats().evict_victim_blocks.store(cache_->get_evicted_blocks(), std::memory_order_relaxed);
+			stats_logger_->set_gc_segments_allocated(cache_->get_gc_segments_allocated());
 		}
 	}
 
@@ -3002,6 +3039,9 @@ void LogCacheAsync::flush_write_buffer()
 	uint32_t block_size = block_size_;
 	size_t total_blocks = write_buffer_.size();
 
+	if (stats_logger_) {
+		stats_logger_->inc_flush_count();
+	}
 
 	// Allocate flush context
 	auto *flush_ctx = new (std::nothrow) WriteBufferFlushCtx();
@@ -3852,6 +3892,9 @@ static void gc_finalize_done(void *cb_arg, int status)
 	}
 
 	// Final chunk done (or incremental disabled) - GC complete
+	if (io->last_status == 0 && io->ctx->cache->stats_logger_ptr()) {
+		io->ctx->cache->stats_logger_ptr()->inc_gc_count();
+	}
 	io->ctx->cache->set_gc_in_progress(false);
 	gc_io_complete(io, io->last_status);
 }
@@ -5173,6 +5216,9 @@ static void evict_finalize_done(void *cb_arg, int status)
 	}
 
 	// Final chunk done (or incremental disabled) - evict complete
+	if (io->last_status == 0 && io->ctx->cache->stats_logger_ptr()) {
+		io->ctx->cache->stats_logger_ptr()->inc_evict_count();
+	}
 	io->ctx->cache->set_evict_in_progress(false);
 	evict_io_complete(io, io->last_status);
 }

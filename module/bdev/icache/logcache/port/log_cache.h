@@ -74,7 +74,8 @@ public:
         long key;
         size_t src_idx;           // Source index in victim segment
         size_t dst_idx;           // Destination index in target segment (for striping)
-        uint64_t create_timestamp;
+        uint32_t create_timestamp;
+        uint32_t gc_copied_timestamp; // GC 최초 복사 시각 (0이면 이번이 첫 GC copy)
         LogCacheSegment *dst_seg; // Target segment for this block (may differ from result.target_seg when segment fills)
     };
 
@@ -148,6 +149,7 @@ public:
     bool is_cache_filled() override;
     virtual void print_stats() override;
     void print_histograms(bool reset = false);
+    void log_victim_age_dist(const char *label, LogCacheSegment *victim);
     void print_objects(std::string prefix, uint64_t value);
     void invalidate(long key, int lba_sz);
     void reset_segment(LogCacheSegment *seg);
@@ -203,6 +205,7 @@ public:
     uint64_t get_write_hit_count() const { return write_hit_size; }
     uint64_t get_compacted_blocks() const { return compacted_blocks; }
     uint64_t get_evicted_blocks() const { return evicted_blocks; }
+    uint64_t get_gc_segments_allocated() const { return gc_segments_allocated; }
 
 private:
     /* configuration ******************************************************/
@@ -219,7 +222,6 @@ private:
     struct Loc { LogCacheSegment* seg; std::size_t idx; };
     std::unordered_map<long, Loc>                mapping;
     std::unordered_set<long>                     pending_writes_;  // keys with write in progress
-    std::unordered_map<long, uint64_t>                evicted_timestamp; // for GC
 
     /* helpers ************************************************************/
     std::unique_ptr<EvictPolicy> evictor;
@@ -251,9 +253,10 @@ private:
     IStream *stream_policy = nullptr;
     uint64_t global_valid_blocks = 0;
     uint64_t compacted_blocks = 0;
+    uint64_t gc_segments_allocated = 0;  // cumulative GC segment allocations
+    uint64_t gc_freed_blocks = 0;        // net freed blocks from GC (= segment_size - compacted per GC'd segment)
     uint64_t invalidate_blocks = 0;
     uint64_t reinsert_blocks = 0;
-    uint64_t ghost_cache_evicted_blocks = 0;
     uint64_t read_blocks_in_partial_write = 0;
 
     uint64_t evicted_segment_age = 0;
@@ -263,27 +266,25 @@ private:
     std::unique_ptr<EvictPolicy> compactor;
     double additional_free_blks_ratio_by_gc;
     
-    std::unique_ptr<Histogram> evicted_ages_histogram;
-    std::unique_ptr<Histogram> evicted_blocks_histogram;
-    std::unique_ptr<Histogram> compacted_blocks_histogram;
     std::unique_ptr<Histogram> evicted_ages_with_segment_histogram;
     std::unique_ptr<Histogram> compacted_ages_with_segment_histogram;
-    std::unique_ptr<Histogram> evicted_cache_blocks_per_evict;
+    std::unique_ptr<Histogram> gc_copied_lifetime_histogram;
     static const int HISTOGRAM_BUCKETS = 40;
     static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = (262144 * 6) * 4;
-    static constexpr double GHOST_CACHE_RATIO = 0.02;  // 2% of cache size
+    static constexpr double GHOST_CACHE_RATIO = 0.1;  // 5% of cache size
+    static constexpr double QLC_TLC_COST_RATIO = (2.88 * 3); // QLC write cost / TLC write cost
     bool is_ghost_cache = false;
     uint64_t bypass_blocks_threshold = 128; // 128* 4k bytes = 512K bytes
     EwmaRatio compaction_ratio;
+    EwmaRatio gc_cost_ratio;             // compacted_blocks / gc_freed_blocks = V_g/(1-V_g), cost per freed block from GC
     EwmaRatio eviction_ratio;
-    EwmaRatio eviction_ratio_in_ghost_cache;
-    EwmaRatio compaction_ratio_in_ghost_cache;
-    EwmaRatio ghost_miss_rate_ewma;  // EWMA of ghost cache miss rate = U(util_step)
-    static constexpr size_t TCO_HISTORY_SIZE = 1;
-    std::deque<double> tco_history;
-    bool tco_policy_higher = true;  // initial policy: HIGHER (increase valid block rate)
+    EwmaRatio evict_cost_ratio;          // evicted_blocks / evict_freed_blocks, cost per freed block from eviction
+    uint64_t evict_freed_blocks = 0;     // total blocks freed by segment eviction
+    EwmaRatio ghost_compaction_ratio;    // ghost compacted / timestamp, per host write
+    EwmaRatio ghost_eviction_ratio;      // ghost evicted / timestamp, per host write
+    EwmaRatio ghost_reuse_ewma;          // d(accessHit) / d(push), reuse rate of evicted blocks
     uint64_t ghost_compacted_blocks = 0;
-    int last_ghost_m = 0;  // 마지막으로 계산된 m 값 (for logging)
+    uint64_t ghost_gc_freed_blocks = 0;
     GhostCache ghost_cache;
     std::vector<uint8_t> staging_buffer_;
 

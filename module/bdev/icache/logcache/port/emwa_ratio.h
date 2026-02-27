@@ -26,9 +26,9 @@ public:
         }
         long double dH  = H  - prevH_;
         long double dUc = Uc - prevUc_;
-        prevH_  = H;
-        prevUc_ = Uc;
         if (dH > 0.0L) {
+            prevH_  = H;
+            prevUc_ = Uc;
             update(dUc, dH);
         }
     }

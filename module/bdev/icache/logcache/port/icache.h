@@ -51,6 +51,7 @@ public:
     FILE *fp;
     FILE *fp_stats = nullptr;
     FILE *fp_object = nullptr;
+    FILE *fp_victim_ratio = nullptr;
 protected:
     std::string stats_prefix_;
 };

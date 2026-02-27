@@ -336,8 +336,13 @@ prefill_cache
 
 # Bind devices to SPDK (uio_pci_generic) so spdk_tgt can use them
 # HUGEMEM=12288 allocates 6144 x 2MB hugepages = 12GB for DMA buffers
-log "Binding devices to SPDK (scripts/setup.sh) with HUGEMEM=12288 and uio_pci_generic..."
-sudo HUGEMEM=12288 "${ROOT_DIR}/scripts/setup.sh"
+log "Compacting memory for hugepage allocation..."
+sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+sudo sh -c 'echo 1 > /proc/sys/vm/compact_memory'
+sleep 2
+
+log "Binding devices to SPDK (scripts/setup.sh) with HUGEMEM=10000 and uio_pci_generic..."
+sudo HUGEMEM=8192 SHRINK_HUGE=yes "${ROOT_DIR}/scripts/setup.sh"
 
 start_spdk_tgt
 create_tier

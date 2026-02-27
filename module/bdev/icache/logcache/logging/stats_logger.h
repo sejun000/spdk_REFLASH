@@ -55,6 +55,10 @@ public:
         std::atomic<uint64_t> write_hit_count{0};     // Write cache hits (same LBA invalidated)
         std::atomic<uint64_t> gc_victim_blocks{0};    // Blocks copied by GC (compaction)
         std::atomic<uint64_t> evict_victim_blocks{0}; // Blocks evicted to backend
+        std::atomic<uint64_t> gc_count{0};            // Number of completed GC operations
+        std::atomic<uint64_t> evict_count{0};         // Number of completed evict operations
+        std::atomic<uint64_t> flush_count{0};         // Number of flush_write_buffer calls
+        std::atomic<uint64_t> gc_segments_allocated{0}; // Cumulative GC segment allocations
     };
 
     /**
@@ -92,6 +96,10 @@ public:
     void add_write_hit() { stats_.write_hit_count.fetch_add(1, std::memory_order_relaxed); }
     void add_gc_victim_blocks(uint64_t count) { stats_.gc_victim_blocks.fetch_add(count, std::memory_order_relaxed); }
     void add_evict_victim_blocks(uint64_t count) { stats_.evict_victim_blocks.fetch_add(count, std::memory_order_relaxed); }
+    void inc_gc_count() { stats_.gc_count.fetch_add(1, std::memory_order_relaxed); }
+    void inc_evict_count() { stats_.evict_count.fetch_add(1, std::memory_order_relaxed); }
+    void inc_flush_count() { stats_.flush_count.fetch_add(1, std::memory_order_relaxed); }
+    void set_gc_segments_allocated(uint64_t count) { stats_.gc_segments_allocated.store(count, std::memory_order_relaxed); }
 
     // Set histogram print callback (called every ~60 seconds)
     void set_histogram_callback(std::function<void()> cb) { histogram_cb_ = std::move(cb); }

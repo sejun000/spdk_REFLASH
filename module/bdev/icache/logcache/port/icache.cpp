@@ -408,7 +408,9 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
     return nullptr;
 }
 
-ICache::~ICache() = default;
+ICache::~ICache() {
+    if (fp_victim_ratio) { fclose(fp_victim_ratio); fp_victim_ratio = nullptr; }
+}
 
 ICache::ICache(uint64_t /*cold_capacity*/, const std::string& waf_log_file,
 	       const std::string& input_stat_log_file)
@@ -449,6 +451,16 @@ ICache::ICache(uint64_t /*cold_capacity*/, const std::string& waf_log_file,
 
 void ICache::set_stats_prefix(const std::string& prefix) {
     stats_prefix_ = prefix;
+    // Open victim_ratio CSV with policy name + timestamp
+    if (!fp_victim_ratio) {
+        std::string path = "victim_ratio_" + prefix + "_" + get_timestamp() + ".csv";
+        fp_victim_ratio = fopen(path.c_str(), "w");
+        if (fp_victim_ratio) {
+            fprintf(fp_victim_ratio, "timestamp,type,class,valid_blocks,total_blocks,valid_ratio\n");
+            fflush(fp_victim_ratio);
+            printf("victim ratio log : %s\n", path.c_str());
+        }
+    }
 }
 
 const std::string& ICache::stats_prefix() const {

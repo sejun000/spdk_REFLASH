@@ -1,9 +1,9 @@
 /**
- * High-performance Trace Replay with LBA Remapping
+ * High-performance Trace Replay
  *
  * Features:
- * - Sequential LBA remapping (new LBA -> 0, 1, 2, ...)
- * - Skips IOs when device is full (not counted in stats)
+ * - Default: passthrough LBA (trace LBA used as-is, modulo device size)
+ * - Optional: sequential LBA remapping with --remap-lba
  * - Auto device detection (ublk > nvmeof > opencas)
  * - Multi-threaded with libaio for maximum performance
  *
@@ -13,6 +13,7 @@
  * Usage:
  *   ./replay_trace [options]
  *   ./replay_trace --trace /path/to/trace --max-tb 4
+ *   ./replay_trace --remap-lba --trace /path/to/trace --max-tb 4
  */
 
 #include <fcntl.h>
@@ -143,14 +144,28 @@ private:
     uint64_t last_report_bytes_ = 0;
 };
 
-// LBA Mapper: maps trace LBAs to sequential device LBAs
+// LBA Mapper: maps trace LBAs to device LBAs
+// Default mode: passthrough (use trace LBA as-is, modulo device size)
+// Remap mode (--remap-lba): sequential remapping (new LBA -> 0, 1, 2, ...)
 class LbaMapper {
 public:
-    LbaMapper(uint64_t device_size_bytes)
-        : max_lba_(device_size_bytes / IO_BLOCK_SIZE) {}
+    LbaMapper(uint64_t device_size_bytes, bool remap)
+        : max_lba_(device_size_bytes / IO_BLOCK_SIZE),
+          device_size_bytes_(device_size_bytes),
+          remap_(remap) {}
 
     // Returns mapped device offset for a single 4KB LBA, or -1 if device is full
     int64_t map(uint64_t trace_offset) {
+        if (!remap_) {
+            // Passthrough: use trace offset directly, wrap around device size
+            uint64_t device_offset = trace_offset % device_size_bytes_;
+            // Align to IO_BLOCK_SIZE
+            device_offset = (device_offset / IO_BLOCK_SIZE) * IO_BLOCK_SIZE;
+            total_ios_++;
+            return (int64_t)device_offset;
+        }
+
+        // Remap mode: sequential LBA assignment
         std::lock_guard<std::mutex> lock(mutex_);
 
         uint64_t trace_lba = trace_offset / IO_BLOCK_SIZE;
@@ -175,25 +190,34 @@ public:
     }
 
     void print_stats() {
+        if (!remap_) {
+            printf("\n  LBA Mode: Passthrough (trace LBA used as-is)\n");
+            printf("    Total IOs: %lu\n", total_ios_.load());
+            return;
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         uint64_t unique_bytes = lba_map_.size() * IO_BLOCK_SIZE;
-        printf("\n  LBA Mapping Stats:\n");
+        printf("\n  LBA Mode: Remap (sequential)\n");
         printf("    Unique LBAs mapped: %lu (%.2f GB)\n", lba_map_.size(), unique_bytes / (1024.0*1024*1024));
         printf("    Skipped IOs:        %lu\n", skipped_ios_);
         printf("    Skipped bytes:      %.2f GB\n", skipped_bytes_ / (1024.0*1024*1024));
     }
 
     uint64_t get_skipped_ios() const { return skipped_ios_; }
-    uint64_t get_unique_lbas() const { return next_device_lba_; }
-    uint64_t get_unique_bytes() const { return next_device_lba_ * IO_BLOCK_SIZE; }
+    uint64_t get_unique_lbas() const { return remap_ ? next_device_lba_ : 0; }
+    uint64_t get_unique_bytes() const { return remap_ ? next_device_lba_ * IO_BLOCK_SIZE : 0; }
+    bool is_remap() const { return remap_; }
 
 private:
     std::mutex mutex_;
     std::unordered_map<uint64_t, uint64_t> lba_map_;
     uint64_t max_lba_;
+    uint64_t device_size_bytes_;
+    bool remap_;
     uint64_t next_device_lba_ = 0;
     uint64_t skipped_ios_ = 0;
     uint64_t skipped_bytes_ = 0;
+    std::atomic<uint64_t> total_ios_{0};
 };
 
 // Work item
@@ -456,7 +480,7 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
 
 // Reader thread
 void reader_thread(const std::string& trace_path, std::vector<WorkQueue*>& queues,
-                   LbaMapper& mapper, int num_threads) {
+                   LbaMapper& mapper, int num_threads, uint32_t io_scale) {
     std::ifstream file(trace_path);
     if (!file.is_open()) {
         printf("ERROR: Cannot open trace file: %s\n", trace_path.c_str());
@@ -489,8 +513,8 @@ void reader_thread(const std::string& trace_path, std::vector<WorkQueue*>& queue
             const std::string& op = parts[1];
             if (op == "W" || op == "WS") {
                 try {
-                    uint64_t offset = std::stoull(parts[2]);
-                    uint32_t size = std::stoul(parts[3]);
+                    uint64_t offset = std::stoull(parts[2]) * io_scale;
+                    uint32_t size = std::stoul(parts[3]) * io_scale;
 
                     if (size > 0) {
                         // Split IO into 4KB chunks and map each independently
@@ -514,10 +538,15 @@ void reader_thread(const std::string& trace_path, std::vector<WorkQueue*>& queue
 
         line_num++;
         if (line_num % 1000000 == 0) {
-            printf("[Reader] Parsed %lu lines, distributed %lu writes, unique %.2f GB, skipped %lu\n",
-                   line_num, distributed,
-                   mapper.get_unique_bytes() / (1024.0*1024*1024),
-                   mapper.get_skipped_ios());
+            if (mapper.is_remap()) {
+                printf("[Reader] Parsed %lu lines, distributed %lu writes, unique %.2f GB, skipped %lu\n",
+                       line_num, distributed,
+                       mapper.get_unique_bytes() / (1024.0*1024*1024),
+                       mapper.get_skipped_ios());
+            } else {
+                printf("[Reader] Parsed %lu lines, distributed %lu writes\n",
+                       line_num, distributed);
+            }
         }
     }
 
@@ -528,10 +557,15 @@ void reader_thread(const std::string& trace_path, std::vector<WorkQueue*>& queue
         q->set_done();
     }
 
-    printf("[Reader] Done: %lu lines, %lu writes, unique %.2f GB, skipped %lu\n",
-           line_num, distributed,
-           mapper.get_unique_bytes() / (1024.0*1024*1024),
-           mapper.get_skipped_ios());
+    if (mapper.is_remap()) {
+        printf("[Reader] Done: %lu lines, %lu writes, unique %.2f GB, skipped %lu\n",
+               line_num, distributed,
+               mapper.get_unique_bytes() / (1024.0*1024*1024),
+               mapper.get_skipped_ios());
+    } else {
+        printf("[Reader] Done: %lu lines, %lu writes\n",
+               line_num, distributed);
+    }
 }
 
 void print_usage(const char* prog) {
@@ -541,6 +575,8 @@ void print_usage(const char* prog) {
     printf("  --trace PATH     Trace file path (default: %s)\n", DEFAULT_TRACE);
     printf("  --threads N      Number of threads (default: %d)\n", NUM_THREADS);
     printf("  --max-tb N       Max write amount in TB (default: %.1f)\n", DEFAULT_MAX_TB);
+    printf("  --remap-lba      Remap LBAs sequentially (default: passthrough)\n");
+    printf("  --io-scale N     Multiply offset and size by N (default: 1)\n");
     printf("  --help           Show this help\n");
 }
 
@@ -550,6 +586,8 @@ int main(int argc, char* argv[]) {
     std::string trace = DEFAULT_TRACE;
     int num_threads = NUM_THREADS;
     double max_tb = DEFAULT_MAX_TB;
+    bool remap_lba = false;
+    uint32_t io_scale = 1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
@@ -560,6 +598,10 @@ int main(int argc, char* argv[]) {
             num_threads = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-tb") == 0 && i + 1 < argc) {
             max_tb = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--remap-lba") == 0) {
+            remap_lba = true;
+        } else if (strcmp(argv[i], "--io-scale") == 0 && i + 1 < argc) {
+            io_scale = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -608,10 +650,12 @@ int main(int argc, char* argv[]) {
     printf("  Threads:     %d\n", num_threads);
     printf("  QD/thread:   %d\n", QUEUE_DEPTH);
     printf("  Max write:   %.1f TB\n", max_tb);
+    printf("  IO scale:   %u\n", io_scale);
+    printf("  LBA mode:   %s\n", remap_lba ? "Remap (sequential)" : "Passthrough");
     printf("============================================================\n\n");
 
     // Create LBA mapper
-    LbaMapper mapper(device_size);
+    LbaMapper mapper(device_size, remap_lba);
 
     // Create work queues
     std::vector<WorkQueue*> queues;
@@ -629,7 +673,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Start reader thread
-    std::thread reader(reader_thread, trace, std::ref(queues), std::ref(mapper), num_threads);
+    std::thread reader(reader_thread, trace, std::ref(queues), std::ref(mapper), num_threads, io_scale);
 
     printf("Replay started...\n\n");
 
