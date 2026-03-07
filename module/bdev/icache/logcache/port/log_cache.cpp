@@ -13,6 +13,8 @@
 #include "spdk/log.h"
 
 extern uint64_t interval;
+extern uint64_t g_threshold;
+extern uint64_t g_timestamp;
 /* ------------------------------------------------------------------ */
 /* ctor / dtor                                                        */
 /* ------------------------------------------------------------------ */
@@ -96,6 +98,7 @@ LogCache::LogCache(uint64_t              cold_capacity,
 
     stream_policy = input_stream_policy;
     global_valid_blocks = 0;
+    g_threshold = total_cache_block_count * 2;
 
     /* 세그먼트 전부 미리 생성 → free_pool */
     /* With striping: each segment has stripe_width physical_bases */
@@ -406,6 +409,7 @@ void LogCache::append_block(int stream_id, long key, int lba_sz, const void *pay
     ++seg->valid_cnt;
     ++global_valid_blocks;
     ++log_cache_timestamp;
+    g_timestamp = log_cache_timestamp;
     if (stream_policy) {
         stream_policy->Append(key, log_cache_timestamp, reinterpret_cast<void*>(seg->valid_cnt));
     }
@@ -463,6 +467,7 @@ bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64
     ++seg->valid_cnt;
     ++global_valid_blocks;
     ++log_cache_timestamp;
+    g_timestamp = log_cache_timestamp;
     if (stream_policy) {
         stream_policy->Append(key, log_cache_timestamp, reinterpret_cast<void*>(seg->valid_cnt));
     }
@@ -723,8 +728,6 @@ LogCacheSegment* LogCache::get_segment_to_active_stream(bool gc, int stream_id, 
     return seg;
 }
 
-extern uint64_t g_threshold;
-extern uint64_t g_timestamp;
 void LogCache::check_and_evict_if_needed()
 {
     // In async mode, GC/Evict is handled by async wrapper
@@ -1316,9 +1319,9 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
 
         // Set global variables for score_warm_first (async mode)
         g_timestamp = log_cache_timestamp;
-        g_threshold = threshold;
+        g_threshold = threshold; //+ segment_size_blocks;
 
-        log_victim_age_dist("gc_victim_age_dist", victim);
+        // log_victim_age_dist("gc_victim_age_dist", victim);
 
         if (victim->valid_cnt == 0) {
             // No valid blocks, just reset
@@ -1431,7 +1434,7 @@ bool LogCache::prepare_evict(EvictPrepareResult &result)
         result.victim_seg = victim;
         result.scan_offset = 0;
 
-        log_victim_age_dist("evict_victim_age_dist", victim);
+        // log_victim_age_dist("evict_victim_age_dist", victim);
 
         if (victim->valid_cnt == 0) {
             result.is_final_chunk = true;

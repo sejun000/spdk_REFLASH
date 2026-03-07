@@ -9,7 +9,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NVMEV_DIR="/home/sejun000/csd-virt/CSD-Virt"
-TRACE_FILE="${TRACE_FILE:-../../alibaba_dwpd2_5x.trace}"
+TRACE_FILE="${TRACE_FILE:-../../ssdtrace_scaled_4x.trace}"
 LOG_FILE="$SCRIPT_DIR/test.log"
 
 # Configurable via environment variables

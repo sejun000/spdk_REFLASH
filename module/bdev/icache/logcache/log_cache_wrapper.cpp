@@ -79,7 +79,7 @@ static inline bool is_old_cycle_segment(Segment *seg) {
 }
 
 static double score_warm_first(Segment *seg) {
-    if (is_old_cycle_segment(seg)) return 1.0;
+    if (is_old_cycle_segment(seg)) return 0;
     double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
     double u = seg->valid_cnt / segment_size;
    // if (u > 0.8) return 0.0;  // Too full to compact efficiently
@@ -93,7 +93,7 @@ static double score_warm_first(Segment *seg) {
 
 // Score function: prefer HOT segments (recently created) for compaction
 static double score_hot_first(Segment *seg) {
-    if (is_old_cycle_segment(seg)) return 1.0;
+    if (is_old_cycle_segment(seg)) return 0;
     double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
     double u = seg->valid_cnt / segment_size;
    // if (u > 0.8) return 0.0;
@@ -107,7 +107,7 @@ static double score_hot_first(Segment *seg) {
 
 // Score function: prefer COLD segments (old) for compaction
 static double score_cold_first(Segment *seg) {
-    if (is_old_cycle_segment(seg)) return 1.0;
+    if (is_old_cycle_segment(seg)) return 0;
     double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
     double u = seg->valid_cnt / segment_size;
   //  if (u > 0.8) return 0.0;
@@ -129,7 +129,7 @@ static double score_sepbit_age(Segment *seg) {
         return -static_cast<double>(seg->create_timestamp);
     }
     if (u < 0.0001) u = 0.0001;
-    return (g_timestamp - seg->create_timestamp) * (1 - u) / u;
+    return sqrt((g_timestamp - seg->create_timestamp)) * (1 - u) / u;
 }
 
 namespace icache {
@@ -2491,12 +2491,14 @@ public:
 			compactor = std::make_unique<CbEvictPolicy>(score_greedy_first);
 			effective_valid_rate = 0.65;
 			score_low_valid_first = false;
+			istream_policy_name = "none";
 		}
 		else if (cache_type == "LOG_GREEDY_40_WARM") {
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_greedy_first);
 			effective_valid_rate = 0.40;
 			score_low_valid_first = false;
+			istream_policy_name = "none";
 		}
 	    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_HOT") {
 			// Hot-first compaction: prefer recently created segments

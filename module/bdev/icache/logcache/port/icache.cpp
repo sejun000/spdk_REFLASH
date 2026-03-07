@@ -38,7 +38,7 @@ static double score_age(Segment *seg) {
 }
 
 uint64_t g_threshold = 0;
-uint64_t g_timestamp = 0;
+uint64_t g_timestamp = 1;
 
 // Check if segment is from an old cycle for its stream → protect from compaction
 // Uses seg->create_timestamp (= oldest block's timestamp after compaction) instead of seg->cycle
@@ -99,7 +99,7 @@ static double score_warm_first_hot_last(Segment *seg) {
 static double score_sepbit_age(Segment *seg) {
     assert(g_threshold > 0 && g_timestamp > 0);
     double u = seg->valid_cnt / segments;
-    return sqrt(g_timestamp - seg->create_timestamp) * (1 - u) / (u);
+    return (g_timestamp - seg->create_timestamp) * (1 - u) / (u);
 }
 
 

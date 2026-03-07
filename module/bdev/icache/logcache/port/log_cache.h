@@ -272,7 +272,7 @@ private:
     static const int HISTOGRAM_BUCKETS = 40;
     static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = (262144 * 6) * 4;
     static constexpr double GHOST_CACHE_RATIO = 0.1;  // 5% of cache size
-    static constexpr double QLC_TLC_COST_RATIO = (2.88 * 3); // QLC write cost / TLC write cost
+    static constexpr double QLC_TLC_COST_RATIO = 19.2;//(2.88 * 1); // QLC write cost / TLC write cost
     bool is_ghost_cache = false;
     uint64_t bypass_blocks_threshold = 128; // 128* 4k bytes = 512K bytes
     EwmaRatio compaction_ratio;
