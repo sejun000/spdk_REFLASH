@@ -241,8 +241,8 @@ def plot_graph_a():
                        s=250, c=CONFIG_COLORS[config_name], label=config_name,
                        edgecolors='black', linewidths=1.5)
 
-        ax.set_xlabel("TLC Writes (GB)")
-        ax.set_ylabel("QLC (Evict) Writes (GB)")
+        ax.set_xlabel("TLC writes (GB)")
+        ax.set_ylabel("QLC (evict) writes (GB)")
         ax.set_title(f"{workload}")
         ax.grid(True)
         ax.set_xlim(left=0)
@@ -272,8 +272,8 @@ def plot_graph_b():
         ax.plot(data["host_write_gb"][mask], waf,
                 label=config_name, linewidth=3, color=CONFIG_COLORS[config_name])
 
-    ax.set_xlabel("Host Writes (GB)")
-    ax.set_ylabel("WAF (FDP Media / FDP Host)")
+    ax.set_xlabel("Host writes (GB)")
+    ax.set_ylabel("WAF (FDP media / FDP host)")
     ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.08), ncol=3, frameon=False)
     ax.grid(True)
     ax.set_xlim(left=500)
@@ -316,8 +316,8 @@ def plot_graph_c():
             ax.plot(plot_data_host[mask], plot_data_qlc[mask],
                     label=config_name, linewidth=3, color=CONFIG_COLORS[config_name])
 
-    ax.set_xlabel("Host Writes (GB)")
-    ax.set_ylabel("QLC (Evict) Writes (GB)")
+    ax.set_xlabel("Host writes (GB)")
+    ax.set_ylabel("QLC (evict) writes (GB)")
     ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.08), ncol=3, frameon=False)
     ax.grid(True)
     ax.set_xlim(left=COST_START_HOST_WRITE_GB if COST_START_HOST_WRITE_GB > 0 else 0)
@@ -415,7 +415,7 @@ def plot_graph_c2():
                         xytext=(0, 5), textcoords="offset points",
                         ha='center', va='bottom', fontsize=14)
 
-    ax.set_ylabel("Capacity-Tier Writes (GB)")
+    ax.set_ylabel("Capacity-tier writes (GB)")
     ax.set_xticks(x)
     ax.set_xticklabels(configs)
     ax.grid(True, axis='y')
@@ -489,13 +489,13 @@ def plot_graph_c3():
                                  xytext=(0, 5), textcoords="offset points",
                                  ha='center', va='bottom', fontsize=14)
 
-    ax_left.set_ylabel("Capacity-Tier Writes (TB)", fontsize=24)
+    ax_left.set_ylabel("Capacity-tier writes (TB)", fontsize=24)
     ax_left.set_xticks(x)
     ax_left.set_xticklabels(active_workloads, fontsize=23)
     ax_left.tick_params(axis='y', labelsize=23)
     ax_left.grid(True, axis='y')
     ax_left.set_ylim(bottom=0, top=5.5)
-    ax_left.set_xlabel("(a) Capacity-Tier Writes", fontsize=28)
+    ax_left.set_xlabel("(a) Capacity-tier writes", fontsize=28)
 
     # --- Right: Avg utilization bar ---
     for i, config_name in enumerate(configs):
@@ -606,7 +606,7 @@ def plot_graph_c4():
                             xytext=(0, 8), textcoords="offset points",
                             ha='center', va='bottom', fontsize=36, fontweight='bold', color='red')
 
-        ax.set_ylabel("Write Amplification", fontsize=40)
+        ax.set_ylabel("Write amplification", fontsize=40)
         ax.set_xticks(x)
         ax.set_xticklabels(configs, rotation=15, ha='right', fontsize=36)
         labels_abc = "abcdefghijklmnopqrstuvwxyz"
@@ -737,7 +737,7 @@ def plot_graph_d():
                                     ha='center', va='bottom', fontsize=14)
 
         if mi == 0:
-            ax.set_ylabel("Normalized Cost")
+            ax.set_ylabel("Normalized cost")
         ax.set_xticks(x)
         ax.set_xticklabels(active_workloads)
         ax.grid(True, axis='y')
@@ -1027,8 +1027,8 @@ def plot_graph_h():
         ax.plot(host_write_gb[mask], valid_block_rate[mask],
                 label=config_name, linewidth=3, color=CONFIG_COLORS[config_name])
 
-    ax.set_xlabel("Host Writes (GB)")
-    ax.set_ylabel("Valid Block Rate")
+    ax.set_xlabel("Host writes (GB)")
+    ax.set_ylabel("Valid block rate")
     ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.08), ncol=3, frameon=False)
     ax.grid(True)
     ax.set_xlim(left=0)
@@ -1100,8 +1100,8 @@ def plot_graph_i():
             else:
                 _plot_utilization_for_config(ax, config_name, workload)
 
-        ax.set_xlabel("Host Writes (GB)")
-        ax.set_ylabel("Cache Utilization")
+        ax.set_xlabel("Host writes (GB)")
+        ax.set_ylabel("Cache utilization")
         ax.set_title(f"{workload}")
         ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.15), ncol=4, frameon=False)
         ax.grid(True)
@@ -1150,7 +1150,7 @@ def plot_graph_j():
                           ha='center', va='bottom', fontsize=14)
 
     ax_a.set_ylabel("WA")
-    ax_a.set_xlabel("(a) Buffer-Tier Device WA")
+    ax_a.set_xlabel("(a) Buffer-tier device WA")
     ax_a.set_xticks(x)
     ax_a.set_xticklabels(configs)
     ax_a.grid(True, axis='y')
@@ -1171,8 +1171,8 @@ def plot_graph_j():
                           xytext=(0, 5), textcoords="offset points",
                           ha='center', va='bottom', fontsize=14)
 
-    ax_b.set_ylabel("Capacity-Tier Writes (TB)")
-    ax_b.set_xlabel("(b) Capacity-Tier Writes")
+    ax_b.set_ylabel("Capacity-tier writes (TB)")
+    ax_b.set_xlabel("(b) Capacity-tier writes")
     ax_b.set_xticks(x)
     ax_b.set_xticklabels(configs)
     ax_b.grid(True, axis='y')
@@ -1210,7 +1210,7 @@ def plot_graph_j():
                           ha='center', va='bottom', fontsize=14)
 
     ax_c.set_ylabel("Normalized TEC")
-    ax_c.set_xlabel("(c) Total Endurance Cost")
+    ax_c.set_xlabel("(c) Total endurance cost")
     ax_c.set_xticks(x)
     ax_c.set_xticklabels(configs)
     ax_c.grid(True, axis='y')
@@ -1218,8 +1218,8 @@ def plot_graph_j():
     # Stacked legend for (c) subplot - horizontal, inside top-left
     from matplotlib.patches import Patch
     ax_c.legend(handles=[
-        Patch(facecolor='#E0E0E0', edgecolor='black', label='Buffer-Tier'),
-        Patch(facecolor='#E0E0E0', edgecolor='black', hatch='xx', label='Capacity-Tier'),
+        Patch(facecolor='#E0E0E0', edgecolor='black', label='Buffer-tier'),
+        Patch(facecolor='#E0E0E0', edgecolor='black', hatch='xx', label='Capacity-tier'),
     ], loc='upper right', ncol=1, fontsize=20,
        frameon=True, edgecolor='black', fancybox=False, handlelength=0.8)
 
