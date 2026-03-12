@@ -109,29 +109,21 @@ CONFIGS = {
     "REFlash": {
         "Ali1": [
             {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260303_190521.ali1.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260226_033136"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_20260226_034248.replay"),
-                "csv_type": "icache",
-                "cache_size_gb": 1880,
-            },
-            {
                 "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260226_033138.csv"),
                 "stat_log": os.path.join(BASE_DIR, "stat.log.20260226_033136"),
                 "replay_trace": os.path.join(BASE_DIR, "reflash_20260226_034248.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
-            # Add more runs here: {"csv": ..., "stat_log": ..., "replay_trace": ..., "csv_type": "icache", "cache_size_gb": 1880},
-        ],
-        "Ali2": [
             {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260303_230256.ali2.csv"),
+                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260303_190521.ali1.csv"),
                 "stat_log": os.path.join(BASE_DIR, "stat.log.20260226_033136"),
                 "replay_trace": os.path.join(BASE_DIR, "reflash_20260226_034248.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
+        ],
+        "Ali2": [
             {
                 "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260227_141502.csv"),
                 "stat_log": os.path.join(BASE_DIR, "stat.log.20260227_141500"),
@@ -139,17 +131,24 @@ CONFIGS = {
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
+            {
+                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260303_230256.ali2.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260226_033136"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_20260226_034248.replay"),
+                "csv_type": "icache",
+                "cache_size_gb": 1880,
+            },
         ],
         "Ali3": [
             {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260303_112411.alilow.csv"),
+                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260302_095057.csv"),
                 "stat_log": os.path.join(BASE_DIR, "stat.log.20260302_095055"),
                 "replay_trace": os.path.join(BASE_DIR, "reflash_20260302_100206.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
             {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260302_095057.csv"),
+                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260303_112411.alilow.csv"),
                 "stat_log": os.path.join(BASE_DIR, "stat.log.20260302_095055"),
                 "replay_trace": os.path.join(BASE_DIR, "reflash_20260302_100206.replay"),
                 "csv_type": "icache",
@@ -158,14 +157,14 @@ CONFIGS = {
         ],
         "YCSB-A": [
             {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260304_081151.csv"),
+                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260228_210650.csv"),
                 "stat_log": os.path.join(BASE_DIR, "stat.log.20260228_210648"),
                 "replay_trace": os.path.join(BASE_DIR, "reflash_20260228_211800.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
             {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260228_210650.csv"),
+                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260304_081151.csv"),
                 "stat_log": os.path.join(BASE_DIR, "stat.log.20260228_210648"),
                 "replay_trace": os.path.join(BASE_DIR, "reflash_20260228_211800.replay"),
                 "csv_type": "icache",
@@ -175,9 +174,30 @@ CONFIGS = {
     },
     "CSAL+GC": {
         "Ali1": {
-            "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_80_WARM_20260227_003829.csv"),
-            "stat_log": os.path.join(BASE_DIR, "stat.log.20260227_003826"),
-            "replay_trace": os.path.join(BASE_DIR, "reflash_80_warm_20260227_004938.replay"),
+            "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_80_WARM_20260307_155706.csv"),
+            "stat_log": os.path.join(BASE_DIR, "stat.log.20260307_155703"),
+            "replay_trace": os.path.join(BASE_DIR, "reflash_80_warm_20260307_075522.replay"),
+            "csv_type": "icache",
+            "cache_size_gb": 1880,
+        },
+        "Ali2": {
+            "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_80_WARM_20260306_170505.csv.dwpd2"),
+            "stat_log": os.path.join(BASE_DIR, "stat.log.20260306_170503"),
+            "replay_trace": os.path.join(BASE_DIR, "reflash_80_warm_20260306_171615.replay"),
+            "csv_type": "icache",
+            "cache_size_gb": 1880,
+        },
+        "Ali3": {
+            "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_80_WARM_20260306_222303.csv.dwpd01"),
+            "stat_log": os.path.join(BASE_DIR, "stat.log.20260306_222301"),
+            "replay_trace": os.path.join(BASE_DIR, "reflash_80_warm_20260306_223413.replay"),
+            "csv_type": "icache",
+            "cache_size_gb": 1880,
+        },
+        "YCSB-A": {
+            "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_80_WARM_20260307_074413.csv.ssdtrace"),
+            "stat_log": os.path.join(BASE_DIR, "stat.log.20260307_074410"),
+            "replay_trace": os.path.join(BASE_DIR, "reflash_80_warm_20260307_075522.replay"),
             "csv_type": "icache",
             "cache_size_gb": 1880,
         },
@@ -268,7 +288,7 @@ CSV_COLUMNS = {
 
 # Cost formula: TLC writes + r * QLC writes
 # Multiple r values for Graph D subplots: each value creates a subplot titled "(a) r=x"
-QLC_COST_MULTIPLIERS = [2.88, 8.64]
+QLC_COST_MULTIPLIERS = [8.64, 2.88]
 
 # Start measuring TLC/QLC writes from this host write point (GB) for cost graphs (A, D, D2)
 # Set to 0 to use the full trace from the beginning
@@ -293,7 +313,7 @@ NEAROPT_COSTS_TB = {
 HISTOGRAM_CONFIGS = ["SepBIT", "REFlash_COLD_FIXED", "REFlash_80", "REFlash"]
 
 # All configs for Graphs A, B, C, D, etc. (histogram 제외)
-ALL_CONFIGS = ["OpenCAS", "CSAL", "SepBIT", "REFlash_80", "REFlash"]
+ALL_CONFIGS = ["OpenCAS", "CSAL", "CSAL+GC", "SepBIT", "REFlash_80", "REFlash"]
 
 # Configs for Graph I (utilization scatter) - ordered for comparison
 GRAPH_I_CONFIGS = ["OpenCAS", "REFlash", "CSAL"]
@@ -302,9 +322,9 @@ GRAPH_B2_CONFIGS = ["OpenCAS", "CSAL+GC", "CSAL"]
 # Configs for Graph C (QLC writes timeseries) - tiering configs only
 GRAPH_C_CONFIGS = ["OpenCAS", "CSAL", "SepBIT", "REFlash_80", "REFlash"]
 # Configs for Graph C2 (QLC writes bar) - ordered for comparison
-GRAPH_C2_CONFIGS = ["OpenCAS", "CSAL", "SepBIT", "REFlash_80", "REFlash"]
+GRAPH_C2_CONFIGS = ["OpenCAS", "CSAL", "CSAL+GC", "SepBIT", "REFlash_80", "REFlash"]
 # Configs for Graph G (throughput)
-GRAPH_G_CONFIGS = ["OpenCAS", "CSAL", "SepBIT", "REFlash_80", "REFlash"]
+GRAPH_G_CONFIGS = ["OpenCAS", "CSAL", "CSAL+GC", "SepBIT", "REFlash_80", "REFlash"]
 # Configs for Graph H (valid block rate) - must have valid_blocks column and cache_size_gb
 GRAPH_H_CONFIGS = ["SepBIT",  "REFlash_80", "REFlash", "CSAL", "OpenCAS"]
 

@@ -55,6 +55,10 @@ LogCache::LogCache(uint64_t              cold_capacity,
       ghost_compaction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       ghost_eviction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       ghost_reuse_ewma(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+#if NETFREE_TCO_ENABLED
+      netfree_a_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      netfree_b_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+#endif
       ghost_cache(cache_block_count * GHOST_CACHE_RATIO),
       device_io_(device_io)
 {
@@ -89,6 +93,10 @@ LogCache::LogCache(uint64_t              cold_capacity,
     ghost_compaction_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
     ghost_eviction_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
     ghost_reuse_ewma = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
+#if NETFREE_TCO_ENABLED
+    netfree_a_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
+    netfree_b_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
+#endif
 
     evictor->init(&log_cache_timestamp, segment_size_blocks, total_segments);
 
@@ -299,11 +307,13 @@ void LogCache::evict_policy_update(LogCacheSegment *s) {
 
 void LogCache::periodic() {
     // Block timestamps are uint32_t — assert we haven't overflowed (~16TB of 4K writes)
+    if (!is_ghost_cache) return;
     if (log_cache_timestamp >= UINT32_MAX) {
         fprintf(stderr, "FATAL: log_cache_timestamp (%lu) exceeded uint32_t range. "
                 "Block timestamps will be corrupted.\n", log_cache_timestamp);
         abort();
     }
+#if 1 // old ghost cache logic
     if (is_ghost_cache){
         if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
             // Per host-write ratios
@@ -326,7 +336,7 @@ void LogCache::periodic() {
                 eviction_ratio.has_value() &&
                 ghost_eviction_ratio.has_value()) {
                 double ghost_reuse_rate = ghost_reuse_ewma.has_value() ? ghost_reuse_ewma.value() : 0.0;
-                double evict_cost_factor = QLC_TLC_COST_RATIO + ghost_reuse_rate;
+                double evict_cost_factor = QLC_TLC_COST_RATIO;
                 // GC cost per host write (TLC rewrites)
                 double gc_cost = compaction_ratio.value();
                 // Eviction savings from having more cache (per host write)
@@ -360,6 +370,47 @@ void LogCache::periodic() {
             }
         }
     }
+#elif NETFREE_TCO_ENABLED
+    if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
+        // A = net free segments from GC
+        uint64_t A = (gc_victim_count_ > gc_active_alloc_count_)
+                     ? (gc_victim_count_ - gc_active_alloc_count_) : 0;
+
+        // Update EWMA: A * segment_size_blocks over log_cache_timestamp
+        netfree_a_ratio.updateFromCumulative(log_cache_timestamp,
+                                              A * segment_size_blocks);
+
+        // B: accumulate get_mth_score_valid_pages(a_value)
+        double a_value = netfree_a_ratio.has_value() ? netfree_a_ratio.value() : 0.0;
+        if (compactor && a_value > 0) {
+            cumulative_B_ += compactor->get_mth_score_valid_pages(a_value);
+        }
+        netfree_b_ratio.updateFromCumulative(log_cache_timestamp, cumulative_B_);
+    }
+
+    if (log_cache_timestamp % (segment_size_blocks * 8) == 0) {
+        if (netfree_a_ratio.has_value() && netfree_b_ratio.has_value()) {
+            double a = netfree_a_ratio.value();
+            double b = netfree_b_ratio.value();
+            double current_valid_rate = (double)global_valid_blocks / total_cache_block_count;
+
+            const char *decision;
+            if (b * QLC_TLC_COST_RATIO > a) {
+                target_valid_blk_rate = std::min(valid_blk_rate_hard_limit,
+                                                  current_valid_rate + 0.1);
+                decision = "RAISE";
+            } else {
+                target_valid_blk_rate = std::max(0.0, current_valid_rate - 0.1);
+                decision = "LOWER";
+            }
+            SPDK_NOTICELOG("periodic_netfree: %s target=%.4f, a=%.6f, b=%.6f, "
+                           "b*r=%.6f, gc_victim=%lu, gc_alloc=%lu, cumB=%lu\n",
+                           decision, target_valid_blk_rate, a, b,
+                           b * QLC_TLC_COST_RATIO,
+                           gc_victim_count_, gc_active_alloc_count_, cumulative_B_);
+        }
+    }
+#endif
 }
 
 void LogCache::batch_insert(int stream_id,
@@ -606,6 +657,9 @@ LogCacheSegment* LogCache::alloc_segment(bool shrink)
     // Track GC segment allocations (shrink=false means GC allocation)
     if (!shrink) {
         gc_segments_allocated++;
+#if NETFREE_TCO_ENABLED
+        gc_active_alloc_count_++;
+#endif
     }
 
     // DEBUG: log segment allocation with class_num
@@ -947,6 +1001,9 @@ void LogCache::dummy_fill_segment(LogCacheSegment* s)
 
 Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, int gc_stream_id)
 {
+#if NETFREE_TCO_ENABLED
+    gc_victim_count_++;
+#endif
     LogCacheSegment* target_seg = nullptr;
     int evicted_blocks_for_victim = 0, compacted_blocks_for_victim = 0;
     if (!stream_policy) {
@@ -1311,6 +1368,9 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
             return false;
         }
 
+#if NETFREE_TCO_ENABLED
+        gc_victim_count_++;
+#endif
         result.victim_seg = victim;
         result.threshold = threshold;
         result.gc_stream_id = victim->get_class_num();

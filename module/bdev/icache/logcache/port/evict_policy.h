@@ -45,7 +45,7 @@ public:
     virtual bool empty() const { return false; }  // Default: not empty
 
     /* Get valid_cnt of m-th segment in score order (for ghost compaction estimation) */
-    virtual uint64_t get_mth_score_valid_pages(int m) const { return 0; }
+    virtual uint64_t get_mth_score_valid_pages(double m) const { return 0; }
 
     /* m개의 free segment를 확보하려면 k번째 segment까지 compact해야 함
      * k = min(k | sum(i=1..k) (1 - U_i) >= m), return k번째 segment의 valid_cnt */

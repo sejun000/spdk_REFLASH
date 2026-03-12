@@ -4,13 +4,43 @@
 # Usage: ./run_benchmark.sh [config_numbers...]
 # Example: ./run_benchmark.sh 1 3 5  (run only config 1, 3, 5)
 # Example: ./run_benchmark.sh        (run all configs)
+#
+# Trace file selection via TRACE_NUMS (space-separated):
+#   TRACE_NUMS="1 3 5" ./run_benchmark.sh 1 2
+#   Available traces:
+#     1) alibaba_dwpd0.3.trace
+#     2) alibaba_dwpd01to1.trace
+#     3) alibaba_dwpd1to2_4x.trace   (default)
+#     4) alibaba_dwpd2_5x.trace
+#     5) ssdtrace_scaled_4x.trace
+#     6) varmail_2tb_6x_16t.csv
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NVMEV_DIR="/home/sejun000/csd-virt/CSD-Virt"
-TRACE_FILE="${TRACE_FILE:-../../ssdtrace_scaled_4x.trace}"
 LOG_FILE="$SCRIPT_DIR/test.log"
+
+# Trace file definitions (number -> path)
+TRACE_BASE="../../"
+declare -a TRACE_FILES=(
+    [1]="alibaba_dwpd0.3.trace"
+    [2]="alibaba_dwpd01to1.trace"
+    [3]="alibaba_dwpd1to2_4x.trace"
+    [4]="alibaba_dwpd2_5x.trace"
+    [5]="ssdtrace_scaled_4x.trace"
+    [6]="varmail_2tb_6x_16t.csv"
+    [7]="fio_zipf_1.0"
+)
+# Default trace file (used when TRACE_NUMS is not set)
+TRACE_FILE="${TRACE_FILE:-${TRACE_BASE}varmail_2tb_6x_16t.csv}"
+
+# fio zipf parameters
+FIO_ZIPF_THETA="0.9"
+FIO_ZIPF_SIZE="3300g"      # working set (3300 GiB ≈ 3.3 TiB)
+FIO_ZIPF_RANDSEED="12345"
+# Current trace number (set in multi-trace loop)
+CURRENT_TRACE_NUM=""
 
 # Configurable via environment variables
 CACHE_SPLIT_GB="${CACHE_SPLIT_GB:-1800}"
@@ -92,6 +122,14 @@ print_configs() {
         echo "  $((i+1)). $name -> $replay" | tee -a "$LOG_FILE"
     done
     echo "" | tee -a "$LOG_FILE"
+    echo "Available trace files:" | tee -a "$LOG_FILE"
+    echo "=========================" | tee -a "$LOG_FILE"
+    for i in "${!TRACE_FILES[@]}"; do
+        local marker=""
+        [ "${TRACE_FILES[$i]}" = "alibaba_dwpd1to2_4x.trace" ] && marker=" (default)"
+        echo "  $i) ${TRACE_FILES[$i]}${marker}" | tee -a "$LOG_FILE"
+    done
+    echo "" | tee -a "$LOG_FILE"
 }
 
 # Step 1: nvmev rmmod && init
@@ -133,12 +171,18 @@ run_tgt() {
 run_replay_trace() {
     local base_replay="$1"
     local timestamp=$(date '+%Y%m%d_%H%M%S')
-    local replay_file="${base_replay%.replay}_${timestamp}.replay"
-    log_info "Step 4: Running replay_trace -> $replay_file"
+    # Include trace name in replay filename for identification
+    local trace_name=$(basename "$TRACE_FILE" | sed 's/\.\(trace\|csv\)$//')
+    local replay_file="${base_replay%.replay}_${trace_name}_${timestamp}.replay"
+    log_info "Step 4: Running replay_trace -> $replay_file (trace: $TRACE_FILE)"
     cd "$SCRIPT_DIR"
 
+    # Build io-scale argument (empty when IO_SCALE is unset/empty)
+    local io_scale_arg=""
+    [ -n "$IO_SCALE" ] && io_scale_arg="--io-scale $IO_SCALE"
+
     # Run replay_trace in background with nohup
-    nohup bash -c "sudo taskset -c 14-18 ./replay_trace --remap-lba --trace $TRACE_FILE --max-tb $MAX_TB --io-scale $IO_SCALE $REPLAY_EXTRA_ARGS" > "$replay_file" 2>&1 &
+    nohup bash -c "sudo taskset -c 14-18 ./replay_trace --remap-lba --trace $TRACE_FILE --max-tb $MAX_TB $io_scale_arg $REPLAY_EXTRA_ARGS" > "$replay_file" 2>&1 &
     local pid=$!
 
     log_info "replay_trace started with PID: $pid"
@@ -149,6 +193,95 @@ run_replay_trace() {
     wait $pid 2>/dev/null || log_warn "replay_trace process terminated (PID: $pid)"
 
     log_success "replay_trace completed -> $replay_file"
+}
+
+# Device detection (mirrors replay_trace.cpp find_device())
+detect_device() {
+    # 1. Check ublk device
+    if [ -b /dev/ublkb0 ]; then
+        local size=$(sudo blockdev --getsize64 /dev/ublkb0 2>/dev/null || echo 0)
+        if [ "$size" -gt 0 ] 2>/dev/null; then
+            echo "/dev/ublkb0"
+            return 0
+        fi
+    fi
+
+    # 2. Check NVMe-oF device (ICACHE/FTLBDEV/NULL/OCF)
+    local nvme_dev=$(nvme list 2>/dev/null | grep -iE 'ICACHE|FTLBDEV|NULL|OCF' | awk '{print $1}')
+    if [ -n "$nvme_dev" ]; then
+        echo "$nvme_dev"
+        return 0
+    fi
+
+    # 3. Check OpenCAS device
+    if [ -b /dev/cas1-1 ]; then
+        local size=$(sudo blockdev --getsize64 /dev/cas1-1 2>/dev/null || echo 0)
+        if [ "$size" -gt 0 ] 2>/dev/null; then
+            echo "/dev/cas1-1"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Step 4 (alt): Run fio with zipf distribution instead of replay_trace
+run_fio_zipf() {
+    local base_replay="$1"
+    local timestamp=$(date '+%Y%m%d_%H%M%S')
+    local replay_file="${base_replay%.replay}_fio_zipf${FIO_ZIPF_THETA}_${timestamp}.replay"
+
+    local device
+    device=$(detect_device)
+    if [ -z "$device" ]; then
+        log_error "No device detected for fio"
+        return 1
+    fi
+
+    log_info "Step 4: Running fio zipf:${FIO_ZIPF_THETA} on $device -> $replay_file"
+    cd "$SCRIPT_DIR"
+
+    local fio_numjobs=4
+    local per_job_io_gib=$(( MAX_TB * 1024 / fio_numjobs ))
+
+    log_info "  Working set: ${FIO_ZIPF_SIZE}, io_size/job: ${per_job_io_gib}g (total ${MAX_TB}TB), seeds: ${FIO_ZIPF_RANDSEED}..$(( FIO_ZIPF_RANDSEED + fio_numjobs - 1 ))"
+
+    # Generate temporary jobfile with per-job seeds
+    local jobfile=$(mktemp /tmp/fio_zipf_XXXXXX.fio)
+    cat > "$jobfile" <<FIOEOF
+[global]
+ioengine=libaio
+direct=1
+rw=randwrite
+bs=4k
+iodepth=64
+random_distribution=zipf:${FIO_ZIPF_THETA}
+norandommap
+size=${FIO_ZIPF_SIZE}
+io_size=${per_job_io_gib}g
+filename=${device}
+group_reporting
+cpus_allowed=14-18
+
+FIOEOF
+    for i in $(seq 0 $((fio_numjobs - 1))); do
+        cat >> "$jobfile" <<FIOEOF
+[job${i}]
+randseed=$(( FIO_ZIPF_RANDSEED + i ))
+
+FIOEOF
+    done
+
+    nohup sudo fio "$jobfile" > "$replay_file" 2>&1 &
+    local pid=$!
+
+    log_info "fio started with PID: $pid"
+    log_info "Waiting for completion (or kill the process to skip)..."
+
+    wait $pid 2>/dev/null || log_warn "fio process terminated (PID: $pid)"
+
+    rm -f "$jobfile"
+    log_success "fio completed -> $replay_file"
 }
 
 # Step 5: Exit all tgt after replay
@@ -182,8 +315,12 @@ run_single_config() {
     log_info "Sleeping 11 minutes after bringup..."
     sleep 660
 
-    # Step 4: Run replay_trace
-    run_replay_trace "$replay"
+    # Step 4: Run replay_trace (or fio zipf for trace 7)
+    if [ "$CURRENT_TRACE_NUM" = "7" ]; then
+        run_fio_zipf "$replay"
+    else
+        run_replay_trace "$replay"
+    fi
 
     # Wait 11 minutes after replay before cleanup
     log_info "Sleeping 11 minutes after replay_trace..."
@@ -234,19 +371,73 @@ main() {
     log_info "Selected configs: ${selected_configs[*]}"
     echo ""
 
-    # Run selected configs
-    local total=${#selected_configs[@]}
-    local current=0
+    # Determine which trace files to run
+    declare -a selected_traces=()
 
-    for idx in "${selected_configs[@]}"; do
-        current=$((current+1))
-        echo ""
-        echo "########################################" | tee -a "$LOG_FILE"
-        echo "  Progress: $current / $total" | tee -a "$LOG_FILE"
-        echo "########################################" | tee -a "$LOG_FILE"
+    if [ -n "${TRACE_NUMS:-}" ]; then
+        for tnum in $TRACE_NUMS; do
+            if [[ "$tnum" =~ ^[0-9]+$ ]] && [ -n "${TRACE_FILES[$tnum]+x}" ]; then
+                selected_traces+=("$tnum")
+            else
+                log_error "Invalid trace number: $tnum (must be one of: ${!TRACE_FILES[*]})"
+                exit 1
+            fi
+        done
+        log_info "Selected traces: ${selected_traces[*]}"
+    fi
 
-        run_single_config "$idx"
-    done
+    # Run selected configs (with optional multi-trace loop)
+    if [ ${#selected_traces[@]} -gt 0 ]; then
+        # Multi-trace mode
+        local trace_total=${#selected_traces[@]}
+        local trace_current=0
+
+        local io_scale_orig="$IO_SCALE"
+        for tnum in "${selected_traces[@]}"; do
+            trace_current=$((trace_current+1))
+            CURRENT_TRACE_NUM="$tnum"
+            TRACE_FILE="${TRACE_BASE}${TRACE_FILES[$tnum]}"
+
+            # Trace 6 (varmail) and 7 (fio zipf) don't need --io-scale
+            if [ "$tnum" -eq 6 ] || [ "$tnum" -eq 7 ]; then
+                IO_SCALE=""
+            else
+                IO_SCALE="$io_scale_orig"
+            fi
+
+            echo ""
+            echo "========================================" | tee -a "$LOG_FILE"
+            log_info "Trace $trace_current / $trace_total: ${TRACE_FILES[$tnum]}"
+            echo "========================================" | tee -a "$LOG_FILE"
+
+            local total=${#selected_configs[@]}
+            local current=0
+
+            for idx in "${selected_configs[@]}"; do
+                current=$((current+1))
+                echo ""
+                echo "########################################" | tee -a "$LOG_FILE"
+                echo "  Trace [$trace_current/$trace_total] Config [$current/$total]" | tee -a "$LOG_FILE"
+                echo "########################################" | tee -a "$LOG_FILE"
+
+                run_single_config "$idx"
+            done
+        done
+    else
+        # Single trace mode (default)
+        local total=${#selected_configs[@]}
+        local current=0
+
+        for idx in "${selected_configs[@]}"; do
+            current=$((current+1))
+            echo ""
+            echo "########################################" | tee -a "$LOG_FILE"
+            echo "  Progress: $current / $total" | tee -a "$LOG_FILE"
+            echo "########################################" | tee -a "$LOG_FILE"
+
+            run_single_config "$idx"
+        done
+    fi
 
     echo ""
     echo "========================================" | tee -a "$LOG_FILE"

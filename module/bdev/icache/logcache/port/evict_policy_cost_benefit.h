@@ -40,7 +40,7 @@ public:
     void update(Segment* seg) override;
     bool empty() const override { return heap_.empty(); }
     size_t segment_count() const override { return heap_.size(); }
-    uint64_t get_mth_score_valid_pages(int m) const override;
+    uint64_t get_mth_score_valid_pages(double m) const override;
     uint64_t get_kth_segment_valid_cnt_for_free_segments(double m) const override;
 private:
     /* 실제 점수 계산: age/u  (u==0 → ∞) */

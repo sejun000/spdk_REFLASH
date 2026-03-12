@@ -129,7 +129,7 @@ static double score_sepbit_age(Segment *seg) {
         return -static_cast<double>(seg->create_timestamp);
     }
     if (u < 0.0001) u = 0.0001;
-    return sqrt((g_timestamp - seg->create_timestamp)) * (1 - u) / u;
+    return (g_timestamp - seg->create_timestamp) * (1 - u) / u;
 }
 
 namespace icache {

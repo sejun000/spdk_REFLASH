@@ -51,6 +51,7 @@ static constexpr bool INCREMENTAL_GC_ENABLED = false;
 static constexpr size_t CRITICAL_FREE_SEGMENTS = 2;   // Block host IO if <= this
 static constexpr size_t LOW_FREE_SEGMENTS = 10;       // Trigger GC if <= this
 #define GHOST_CACHE 1
+#define NETFREE_TCO_ENABLED 0
 
 class LogCache final : public ICache
 {
@@ -272,7 +273,7 @@ private:
     static const int HISTOGRAM_BUCKETS = 40;
     static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = (262144 * 6) * 4;
     static constexpr double GHOST_CACHE_RATIO = 0.1;  // 5% of cache size
-    static constexpr double QLC_TLC_COST_RATIO = 19.2;//(2.88 * 1); // QLC write cost / TLC write cost
+    static constexpr double QLC_TLC_COST_RATIO = 2.88;//(2.88 * 1); // QLC write cost / TLC write cost
     bool is_ghost_cache = false;
     uint64_t bypass_blocks_threshold = 128; // 128* 4k bytes = 512K bytes
     EwmaRatio compaction_ratio;
@@ -285,6 +286,13 @@ private:
     EwmaRatio ghost_reuse_ewma;          // d(accessHit) / d(push), reuse rate of evicted blocks
     uint64_t ghost_compacted_blocks = 0;
     uint64_t ghost_gc_freed_blocks = 0;
+#if NETFREE_TCO_ENABLED
+    uint64_t gc_victim_count_ = 0;           // cumulative GC victim segments
+    uint64_t gc_active_alloc_count_ = 0;     // cumulative GC new segment allocations
+    uint64_t cumulative_B_ = 0;              // cumulative get_mth_score_valid_pages sum
+    EwmaRatio netfree_a_ratio;               // EWMA of A * seg_size over timestamp
+    EwmaRatio netfree_b_ratio;               // EWMA of cumulative_B over timestamp
+#endif
     GhostCache ghost_cache;
     std::vector<uint8_t> staging_buffer_;
 
