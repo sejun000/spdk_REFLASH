@@ -8,7 +8,7 @@ TRACES = [
     "/home/sejun000/ssdtrace_scaled_4x.trace",
 ]
 
-LIMIT_BYTES = 8 * 1024**4  # 8 TB
+LIMIT_BYTES = 7 * 1024**4  # 7 TB
 PAGE_SIZE = 4096
 
 for trace_path in TRACES:
@@ -33,9 +33,9 @@ for trace_path in TRACES:
 
             # Track each 4KB page touched
             start_page = offset // PAGE_SIZE
-            num_pages = (size + PAGE_SIZE - 1) // PAGE_SIZE
-            for p in range(num_pages):
-                write_count_per_lba[start_page + p] += 1
+            end_page = (offset + size - 1) // PAGE_SIZE
+            for p in range(start_page, end_page + 1):
+                write_count_per_lba[p] += 1
 
             total_write_bytes += size
             total_write_ios += 1
