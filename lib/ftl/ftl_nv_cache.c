@@ -223,6 +223,7 @@ ftl_nv_cache_init(struct spdk_ftl_dev *dev)
 	uint64_t i, offset;
 
 	nv_cache->halt = true;
+	nv_cache->skip_md_write = true;
 
 	nv_cache->md = dev->layout.md[FTL_LAYOUT_REGION_TYPE_NVC_MD];
 	if (!nv_cache->md) {

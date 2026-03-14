@@ -519,6 +519,7 @@ write_blocks(struct spdk_ftl_dev *dev, struct spdk_bdev_desc *desc,
 {
 	if (desc == dev->nv_cache.bdev_desc) {
 		/* Use FDP placement handle for writes to NV cache */
+		ftl_stats_logger_add_md_write(dev->stats_logger, num_blocks * FTL_BLOCK_SIZE);
 		return ftl_nv_cache_bdev_write_blocks_with_md_fdp(desc, ch, buf, md_buf,
 				offset_blocks, num_blocks,
 				cb, cb_arg, fdp_handle, iov);

@@ -255,7 +255,7 @@ sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
 sudo sh -c 'echo 1 > /proc/sys/vm/compact_memory'
 sleep 2
 
-log "Binding devices to SPDK (scripts/setup.sh) with HUGEMEM=12288 and uio_pci_generic..."
+log "Binding devices to SPDK (scripts/setup.sh) with HUGEMEM=28672 and uio_pci_generic..."
 sudo HUGEMEM=12288 SHRINK_HUGE=yes "${ROOT_DIR}/scripts/setup.sh"
 
 start_spdk_tgt

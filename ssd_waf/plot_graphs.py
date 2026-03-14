@@ -216,6 +216,17 @@ def parse_throughput_from_replay_trace(replay_trace_path):
     match = re.search(r"Average BW:\s+([\d.]+)\s*MB/s", content)
     if match:
         return float(match.group(1))
+
+    # fio format: bw (  MiB/s): ... avg=XXXX.XX ...
+    match = re.search(r"bw\s*\(\s*MiB/s\).*avg=\s*([\d.]+)", content)
+    if match:
+        return float(match.group(1))
+
+    # fio format: bw (  KiB/s): ... avg=XXXX.XX ...
+    match = re.search(r"bw\s*\(\s*KiB/s\).*avg=\s*([\d.]+)", content)
+    if match:
+        return float(match.group(1)) / 1024.0
+
     return None
 
 
@@ -548,16 +559,31 @@ def plot_graph_c4():
     """
     configs = GRAPH_C2_CONFIGS
     metrics = ["Host WA", "Device WA"]
-    metric_colors = {"Host WA": "#4c72b0", "Device WA": "#dd8452"}
+    metric_colors = {"Host WA": "#4c72b0", "Device WA": "#7dce94"}
     active_workloads = get_active_workloads(configs)
     n_workloads = len(active_workloads)
     if n_workloads == 0:
         print("Graph C4: No workloads with data, skipping.")
         return
 
-    fig, axes = plt.subplots(1, n_workloads, figsize=(12 * n_workloads, 10))
-    if n_workloads == 1:
-        axes = [axes]
+    # W layout: top row has ceil(n/2) subplots, bottom row has floor(n/2) centered
+    top_count = (n_workloads + 1) // 2
+    bot_count = n_workloads - top_count
+    ncols_grid = top_count * 2  # use double grid for centering bottom row
+    fig = plt.figure(figsize=(12 * top_count, 7 * 2))
+    import matplotlib.gridspec as gridspec
+    gs = gridspec.GridSpec(2, ncols_grid, figure=fig)
+    axes_list = []
+    # Top row: evenly spaced across full width
+    for i in range(top_count):
+        ax = fig.add_subplot(gs[0, i * 2:(i + 1) * 2])
+        axes_list.append(ax)
+    # Bottom row: centered
+    bot_offset = top_count - bot_count  # offset in grid units to center
+    for i in range(bot_count):
+        ax = fig.add_subplot(gs[1, bot_offset + i * 2:bot_offset + (i + 1) * 2])
+        axes_list.append(ax)
+    axes = axes_list
 
     for wi, workload in enumerate(active_workloads):
         ax = axes[wi]
@@ -613,14 +639,14 @@ def plot_graph_c4():
         ax.set_xlabel(f"({labels_abc[wi]}) {workload}", fontsize=48)
         ax.tick_params(axis='y', labelsize=36)
         ax.grid(True, axis='y')
-        ax.set_ylim(bottom=0)
+        ax.set_ylim(bottom=0, top=4.5)
 
     # Single shared legend
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.05),
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.03),
                ncol=len(labels), frameon=False, fontsize=40)
-    plt.subplots_adjust(top=0.88)
     plt.tight_layout()
+    plt.subplots_adjust(top=0.94)
     plt.savefig(OUTPUT_FILES["graph_c4"], dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {OUTPUT_FILES['graph_c4']}")
@@ -642,7 +668,7 @@ def plot_graph_d():
         print("Graph D: No workloads with data, skipping.")
         return
 
-    fig, axes = plt.subplots(1, n_multipliers, figsize=(14 * n_multipliers, 7))
+    fig, axes = plt.subplots(1, n_multipliers, figsize=(14 * n_multipliers, 5))
     if n_multipliers == 1:
         axes = [axes]
 
@@ -704,6 +730,8 @@ def plot_graph_d():
         for workload in active_workloads:
             base_costs[workload] = raw_costs.get((NORMALIZATION_BASE, workload), 1.0)
 
+        y_max = 2.5
+        overflow_annotations = {}  # bi -> list of (x_pos, value)
         for i, config_name in enumerate(all_labels):
             vals = []
             for workload in active_workloads:
@@ -715,42 +743,35 @@ def plot_graph_d():
             bars = ax.bar(x + offset, vals, width, label=config_name,
                           color=CONFIG_COLORS.get(config_name, "#333333"),
                           edgecolor='black', linewidth=1.5)
+            # Collect bars that exceed y_max
+            for bi, v in enumerate(vals):
+                if v > y_max:
+                    overflow_annotations.setdefault(bi, []).append((x[bi] + offset, v))
 
-            for bar in bars:
-                height = bar.get_height()
-                if height > 0:
-                    if config_name == "QLC only":
-                        # Always show value above graph area for QLC only
-                        ax.annotate(f'{height:.2f}',
-                                    xy=(bar.get_x() + bar.get_width() / 2, 2.0),
-                                    xytext=(0, 3), textcoords="offset points",
-                                    ha='center', va='bottom', fontsize=12, fontweight='bold',
-                                    annotation_clip=False)
-                    elif height > 2.0:
-                        ax.annotate(f'{height:.2f}',
-                                    xy=(bar.get_x() + bar.get_width() / 2, 1.97),
-                                    ha='center', va='top', fontsize=12, fontweight='bold')
-                    else:
-                        ax.annotate(f'{height:.2f}',
-                                    xy=(bar.get_x() + bar.get_width() / 2, height),
-                                    xytext=(0, 5), textcoords="offset points",
-                                    ha='center', va='bottom', fontsize=14)
+        # Stagger overflow annotations so they don't overlap
+        for bi, annots in overflow_annotations.items():
+            for rank, (x_pos, v) in enumerate(annots):
+                y_offset = 4 + rank * 18
+                ax.annotate(f'{v:.1f}', xy=(x_pos, y_max),
+                            xytext=(0, y_offset), textcoords="offset points",
+                            ha='center', va='bottom', fontsize=16, fontweight='bold')
+
 
         if mi == 0:
-            ax.set_ylabel("Normalized cost")
+            ax.set_ylabel("Normalized TEC")
         ax.set_xticks(x)
         ax.set_xticklabels(active_workloads)
         ax.grid(True, axis='y')
-        ax.set_ylim(bottom=0, top=2.0)
+        ax.set_ylim(bottom=0, top=2.5)
         # Title below subplot
         ax.set_xlabel(f"({labels_abc[mi]}) r={multiplier}")
 
     # Shared legend at top - single row
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.05),
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.08),
                ncol=len(labels), frameon=False)
     plt.tight_layout()
-    plt.subplots_adjust(top=0.90)
+    plt.subplots_adjust(top=0.88)
     plt.savefig(OUTPUT_FILES["graph_d"], dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {OUTPUT_FILES['graph_d']}")
@@ -1117,7 +1138,7 @@ def plot_graph_j():
     """Graph J: 3 subplots - (a) FDP WA bar, (b) QLC writes bar, (c) normalized TEC bar
     Shared legend at top center, one row. Ali2."""
     configs = ["OpenCAS", "CSAL", "REFlash"]
-    workload = "Ali2"
+    workload = "Ali1"
     r = QLC_COST_MULTIPLIERS[0]  # 8.64
 
     fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(24, 6))

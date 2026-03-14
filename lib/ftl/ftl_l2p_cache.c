@@ -640,6 +640,7 @@ process_page_out(struct ftl_l2p_page *page, spdk_bdev_io_completion_cb cb)
 			1, cb, page);
 
 	if (spdk_likely(0 == rc)) {
+		ftl_stats_logger_add_l2p_write(cache->dev->stats_logger, FTL_BLOCK_SIZE);
 		return;
 	}
 
@@ -1444,6 +1445,7 @@ page_out_io(struct spdk_ftl_dev *dev, struct ftl_l2p_cache *cache,
 
 	cache->l2_pgs_evicting++;
 	if (spdk_likely(0 == rc)) {
+		ftl_stats_logger_add_l2p_write(dev->stats_logger, FTL_BLOCK_SIZE);
 		return;
 	}
 

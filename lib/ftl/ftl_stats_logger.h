@@ -69,10 +69,16 @@ struct ftl_stats_logger {
 	uint64_t gc_victim_blocks;     /* Blocks compacted by GC */
 	uint64_t evict_victim_blocks;  /* Blocks evicted (chunk freed) */
 
+	/* Per-metadata-type write bytes to nv_cache */
+	uint64_t l2p_write_bytes;      /* L2P cache page writeback (eviction + persist) */
+	uint64_t md_write_bytes;       /* ftl_md region writes to nv_cache */
+
 	/* Previous values for delta calculation */
 	uint64_t prev_host_write;
 	uint64_t prev_cache_write;
 	uint64_t prev_backend_write;
+	uint64_t prev_l2p_write;
+	uint64_t prev_md_write;
 
 	/* Start time */
 	uint64_t start_time_us;
@@ -219,6 +225,28 @@ ftl_stats_logger_add_evict_victim(struct ftl_stats_logger *logger, uint64_t coun
 {
 	if (logger) {
 		logger->evict_victim_blocks += count;
+	}
+}
+
+/**
+ * Add L2P cache write bytes (eviction/persist writeback to nv_cache)
+ */
+static inline void
+ftl_stats_logger_add_l2p_write(struct ftl_stats_logger *logger, uint64_t bytes)
+{
+	if (logger) {
+		logger->l2p_write_bytes += bytes;
+	}
+}
+
+/**
+ * Add metadata region write bytes (ftl_md writes to nv_cache)
+ */
+static inline void
+ftl_stats_logger_add_md_write(struct ftl_stats_logger *logger, uint64_t bytes)
+{
+	if (logger) {
+		logger->md_write_bytes += bytes;
 	}
 }
 
