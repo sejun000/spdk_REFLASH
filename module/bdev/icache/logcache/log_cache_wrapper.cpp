@@ -862,6 +862,7 @@ public:
 
 	// Get cache bdev for NVMe controller access
 	struct spdk_bdev *get_cache_bdev() const { return m_cache_bdev; }
+	struct spdk_bdev *get_backend_bdev() const { return m_backend_bdev; }
 
 	// Async API implementations
 	// Zone-aware write: QD1 per zone
@@ -2467,6 +2468,22 @@ public:
 			}
 		}
 			// LOG_GREEDY_COST_BENEFIT_11 uses valid_rate_threshold from parameter
+		else if (cache_type == "REFLASH" ||
+		         cache_type == "REFLASH_R864" ||
+		         cache_type == "REFLASH_R288") {
+			// GhostDelta_GC_SUM with configurable periodic_ratio
+			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
+			compactor = std::make_unique<CbEvictPolicy>(score_warm_first);
+			effective_valid_rate = 0.6;
+			score_low_valid_first = true;
+		}
+		else if (cache_type == "REFLASH_80") {
+			// Same as REFLASH but with fixed 80% target_valid_rate
+			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
+			compactor = std::make_unique<CbEvictPolicy>(score_warm_first);
+			effective_valid_rate = 0.80;
+			score_low_valid_first = true;
+		}
 		else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GREEDY") {
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_greedy_first);
@@ -2532,8 +2549,15 @@ public:
 		set_stream_interval(static_cast<uint64_t>(cache_block_count), segment_size_blocks);
 		IStream *input_stream_policy = createIstreamPolicy(istream_policy_name);
 
-		SPDK_NOTICELOG("LogCacheAsync: cache_type=%s, valid_rate=%.2f, has_compactor=%d, istream=%p\n",
-			       cache_type.c_str(), effective_valid_rate, compactor != nullptr, input_stream_policy);
+		// GS_SUM doc: util_step = (kGsDecisionPeriodSegs * segment_size_blocks) / total_cache_block_count,
+		// floor 0.02. For REFLASH policies; other policies keep default 0.02 implicitly.
+		const int gs_decision_period_segs = 2;
+		double auto_util_step = static_cast<double>(segment_size_blocks * gs_decision_period_segs)
+		                       / static_cast<double>(cache_block_count);
+		double effective_util_step = std::max(0.02, auto_util_step);
+		SPDK_NOTICELOG("LogCacheAsync: cache_type=%s, valid_rate=%.2f, has_compactor=%d, istream=%p, util_step=%.6f (auto=%.6f)\n",
+			       cache_type.c_str(), effective_valid_rate, compactor != nullptr, input_stream_policy,
+			       effective_util_step, auto_util_step);
 
 		cache_ = std::make_unique<LogCache>(
 			cold_capacity,
@@ -2551,9 +2575,22 @@ public:
 			0.0,
 			score_low_valid_first,
 			stat_log_path,
-			device);
+			device,
+			effective_util_step);
 		cache_->set_stats_prefix("icache");
 		cache_->set_async_mode(true);  // Disable sync eviction, use async wrapper
+
+		// Set periodic mode for REFLASH policies
+		// Set periodic mode and ratio for REFLASH policies
+		if (cache_type == "REFLASH" || cache_type == "REFLASH_80" ||
+		    cache_type == "REFLASH_R864" || cache_type == "REFLASH_R288") {
+			cache_->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM);
+			if (cache_type == "REFLASH_R864") {
+				cache_->setPeriodicRatio(8.64);
+			} else if (cache_type == "REFLASH_R288") {
+				cache_->setPeriodicRatio(2.88);
+			}
+		}
 
 		// Initialize QoS throttle
 		throttle_init();
@@ -2699,6 +2736,13 @@ public:
 		}
 	}
 
+	// Set backend NVMe controller for NAND writes reading (vendor log page 0xC0)
+	void set_stats_backend_nvme_ctrlr(struct spdk_nvme_ctrlr *ctrlr) {
+		if (stats_logger_) {
+			stats_logger_->set_backend_nvme_ctrlr(ctrlr);
+		}
+	}
+
 	// Start the stats logger (call from worker thread after channels set)
 	void start_stats_logger() {
 		if (stats_logger_) {
@@ -2729,6 +2773,9 @@ public:
 			stats_logger_->stats().gc_victim_blocks.store(cache_->get_compacted_blocks(), std::memory_order_relaxed);
 			stats_logger_->stats().evict_victim_blocks.store(cache_->get_evicted_blocks(), std::memory_order_relaxed);
 			stats_logger_->set_gc_segments_allocated(cache_->get_gc_segments_allocated());
+			// Push WAF values from StatsLogger to LogCache for periodic decisions
+			cache_->setFdpWaf(stats_logger_->fdp_waf());
+			cache_->setBackendWaf(stats_logger_->backend_waf());
 		}
 	}
 
@@ -6233,6 +6280,33 @@ log_cache_ctx_set_channels(struct log_cache_ctx *ctx,
 			SPDK_NOTICELOG("Set NVMe controller for stats logger: %p\n", nvme_ctrlr);
 		} else {
 			SPDK_NOTICELOG("No NVMe controller for cache bdev (not an NVMe bdev?)\n");
+		}
+	}
+
+	// Get NVMe controller from backend bdev for NAND writes log page
+	struct spdk_bdev *backend_bdev = ctx->device->get_backend_bdev();
+	if (backend_bdev && ctx->cache) {
+		struct spdk_nvme_ctrlr *backend_ctrlr = bdev_nvme_get_ctrlr(backend_bdev);
+		if (!backend_ctrlr) {
+			const char *bdev_name = spdk_bdev_get_name(backend_bdev);
+			if (bdev_name) {
+				std::string name(bdev_name);
+				size_t p_pos = name.rfind('p');
+				if (p_pos != std::string::npos && p_pos > 0) {
+					std::string parent_name = name.substr(0, p_pos);
+					struct spdk_bdev *parent_bdev = spdk_bdev_get_by_name(parent_name.c_str());
+					if (parent_bdev) {
+						backend_ctrlr = bdev_nvme_get_ctrlr(parent_bdev);
+						SPDK_NOTICELOG("Got backend NVMe controller from parent bdev %s\n", parent_name.c_str());
+					}
+				}
+			}
+		}
+		if (backend_ctrlr) {
+			ctx->cache->set_stats_backend_nvme_ctrlr(backend_ctrlr);
+			SPDK_NOTICELOG("Set backend NVMe controller for NAND writes: %p\n", backend_ctrlr);
+		} else {
+			SPDK_NOTICELOG("No NVMe controller for backend bdev (not an NVMe bdev?)\n");
 		}
 	}
 

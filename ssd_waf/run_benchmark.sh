@@ -71,6 +71,10 @@ declare -a CONFIGS=(
     "LOG_GREEDY_80_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_80_WARM ./run_tier_fdp.sh|reflash_80_warm.replay"
     "LOG_GREEDY_60_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_60_WARM ./run_tier_fdp.sh|reflash_60_warm.replay"
     "LOG_GREEDY_40_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_40_WARM ./run_tier_fdp.sh|reflash_40_warm.replay"
+    "REFLASH|sudo ICACHE_CACHE_TYPE=REFLASH ./run_tier_fdp.sh|reflash.replay"
+    "REFLASH_80|sudo ICACHE_CACHE_TYPE=REFLASH_80 ./run_tier_fdp.sh|reflash.replay"
+    "REFLASH_R864|sudo ICACHE_CACHE_TYPE=REFLASH_R864 ./run_tier_fdp.sh|reflash.replay"
+    "REFLASH_R288|sudo ICACHE_CACHE_TYPE=REFLASH_R288 ./run_tier_fdp.sh|reflash.replay"
 )
 # Split configs (use with CACHE_SPLIT_ENABLE=1):
 #    "LOG_SEPBIT_FIFO|sudo ICACHE_CACHE_TYPE=LOG_SEPBIT_FIFO CACHE_SPLIT_GB=$CACHE_SPLIT_GB CACHE_SPLIT_ENABLE=1 BACKEND_SPLIT_GB=$BACKEND_SPLIT_GB ./run_tier_fdp.sh|sepbit.replay"

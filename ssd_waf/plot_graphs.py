@@ -40,6 +40,14 @@ plt.rcParams['grid.linewidth'] = 1.0
 
 # Consistent color mapping for configs
 # REFlash and NearOpt: bold/vivid colors, others: medium pastel tones
+CONFIG_DISPLAY_NAMES = {
+    "REFlash_80": "REFlash-80",
+    "Greedy": "CSAL+GC",
+}
+
+def display_name(name):
+    return CONFIG_DISPLAY_NAMES.get(name, name)
+
 CONFIG_COLORS = {
     "SepBIT": "#F0C070",            # medium pastel amber/yellow
     "REFlash_COLD_FIXED": "#F0A870",# medium pastel orange
@@ -47,7 +55,7 @@ CONFIG_COLORS = {
     "REFlash": "#C41E3A",           # bold crimson red
     "REFlash_2.88": "#E85050",      # bold medium red
     "REFlash_8.64": "#C41E3A",      # bold dark red
-    "CSAL+GC": "#E090B0",          # medium pastel pink
+    "Greedy": "#E090B0",          # medium pastel pink
     "REFlash_Beta_Control": "#C09870", # medium pastel brown
     "CSAL": "#A880C0",             # medium pastel purple
     "OpenCAS": "#7BAFD4",          # medium pastel blue
@@ -149,17 +157,18 @@ def get_final_values(config_name, workload=None, run_index=0):
     config = get_config(config_name, workload, run_index)
     data = load_csv_data(config_name, workload, run_index)
 
-    # For ocf type, use QLC at the point where host_write stops changing
-    if config["csv_type"] == "ocf":
-        final_host_write = data["host_write_gb"][-1]
-        qlc_end_idx = len(data["host_write_gb"]) - 1
-        for i in range(len(data["host_write_gb"]) - 1, -1, -1):
-            if data["host_write_gb"][i] == final_host_write:
-                qlc_end_idx = i
-            else:
-                break
-    else:
-        qlc_end_idx = len(data["host_write_gb"]) - 1
+    # # For ocf type, use QLC at the point where host_write stops changing
+    # if config["csv_type"] == "ocf":
+    #     final_host_write = data["host_write_gb"][-1]
+    #     qlc_end_idx = len(data["host_write_gb"]) - 1
+    #     for i in range(len(data["host_write_gb"]) - 1, -1, -1):
+    #         if data["host_write_gb"][i] == final_host_write:
+    #             qlc_end_idx = i
+    #         else:
+    #             break
+    # else:
+    #     qlc_end_idx = len(data["host_write_gb"]) - 1
+    qlc_end_idx = len(data["host_write_gb"]) - 1
 
     tlc_start = 0
     qlc_start = 0
@@ -249,7 +258,7 @@ def plot_graph_a():
                 continue
             final = get_final_values(config_name, workload)
             ax.scatter(final["tlc_write_gb"], final["qlc_write_gb"],
-                       s=250, c=CONFIG_COLORS[config_name], label=config_name,
+                       s=250, c=CONFIG_COLORS[config_name], label=display_name(config_name),
                        edgecolors='black', linewidths=1.5)
 
         ax.set_xlabel("TLC writes (GB)")
@@ -281,7 +290,7 @@ def plot_graph_b():
         mask = data["fdp_host_write_gb"] > 0
         waf = data["fdp_media_write_gb"][mask] / data["fdp_host_write_gb"][mask]
         ax.plot(data["host_write_gb"][mask], waf,
-                label=config_name, linewidth=3, color=CONFIG_COLORS[config_name])
+                label=display_name(config_name), linewidth=3, color=CONFIG_COLORS[config_name])
 
     ax.set_xlabel("Host writes (GB)")
     ax.set_ylabel("WAF (FDP media / FDP host)")
@@ -321,11 +330,11 @@ def plot_graph_c():
             mask = plot_data_host >= COST_START_HOST_WRITE_GB
             qlc_start = plot_data_qlc[mask][0] if mask.any() else 0
             ax.plot(plot_data_host[mask], plot_data_qlc[mask] - qlc_start,
-                    label=config_name, linewidth=3, color=CONFIG_COLORS[config_name])
+                    label=display_name(config_name), linewidth=3, color=CONFIG_COLORS[config_name])
         else:
             mask = plot_data_host > 0
             ax.plot(plot_data_host[mask], plot_data_qlc[mask],
-                    label=config_name, linewidth=3, color=CONFIG_COLORS[config_name])
+                    label=display_name(config_name), linewidth=3, color=CONFIG_COLORS[config_name])
 
     ax.set_xlabel("Host writes (GB)")
     ax.set_ylabel("QLC (evict) writes (GB)")
@@ -373,7 +382,7 @@ def plot_graph_b2():
             vals.append(fdp_media / fdp_host if fdp_host > 0 else 0)
 
         offset = (i - (n_configs - 1) / 2) * width
-        bars = ax.bar(x + offset, vals, width, label=config_name,
+        bars = ax.bar(x + offset, vals, width, label=display_name(config_name),
                       color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=1.5)
 
         for bar in bars:
@@ -400,8 +409,8 @@ def plot_graph_b2():
 
 def plot_graph_c2():
     """Graph C2: Grouped bar - Final QLC (evict) writes per workload, grouped by feature"""
-    configs = ["OpenCAS", "CSAL+GC", "CSAL"]
-    workload = "Ali1"
+    configs = ["OpenCAS", "Greedy", "CSAL"]
+    workload = "Alibaba1"
     n_configs = len(configs)
 
     fig, ax = plt.subplots(figsize=(14, 10))
@@ -428,7 +437,7 @@ def plot_graph_c2():
 
     ax.set_ylabel("Capacity-tier writes (GB)")
     ax.set_xticks(x)
-    ax.set_xticklabels(configs)
+    ax.set_xticklabels([display_name(c) for c in configs])
     ax.grid(True, axis='y')
     ax.set_ylim(bottom=0)
 
@@ -475,7 +484,7 @@ def plot_graph_c3():
         print("Graph C3: No workloads with data, skipping.")
         return
 
-    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(24, 5.25))
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(24, 4.2))
     x = np.arange(n_workloads)
     width = 0.8 / n_configs
 
@@ -490,17 +499,9 @@ def plot_graph_c3():
             vals.append(final["qlc_write_gb"] / 1000)
 
         offset = (i - (n_configs - 1) / 2) * width
-        bars = ax_left.bar(x + offset, vals, width, label=config_name,
+        bars = ax_left.bar(x + offset, vals, width, label=display_name(config_name),
                            color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=1.5)
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0:
-                ax_left.annotate(f'{height:.1f}',
-                                 xy=(bar.get_x() + bar.get_width() / 2, height),
-                                 xytext=(0, 5), textcoords="offset points",
-                                 ha='center', va='bottom', fontsize=14)
-
-    ax_left.set_ylabel("Capacity-tier writes (TB)", fontsize=24)
+    ax_left.set_ylabel("TB", fontsize=24)
     ax_left.set_xticks(x)
     ax_left.set_xticklabels(active_workloads, fontsize=23)
     ax_left.tick_params(axis='y', labelsize=23)
@@ -516,22 +517,13 @@ def plot_graph_c3():
                 vals.append(0)
                 continue
             v = _get_avg_utilization(config_name, workload)
-            if config_name in ("REFlash_80", "SepBIT", "CSAL+GC"):
+            if config_name in ("REFlash_80", "SepBIT", "Greedy"):
                 v = round(v, 1)
             vals.append(v)
 
         offset = (i - (n_configs - 1) / 2) * width
-        bars = ax_right.bar(x + offset, vals, width, label=config_name,
+        bars = ax_right.bar(x + offset, vals, width, label=display_name(config_name),
                             color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=1.5)
-        fmt = '.1f' if config_name in ("REFlash_80", "SepBIT", "CSAL+GC") else '.2f'
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0:
-                ax_right.annotate(f'{height:{fmt}}',
-                                  xy=(bar.get_x() + bar.get_width() / 2, height),
-                                  xytext=(0, 5), textcoords="offset points",
-                                  ha='center', va='bottom', fontsize=14)
-
     ax_right.set_ylabel("BUtil", fontsize=24)
     ax_right.set_xticks(x)
     ax_right.set_xticklabels(active_workloads, fontsize=23)
@@ -541,7 +533,7 @@ def plot_graph_c3():
     ax_right.set_xlabel("(b) BUtil", fontsize=28)
 
     handles, labels = ax_left.get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.03),
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.06),
                ncol=n_configs, frameon=False, fontsize=20)
     plt.tight_layout()
     plt.subplots_adjust(top=0.90)
@@ -634,7 +626,7 @@ def plot_graph_c4():
 
         ax.set_ylabel("Write amplification", fontsize=40)
         ax.set_xticks(x)
-        ax.set_xticklabels(configs, rotation=15, ha='right', fontsize=36)
+        ax.set_xticklabels([display_name(c) for c in configs], rotation=15, ha='right', fontsize=36)
         labels_abc = "abcdefghijklmnopqrstuvwxyz"
         ax.set_xlabel(f"({labels_abc[wi]}) {workload}", fontsize=48)
         ax.tick_params(axis='y', labelsize=36)
@@ -659,7 +651,7 @@ def plot_graph_d():
     Subplot titles: (a) r=X, (b) r=Y, etc.
     """
     configs = ALL_CONFIGS
-    all_labels = ["QLC only"] + list(configs) + ["NearOpt"]
+    all_labels = ["QLC only"] + list(configs)
     active_workloads = get_active_workloads(configs)
     n_workloads = len(active_workloads)
     n_bars = len(all_labels)
@@ -668,7 +660,7 @@ def plot_graph_d():
         print("Graph D: No workloads with data, skipping.")
         return
 
-    fig, axes = plt.subplots(1, n_multipliers, figsize=(14 * n_multipliers, 5))
+    fig, axes = plt.subplots(1, n_multipliers, figsize=(14 * n_multipliers, 4))
     if n_multipliers == 1:
         axes = [axes]
 
@@ -740,7 +732,7 @@ def plot_graph_d():
                 vals.append(raw / base if base > 0 else 0)
 
             offset = (i - (n_bars - 1) / 2) * width
-            bars = ax.bar(x + offset, vals, width, label=config_name,
+            bars = ax.bar(x + offset, vals, width, label=display_name(config_name),
                           color=CONFIG_COLORS.get(config_name, "#333333"),
                           edgecolor='black', linewidth=1.5)
             # Collect bars that exceed y_max
@@ -748,14 +740,19 @@ def plot_graph_d():
                 if v > y_max:
                     overflow_annotations.setdefault(bi, []).append((x[bi] + offset, v))
 
-        # Stagger overflow annotations so they don't overlap
+        # Spread overflow annotations horizontally so they don't overlap
         for bi, annots in overflow_annotations.items():
+            n = len(annots)
             for rank, (x_pos, v) in enumerate(annots):
-                y_offset = 4 + rank * 18
+                y_offset = 4
+                x_nudge = (rank - (n - 1) / 2) * 12 if n > 1 else 0
                 ax.annotate(f'{v:.1f}', xy=(x_pos, y_max),
-                            xytext=(0, y_offset), textcoords="offset points",
-                            ha='center', va='bottom', fontsize=16, fontweight='bold')
+                            xytext=(x_nudge, y_offset), textcoords="offset points",
+                            ha='center', va='bottom', fontsize=21, fontweight='bold')
 
+
+        ax.axhline(y=1.0, color=CONFIG_COLORS["NearOpt"], linestyle='--',
+                   linewidth=2.5, label='NearOpt' if mi == 0 else None)
 
         if mi == 0:
             ax.set_ylabel("Normalized TEC")
@@ -768,10 +765,10 @@ def plot_graph_d():
 
     # Shared legend at top - single row
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.08),
-               ncol=len(labels), frameon=False)
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.12),
+               ncol=len(labels), frameon=False, fontsize=26)
     plt.tight_layout()
-    plt.subplots_adjust(top=0.88)
+    plt.subplots_adjust(top=0.85)
     plt.savefig(OUTPUT_FILES["graph_d"], dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {OUTPUT_FILES['graph_d']}")
@@ -839,7 +836,7 @@ def plot_graph_d2():
                     vals.append(0)
 
             offset = (i - (n_bars - 1) / 2) * width
-            bars = ax.bar(x + offset, vals, width, label=config_name,
+            bars = ax.bar(x + offset, vals, width, label=display_name(config_name),
                           color=CONFIG_COLORS.get(config_name, "#333333"),
                           edgecolor='black', linewidth=1.5)
 
@@ -1000,7 +997,7 @@ def plot_graph_g():
             vals.append(tp if tp else 0)
 
         offset = (i - (n_configs - 1) / 2) * width
-        bars = ax.bar(x + offset, vals, width, label=config_name,
+        bars = ax.bar(x + offset, vals, width, label=display_name(config_name),
                       color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=1.5)
 
 
@@ -1046,7 +1043,7 @@ def plot_graph_h():
         # Filter where host_write > 0
         mask = host_write_gb > 0
         ax.plot(host_write_gb[mask], valid_block_rate[mask],
-                label=config_name, linewidth=3, color=CONFIG_COLORS[config_name])
+                label=display_name(config_name), linewidth=3, color=CONFIG_COLORS[config_name])
 
     ax.set_xlabel("Host writes (GB)")
     ax.set_ylabel("Valid block rate")
@@ -1137,21 +1134,22 @@ def plot_graph_i():
 def plot_graph_j():
     """Graph J: 3 subplots - (a) FDP WA bar, (b) QLC writes bar, (c) normalized TEC bar
     Shared legend at top center, one row. Ali2."""
-    configs = ["OpenCAS", "CSAL", "REFlash"]
-    workload = "Ali1"
+    configs = ["OpenCAS", "CSAL", "Greedy", "REFlash"]
+    workload = "Alibaba1"
     r = QLC_COST_MULTIPLIERS[0]  # 8.64
 
-    fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(24, 6))
+    fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(24, 5))
 
     n_configs = len(configs)
     x = np.arange(n_configs)
 
     # --- (a) Buffer-Tier Device WA (delta from COST_START_HOST_WRITE_GB) ---
+    # VERSION A: Host WA + Device WA grouped bars (commented out)
+    # VERSION B: Device WA only (active)
     for i, config_name in enumerate(configs):
         val = 0
         if has_workload(config_name, workload):
             data = load_csv_data(config_name, workload)
-            # Find start index at COST_START_HOST_WRITE_GB
             fdp_host_start = 0
             fdp_media_start = 0
             for si in range(len(data["host_write_gb"])):
@@ -1162,18 +1160,18 @@ def plot_graph_j():
             fdp_host = data["fdp_host_write_gb"][-1] - fdp_host_start
             fdp_media = data["fdp_media_write_gb"][-1] - fdp_media_start
             val = fdp_media / fdp_host if fdp_host > 0 else 0
-        ax_a.bar(x[i], val, 0.6, label=config_name,
+        ax_a.bar(x[i], val, 0.6,
                  color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=1.5)
         if val > 0:
             ax_a.annotate(f'{val:.2f}',
                           xy=(x[i], val),
                           xytext=(0, 5), textcoords="offset points",
-                          ha='center', va='bottom', fontsize=14)
+                          ha='center', va='bottom', fontsize=24)
 
     ax_a.set_ylabel("WA")
     ax_a.set_xlabel("(a) Buffer-tier device WA")
     ax_a.set_xticks(x)
-    ax_a.set_xticklabels(configs)
+    ax_a.set_xticklabels([display_name(c) for c in configs])
     ax_a.grid(True, axis='y')
     ax_a.set_ylim(bottom=0, top=4.5)
 
@@ -1184,20 +1182,20 @@ def plot_graph_j():
             run_idx = 0
             final = get_final_values(config_name, workload, run_index=run_idx)
             val = final["qlc_write_gb"] / 1000  # GB to TB
-        ax_b.bar(x[i], val, 0.6, label=config_name,
+        ax_b.bar(x[i], val, 0.6, label=display_name(config_name),
                  color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=1.5)
         if val > 0:
             ax_b.annotate(f'{val:.2f}',
                           xy=(x[i], val),
                           xytext=(0, 5), textcoords="offset points",
-                          ha='center', va='bottom', fontsize=14)
+                          ha='center', va='bottom', fontsize=24)
 
-    ax_b.set_ylabel("Capacity-tier writes (TB)")
+    ax_b.set_ylabel("TB")
     ax_b.set_xlabel("(b) Capacity-tier writes")
     ax_b.set_xticks(x)
-    ax_b.set_xticklabels(configs)
+    ax_b.set_xticklabels([display_name(c) for c in configs])
     ax_b.grid(True, axis='y')
-    ax_b.set_ylim(bottom=0, top=5.5)
+    ax_b.set_ylim(bottom=0, top=4.5)
 
     # --- (c) Normalized TEC (stacked: buffer-tier + capacity-tier) ---
     # Compute raw cost components, normalize to OpenCAS
@@ -1216,7 +1214,6 @@ def plot_graph_j():
     for i, config_name in enumerate(configs):
         tlc_val = raw_tlc.get(config_name, 0) / base_cost if base_cost > 0 else 0
         qlc_val = raw_qlc.get(config_name, 0) / base_cost if base_cost > 0 else 0
-        total_val = tlc_val + qlc_val
         # Bottom: buffer-tier (solid)
         ax_c.bar(x[i], tlc_val, 0.6,
                  color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=1.5)
@@ -1224,30 +1221,26 @@ def plot_graph_j():
         ax_c.bar(x[i], qlc_val, 0.6, bottom=tlc_val,
                  color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=1.5,
                  hatch='xx')
+        total_val = tlc_val + qlc_val
         if total_val > 0:
             ax_c.annotate(f'{total_val:.2f}',
                           xy=(x[i], total_val),
                           xytext=(0, 5), textcoords="offset points",
-                          ha='center', va='bottom', fontsize=14)
-
+                          ha='center', va='bottom', fontsize=24)
     ax_c.set_ylabel("Normalized TEC")
     ax_c.set_xlabel("(c) Total endurance cost")
     ax_c.set_xticks(x)
-    ax_c.set_xticklabels(configs)
+    ax_c.set_xticklabels([display_name(c) for c in configs])
     ax_c.grid(True, axis='y')
-    ax_c.set_ylim(bottom=0, top=1.15)
+    ax_c.set_ylim(bottom=0, top=1.4)
     # Stacked legend for (c) subplot - horizontal, inside top-left
     from matplotlib.patches import Patch
     ax_c.legend(handles=[
         Patch(facecolor='#E0E0E0', edgecolor='black', label='Buffer-tier'),
         Patch(facecolor='#E0E0E0', edgecolor='black', hatch='xx', label='Capacity-tier'),
-    ], loc='upper right', ncol=1, fontsize=20,
+    ], loc='upper right', ncol=2, fontsize=23,
        frameon=True, edgecolor='black', fancybox=False, handlelength=0.8)
 
-    # Shared legend - one row, top center
-    handles, labels = ax_a.get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.08),
-               ncol=len(labels), frameon=False, fontsize=27)
     plt.tight_layout()
     plt.savefig(OUTPUT_FILES["graph_j"], dpi=150, bbox_inches='tight')
     plt.close()

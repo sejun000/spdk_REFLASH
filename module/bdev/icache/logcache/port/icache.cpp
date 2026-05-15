@@ -286,6 +286,22 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
             nullptr, input_stream_policy, 0.6, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true), cache_type);
     }
+    else if (cache_type == "REFLASH") {
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.6, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true);
+        lc->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM);
+        return attach_prefix(lc, cache_type);
+    }
+    else if (cache_type == "REFLASH_80") {
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.80, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true);
+        lc->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM);
+        return attach_prefix(lc, cache_type);
+    }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_11") { // for getting optimized value from dynamic algorithm
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 

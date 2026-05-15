@@ -29,6 +29,16 @@ struct NvmeFdpStatsLog {
 #pragma pack(pop)
 
 /**
+ * Backend vendor-specific log page 0xC0
+ * Bytes 24-31: NAND writes (in SMART units, 1 unit = 512,000 bytes)
+ */
+#pragma pack(push, 1)
+struct VendorLogPage0xC0 {
+    uint8_t data[256];   // read enough to cover offset 24-31
+};
+#pragma pack(pop)
+
+/**
  * Stats Logger for icache
  *
  * Periodically logs write statistics to a file:
@@ -76,6 +86,9 @@ public:
     // Set NVMe controller for log page reading (can be called after start)
     void set_nvme_ctrlr(struct spdk_nvme_ctrlr *ctrlr);
 
+    // Set backend NVMe controller for NAND writes reading (vendor log page 0xC0)
+    void set_backend_nvme_ctrlr(struct spdk_nvme_ctrlr *ctrlr);
+
     // Initialize and start the logger (call from SPDK thread)
     bool start();
 
@@ -110,6 +123,10 @@ public:
     uint64_t backend_write_bytes() const { return stats_.backend_write_bytes.load(std::memory_order_relaxed); }
     uint64_t gc_write_bytes() const { return stats_.gc_write_bytes.load(std::memory_order_relaxed); }
 
+    // WAF values (computed from log page deltas)
+    double fdp_waf() const { return fdp_waf_; }        // cache SSD: MBMW/HBMW
+    double backend_waf() const { return backend_waf_; } // backend SSD: nand/host
+
 private:
     // SPDK poller callback
     static int poller_fn(void *arg);
@@ -122,6 +139,10 @@ private:
 
     // Read NVMe endurance group log page
     void read_nvme_log_page();
+
+    // Read backend vendor log page 0xC0 for NAND writes
+    void read_backend_log_page();
+    static void backend_log_page_done(void *cb_arg, const struct spdk_nvme_cpl *cpl);
 
     std::string policy_name_;
     std::string log_dir_;
@@ -154,6 +175,23 @@ private:
     uint64_t nvme_media_written_ = 0;    // MBMW: Media Bytes with Metadata Written
     uint64_t prev_nvme_host_written_ = 0;
     uint64_t prev_nvme_media_written_ = 0;
+
+    // WAF computation: cumulative average from the point where both writes became non-zero
+    double fdp_waf_ = 1.0;          // cache SSD WAF: (MBMW-start)/(HBMW-start)
+    double backend_waf_ = 1.0;      // backend SSD WAF: (nand-start)/(host-start)
+    uint64_t waf_start_nvme_host_ = 0;
+    uint64_t waf_start_nvme_media_ = 0;
+    bool     waf_fdp_started_ = false;
+    uint64_t waf_start_backend_nand_ = 0;
+    uint64_t waf_start_backend_write_ = 0;
+    bool     waf_backend_started_ = false;
+
+    // Backend NVMe controller for vendor log page 0xC0
+    struct spdk_nvme_ctrlr *backend_nvme_ctrlr_ = nullptr;
+    VendorLogPage0xC0 *backend_log_page_buf_ = nullptr;
+    bool backend_log_page_pending_ = false;
+    uint64_t backend_nand_written_ = 0;         // NAND writes in bytes (value * 512000)
+    uint64_t prev_backend_nand_written_ = 0;
 
     // Histogram periodic print (every ~60 seconds)
     std::function<void()> histogram_cb_;

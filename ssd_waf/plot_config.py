@@ -12,31 +12,31 @@ LOGGING_DIR = os.path.join(BASE_DIR, "logging")
 OUTPUT_DIR = BASE_DIR
 
 # Workload names for multi-workload graphs (A, B2, C2, D, D2, G)
-WORKLOADS = ["FIO-0.9", "YCSB-A", "Ali1", "Ali2", "Ali3", "Varmail"]
+WORKLOADS = ["FIO", "YCSB-A", "Alibaba1", "Alibaba2", "Alibaba3", "Varmail"]
 
 # Default workload for single-workload graphs (B, C, H, I, E, F, F2)
-DEFAULT_WORKLOAD = "Ali1"
+DEFAULT_WORKLOAD = "Alibaba1"
 
 # Config definitions - nested: feature -> workload -> config_dict
 # Each feature can have data for one or more workloads.
 # Graphs will gracefully skip missing workloads.
 CONFIGS = {
     "SepBIT": {
-        "Ali1": {
+        "Alibaba1": {
             "csv": os.path.join(LOGGING_DIR, "LOG_SEPBIT_FIFO_20260228_061648.csv"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260228_061646"),
             "replay_trace": os.path.join(BASE_DIR, "sepbit_20260228_062758.replay"),
             "csv_type": "icache",
             "cache_size_gb": 1880,
         },
-        "Ali2": {
+        "Alibaba2": {
             "csv": os.path.join(LOGGING_DIR, "LOG_SEPBIT_FIFO_20260226_081216.csv"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260226_081214"),
             "replay_trace": os.path.join(BASE_DIR, "sepbit_20260226_082326.replay"),
             "csv_type": "icache",
             "cache_size_gb": 1880,
         },
-        "Ali3": {
+        "Alibaba3": {
             "csv": os.path.join(LOGGING_DIR, "LOG_SEPBIT_FIFO_20260303_002046.csv"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260303_002043"),
             "replay_trace": os.path.join(BASE_DIR, "sepbit_20260303_003155.replay"),
@@ -57,7 +57,7 @@ CONFIGS = {
             "csv_type": "icache",
             "cache_size_gb": 1880,
         },
-        "FIO-0.9": {
+        "FIO": {
             "csv": os.path.join(LOGGING_DIR, "LOG_SEPBIT_FIFO_20260311_151222.csv"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260311_151220"),
             "replay_trace": os.path.join(BASE_DIR, "sepbit_fio_zipf0.9_20260311_152332.replay"),
@@ -66,14 +66,14 @@ CONFIGS = {
         },
     },
     "REFlash_COLD_FIXED": {
-        "Ali1": {
+        "Alibaba1": {
             "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_COLD_20260209_214756.csv"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260209_214755"),
             "replay_trace": os.path.join(BASE_DIR, "reflash_cold_fixed.replay"),
             "csv_type": "icache",
             "cache_size_gb": 1880,
         },
-        "Ali2": {
+        "Alibaba2": {
             "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_COLD_20260209_214756.csv"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260209_214755"),
             "replay_trace": os.path.join(BASE_DIR, "reflash_cold_fixed.replay"),
@@ -89,21 +89,21 @@ CONFIGS = {
         },
     },
     "REFlash_80": {
-        "Ali1": {
+        "Alibaba1": {
             "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_WARM_20260228_133035.csv"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260228_133033"),
             "replay_trace": os.path.join(BASE_DIR, "reflash_fixed_20260228_134145.replay"),
             "csv_type": "icache",
             "cache_size_gb": 1880,
         },
-        "Ali2": {
+        "Alibaba2": {
             "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_WARM_20260226_153249.csv"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260226_153246"),
             "replay_trace": os.path.join(BASE_DIR, "reflash_fixed_20260226_154358.replay"),
             "csv_type": "icache",
             "cache_size_gb": 1880,
         },
-        "Ali3": {
+        "Alibaba3": {
             "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_WARM_20260303_044509.csv"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260303_044507"),
             "replay_trace": os.path.join(BASE_DIR, "reflash_fixed_20260303_045619.replay"),
@@ -124,7 +124,7 @@ CONFIGS = {
             "csv_type": "icache",
             "cache_size_gb": 1880,
         },
-        "FIO-0.9": {
+        "FIO": {
             "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_WARM_20260312_141111.csv"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260312_141109"),
             "replay_trace": os.path.join(BASE_DIR, "reflash_fixed_fio_zipf0.9_20260312_142221.replay"),
@@ -134,7 +134,7 @@ CONFIGS = {
     },
     # REFlash: list format - each workload has a list of run configs (multiple csv/stat_log/replay_trace)
     "REFlash": {
-        "Ali1": [
+        "Alibaba1": [
             {
                 "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260227_141502.csv"),
                 "stat_log": os.path.join(BASE_DIR, "stat.log.20260227_141500"),
@@ -150,7 +150,7 @@ CONFIGS = {
                 "cache_size_gb": 1880,
             },
         ],
-        "Ali2": [
+        "Alibaba2": [
             {
                 "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260226_033138.csv"),
                 "stat_log": os.path.join(BASE_DIR, "stat.log.20260226_033136"),
@@ -166,7 +166,7 @@ CONFIGS = {
                 "cache_size_gb": 1880,
             },
         ],
-        "Ali3": [
+        "Alibaba3": [
             {
                 "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260302_095057.csv"),
                 "stat_log": os.path.join(BASE_DIR, "stat.log.20260302_095055"),
@@ -201,20 +201,20 @@ CONFIGS = {
         "Varmail": [
             {  # r=8.64
                 "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260312_220439.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260309_083114"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260312_220437"),
                 "replay_trace": os.path.join(BASE_DIR, "reflash_varmail_2tb_6x_16t_20260309_084226.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
             {  # r=2.88
                 "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260309_083117.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260312_220437"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260309_083114"),
                 "replay_trace": os.path.join(BASE_DIR, "reflash_varmail_2tb_6x_16t_20260312_221549.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
         ],
-        "FIO-0.9": [
+        "FIO": [
             {  # r=8.64
                 "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260313_024813.csv"),
                 "stat_log": os.path.join(BASE_DIR, "stat.log.20260313_024811"),
@@ -231,22 +231,22 @@ CONFIGS = {
             },
         ],
     },
-    "CSAL+GC": {
-        "Ali1": {
+    "Greedy": {
+        "Alibaba1": {
             "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_80_WARM_20260306_170505.csv.dwpd2"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260306_170503"),
             "replay_trace": os.path.join(BASE_DIR, "reflash_80_warm_20260306_171615.replay"),
             "csv_type": "icache",
             "cache_size_gb": 1880,
         },
-        "Ali2": {
+        "Alibaba2": {
             "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_80_WARM_20260307_155706.csv"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260307_155703"),
             "replay_trace": os.path.join(BASE_DIR, "reflash_80_warm_20260307_075522.replay"),
             "csv_type": "icache",
             "cache_size_gb": 1880,
         },
-        "Ali3": {
+        "Alibaba3": {
             "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_80_WARM_20260306_222303.csv.dwpd01"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260306_222301"),
             "replay_trace": os.path.join(BASE_DIR, "reflash_80_warm_20260306_223413.replay"),
@@ -267,7 +267,7 @@ CONFIGS = {
             "csv_type": "icache",
             "cache_size_gb": 1880,
         },
-        "FIO-0.9": {
+        "FIO": {
             "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_80_WARM_20260311_233030.csv"),
             "stat_log": os.path.join(BASE_DIR, "stat.log.20260311_233027"),
             "replay_trace": os.path.join(BASE_DIR, "reflash_80_warm_fio_zipf0.9_20260311_234139.replay"),
@@ -276,21 +276,21 @@ CONFIGS = {
         },
     },
     "CSAL": {
-        "Ali1": {
+        "Alibaba1": {
             "csv": os.path.join(LOGGING_DIR, "ftl0_20260227_181546.csv"),
             "stat_log": None,
             "replay_trace": os.path.join(BASE_DIR, "ftl_20260227_182656.replay"),
             "csv_type": "ftl",
             "cache_size_gb": 1880,
         },
-        "Ali2": {
+        "Alibaba2": {
             "csv": os.path.join(LOGGING_DIR, "ftl0_20260225_082514.csv"),
             "stat_log": None,
             "replay_trace": os.path.join(BASE_DIR, "ftl_20260225_083623.replay"),
             "csv_type": "ftl",
             "cache_size_gb": 1880,
         },
-        "Ali3": {
+        "Alibaba3": {
             "csv": os.path.join(LOGGING_DIR, "ftl0_20260302_140526.csv"),
             "stat_log": None,
             "replay_trace": os.path.join(BASE_DIR, "ftl_20260302_141636.replay"),
@@ -311,7 +311,7 @@ CONFIGS = {
             "csv_type": "ftl",
             "cache_size_gb": 1880,
         },
-        "FIO-0.9": {
+        "FIO": {
             "csv": os.path.join(LOGGING_DIR, "ftl0_20260313_235735.csv"),
             "stat_log": None,
             "replay_trace": os.path.join(BASE_DIR, "ftl_fio_zipf0.9_20260314_000844.replay"),
@@ -320,19 +320,19 @@ CONFIGS = {
         },
     },
     "OpenCAS": {
-        "Ali1": {
+        "Alibaba1": {
             "csv": os.path.join(LOGGING_DIR, "ocf0_20260227_225127.csv"),
             "stat_log": None,
             "replay_trace": os.path.join(BASE_DIR, "ocf_20260227_230240.replay"),
             "csv_type": "ocf",
         },
-        "Ali2": {
+        "Alibaba2": {
             "csv": os.path.join(LOGGING_DIR, "ocf0_20260225_122214.csv"),
             "stat_log": None,
             "replay_trace": os.path.join(BASE_DIR, "ocf_20260225_123326.replay"),
             "csv_type": "ocf",
         },
-         "Ali3": {
+         "Alibaba3": {
             "csv": os.path.join(LOGGING_DIR, "ocf0_20260302_182507.csv"),
             "stat_log": None,
             "replay_trace": os.path.join(BASE_DIR, "ocf_20260302_183620.replay"),
@@ -350,7 +350,7 @@ CONFIGS = {
             "replay_trace": os.path.join(BASE_DIR, "ocf_varmail_2tb_6x_16t_20260308_230238.replay"),
             "csv_type": "ocf",
         },
-        "FIO-0.9": {
+        "FIO": {
             "csv": os.path.join(LOGGING_DIR, "ocf0_20260311_051835.csv"),
             "stat_log": None,
             "replay_trace": os.path.join(BASE_DIR, "ocf_fio_zipf0.9_20260311_052948.replay"),
@@ -398,36 +398,36 @@ NORMALIZATION_BASE = "NearOpt"
 
 # NearOpt (lower bound) cost values in TB, per (workload, QLC_COST_MULTIPLIER)
 NEAROPT_COSTS_TB = {
-    ("Ali1", 2.88): 14.35,
-    ("Ali1", 8.64): 23.24,
-    ("Ali2", 2.88): 18.61,
-    ("Ali2", 8.64): 31.36,
-    ("Ali3", 2.88): 16.85,
-    ("Ali3", 8.64): 32.15,
+    ("Alibaba1", 2.88): 14.35,
+    ("Alibaba1", 8.64): 23.24,
+    ("Alibaba2", 2.88): 18.61,
+    ("Alibaba2", 8.64): 31.36,
+    ("Alibaba3", 2.88): 16.85,
+    ("Alibaba3", 8.64): 32.15,
     ("YCSB-A", 2.88): 18.09,
     ("YCSB-A", 8.64): 32.11,
     ("Varmail", 2.88): 22.60,   # TODO: temporary placeholder
     ("Varmail", 8.64): 47.85,   # TODO: temporary placeholder
-    ("FIO-0.9", 2.88): 14.23,
-    ("FIO-0.9", 8.64): 22.31,
+    ("FIO", 2.88): 14.23,
+    ("FIO", 8.64): 22.31,
 }
 
 # Configs that have histogram data (for Graphs E, F)
 HISTOGRAM_CONFIGS = ["SepBIT", "REFlash_COLD_FIXED", "REFlash_80", "REFlash"]
 
 # All configs for Graphs A, B, C, D, etc. (histogram 제외)
-ALL_CONFIGS = ["OpenCAS", "CSAL", "CSAL+GC", "SepBIT", "REFlash_80", "REFlash"]
+ALL_CONFIGS = ["OpenCAS", "CSAL", "Greedy", "SepBIT", "REFlash_80", "REFlash"]
 
 # Configs for Graph I (utilization scatter) - ordered for comparison
 GRAPH_I_CONFIGS = ["OpenCAS", "REFlash", "CSAL"]
 # Configs for Graph B2 (WAF bar) - ordered for comparison
-GRAPH_B2_CONFIGS = ["OpenCAS", "CSAL+GC", "CSAL"]
+GRAPH_B2_CONFIGS = ["OpenCAS", "Greedy", "CSAL"]
 # Configs for Graph C (QLC writes timeseries) - tiering configs only
 GRAPH_C_CONFIGS = ["OpenCAS", "CSAL", "SepBIT", "REFlash_80", "REFlash"]
 # Configs for Graph C2 (QLC writes bar) - ordered for comparison
-GRAPH_C2_CONFIGS = ["OpenCAS", "CSAL", "CSAL+GC", "SepBIT", "REFlash_80", "REFlash"]
+GRAPH_C2_CONFIGS = ["OpenCAS", "CSAL", "Greedy", "SepBIT", "REFlash_80", "REFlash"]
 # Configs for Graph G (throughput)
-GRAPH_G_CONFIGS = ["OpenCAS", "CSAL", "CSAL+GC", "SepBIT", "REFlash_80", "REFlash"]
+GRAPH_G_CONFIGS = ["OpenCAS", "CSAL", "Greedy", "SepBIT", "REFlash_80", "REFlash"]
 # Configs for Graph H (valid block rate) - must have valid_blocks column and cache_size_gb
 GRAPH_H_CONFIGS = ["SepBIT",  "REFlash_80", "REFlash", "CSAL", "OpenCAS"]
 

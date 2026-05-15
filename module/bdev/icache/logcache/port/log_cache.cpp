@@ -33,7 +33,8 @@ LogCache::LogCache(uint64_t              cold_capacity,
              double input_additional_free_blks_ratio_by_gc,
              bool input_ghost_cache,
              std::string stat_log_file,
-             CacheDeviceInterface *device_io
+             CacheDeviceInterface *device_io,
+             double input_util_step
              )
     : ICache(cold_capacity, waf_log_file, stat_log_file),
       cache_block_size(blk_sz),
@@ -44,6 +45,7 @@ LogCache::LogCache(uint64_t              cold_capacity,
       valid_blk_rate_hard_limit(0.93),
       compactor(std::move(cp)),
       additional_free_blks_ratio_by_gc(input_additional_free_blks_ratio_by_gc),
+      util_step_(input_util_step),
       evicted_ages_with_segment_histogram(std::make_unique<Histogram>("evicted_ages_with_segment", cache_block_count * 2 / HISTOGRAM_BUCKETS, HISTOGRAM_BUCKETS * 2, fp_stats)),
       compacted_ages_with_segment_histogram(std::make_unique<Histogram>("compacted_ages_with_segment", cache_block_count * 2 / HISTOGRAM_BUCKETS, HISTOGRAM_BUCKETS * 2, fp_stats)),
       gc_copied_lifetime_histogram(std::make_unique<Histogram>("gc_copied_lifetime", cache_block_count * 2 / HISTOGRAM_BUCKETS, HISTOGRAM_BUCKETS * 2, fp_stats)),
@@ -55,11 +57,13 @@ LogCache::LogCache(uint64_t              cold_capacity,
       ghost_compaction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       ghost_eviction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       ghost_reuse_ewma(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      compaction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      eviction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
 #if NETFREE_TCO_ENABLED
       netfree_a_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       netfree_b_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
 #endif
-      ghost_cache(cache_block_count * GHOST_CACHE_RATIO),
+      ghost_cache(cache_block_count * util_step_),
       device_io_(device_io)
 {
     // For striping: segment_bytes = zone_capacity * stripe_width
@@ -86,13 +90,15 @@ LogCache::LogCache(uint64_t              cold_capacity,
     SPDK_NOTICELOG("LogCache init: segment_size_blocks=%zu, total_zones=%zu, total_segments=%zu\n",
            segment_size_blocks, total_zones, total_segments);
 
-    // Re-initialize EWMA ratios with segment_size_blocks (instead of hardcoded DEFAULT_HALF_LIFE_IN_BLOCKS)
-    compaction_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
-    eviction_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
-    evict_cost_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
-    ghost_compaction_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
-    ghost_eviction_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
-    ghost_reuse_ewma = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
+    // GS_SUM doc spec: EWMA half-life = 1 segment of host writes (= GS_HALF_LIFE_IN_BLOCKS).
+    compaction_ratio = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    eviction_ratio = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    evict_cost_ratio = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    ghost_compaction_ratio = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    ghost_eviction_ratio = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    ghost_reuse_ewma = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    compaction_ratio_in_ghost_cache = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    eviction_ratio_in_ghost_cache = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
 #if NETFREE_TCO_ENABLED
     netfree_a_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
     netfree_b_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
@@ -313,64 +319,79 @@ void LogCache::periodic() {
                 "Block timestamps will be corrupted.\n", log_cache_timestamp);
         abort();
     }
-#if 1 // old ghost cache logic
-    if (is_ghost_cache){
-        if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
-            // Per host-write ratios
-            compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
-            eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
-            // Per freed-block ratios (monitoring)
-            gc_cost_ratio.updateFromCumulative(gc_freed_blocks, compacted_blocks);
-            evict_cost_ratio.updateFromCumulative(evict_freed_blocks, evicted_blocks);
-            // Ghost: eviction rate if cache were GHOST_CACHE_RATIO larger
-            uint64_t ghost_evicted = ghost_cache.evictCount();
-            ghost_eviction_ratio.updateFromCumulative(log_cache_timestamp, ghost_evicted);
-            ghost_compaction_ratio.updateFromCumulative(log_cache_timestamp, ghost_compacted_blocks);
-            // Ghost reuse rate: d(accessHit) / d(push)
-            if (ghost_cache.pushCount() > 0) {
-                ghost_reuse_ewma.updateFromCumulative(ghost_cache.pushCount(), ghost_cache.accessHitCount());
-            }
-        }
-        if (log_cache_timestamp % (segment_size_blocks * 8) == 0) {
-            if (compaction_ratio.has_value() &&
-                eviction_ratio.has_value() &&
-                ghost_eviction_ratio.has_value()) {
-                double ghost_reuse_rate = ghost_reuse_ewma.has_value() ? ghost_reuse_ewma.value() : 0.0;
-                double evict_cost_factor = QLC_TLC_COST_RATIO;
-                // GC cost per host write (TLC rewrites)
-                double gc_cost = compaction_ratio.value();
-                // Eviction savings from having more cache (per host write)
-                double evict_savings = (eviction_ratio.value() - ghost_eviction_ratio.value()) * evict_cost_factor;
-                double current_valid_rate = (double)global_valid_blocks / total_cache_block_count;
 
-                const char *decision;
-                if (evict_savings > gc_cost) {
-                    // GC saves more than it costs → RAISE
-                    target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, current_valid_rate + 0.1);
-                    decision = "RAISE";
-                } else {
-                    // GC costs more than it saves → LOWER
-                    target_valid_blk_rate = std::max(0.0, current_valid_rate - 0.1);
-                    decision = "LOWER";
-                }
-                SPDK_NOTICELOG("periodic: %s target=%.4f, gc_cost=%.6f, evict_savings=%.6f, "
-                               "compact_ratio=%.6f, evict_ratio=%.6f, ghost_evict_ratio=%.6f, "
-                               "ghost_reuse=%.4f, evict_cost_factor=%.4f, "
-                               "gc_cost_ratio=%.6f, evict_cost_ratio=%.6f, "
-                               "evicted=%lu, evict_freed=%lu, compacted=%lu, gc_freed=%lu, "
-                               "ghost_evicted=%lu, ghost_compacted=%lu\n",
-                               decision, target_valid_blk_rate, gc_cost, evict_savings,
-                               compaction_ratio.value(), eviction_ratio.value(),
-                               ghost_eviction_ratio.value(),
-                               ghost_reuse_rate, evict_cost_factor,
-                               gc_cost_ratio.has_value() ? gc_cost_ratio.value() : -1.0,
-                               evict_cost_ratio.has_value() ? evict_cost_ratio.value() : -1.0,
-                               evicted_blocks, evict_freed_blocks, compacted_blocks, gc_freed_blocks,
-                               (uint64_t)ghost_cache.evictCount(), ghost_compacted_blocks);
-            }
+    switch (periodic_mode_) {
+    case PeriodicMode::GhostDelta_GC:
+        periodic_ghost_delta_gc();
+        break;
+    case PeriodicMode::NetFree_TCO:
+        periodic_netfree_tco();
+        break;
+    case PeriodicMode::GhostDelta_GC_SUM:
+        periodic_ghost_delta_gc_sum();
+        break;
+    }
+}
+
+void LogCache::periodic_ghost_delta_gc() {
+    if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
+        // Per host-write ratios
+        compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
+        eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
+        // Per freed-block ratios (monitoring)
+        gc_cost_ratio.updateFromCumulative(gc_freed_blocks, compacted_blocks);
+        evict_cost_ratio.updateFromCumulative(evict_freed_blocks, evicted_blocks);
+        // Ghost: eviction rate if cache were util_step_ larger
+        uint64_t ghost_evicted = ghost_cache.evictCount();
+        ghost_eviction_ratio.updateFromCumulative(log_cache_timestamp, ghost_evicted);
+        ghost_compaction_ratio.updateFromCumulative(log_cache_timestamp, ghost_compacted_blocks);
+        // Ghost reuse rate: d(accessHit) / d(push)
+        if (ghost_cache.pushCount() > 0) {
+            ghost_reuse_ewma.updateFromCumulative(ghost_cache.pushCount(), ghost_cache.accessHitCount());
         }
     }
-#elif NETFREE_TCO_ENABLED
+    if (log_cache_timestamp % (segment_size_blocks * kGsDecisionPeriodSegs) == 0) {
+        if (compaction_ratio.has_value() &&
+            eviction_ratio.has_value() &&
+            ghost_eviction_ratio.has_value()) {
+            double ghost_reuse_rate = ghost_reuse_ewma.has_value() ? ghost_reuse_ewma.value() : 0.0;
+            double evict_cost_factor = QLC_TLC_COST_RATIO;
+            // GC cost per host write (TLC rewrites)
+            double gc_cost = compaction_ratio.value();
+            // Eviction savings from having more cache (per host write)
+            double evict_savings = (eviction_ratio.value() - ghost_eviction_ratio.value()) * evict_cost_factor;
+            double current_valid_rate = (double)global_valid_blocks / total_cache_block_count;
+
+            const char *decision;
+            if (evict_savings > gc_cost) {
+                // GC saves more than it costs → RAISE
+                target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, current_valid_rate + 0.1);
+                decision = "RAISE";
+            } else {
+                // GC costs more than it saves → LOWER
+                target_valid_blk_rate = std::max(0.0, current_valid_rate - 0.1);
+                decision = "LOWER";
+            }
+            SPDK_NOTICELOG("periodic: %s target=%.4f, gc_cost=%.6f, evict_savings=%.6f, "
+                           "compact_ratio=%.6f, evict_ratio=%.6f, ghost_evict_ratio=%.6f, "
+                           "ghost_reuse=%.4f, evict_cost_factor=%.4f, "
+                           "gc_cost_ratio=%.6f, evict_cost_ratio=%.6f, "
+                           "evicted=%lu, evict_freed=%lu, compacted=%lu, gc_freed=%lu, "
+                           "ghost_evicted=%lu, ghost_compacted=%lu\n",
+                           decision, target_valid_blk_rate, gc_cost, evict_savings,
+                           compaction_ratio.value(), eviction_ratio.value(),
+                           ghost_eviction_ratio.value(),
+                           ghost_reuse_rate, evict_cost_factor,
+                           gc_cost_ratio.has_value() ? gc_cost_ratio.value() : -1.0,
+                           evict_cost_ratio.has_value() ? evict_cost_ratio.value() : -1.0,
+                           evicted_blocks, evict_freed_blocks, compacted_blocks, gc_freed_blocks,
+                           (uint64_t)ghost_cache.evictCount(), ghost_compacted_blocks);
+        }
+    }
+}
+
+void LogCache::periodic_netfree_tco() {
+#if NETFREE_TCO_ENABLED
     if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
         // A = net free segments from GC
         uint64_t A = (gc_victim_count_ > gc_active_alloc_count_)
@@ -388,7 +409,7 @@ void LogCache::periodic() {
         netfree_b_ratio.updateFromCumulative(log_cache_timestamp, cumulative_B_);
     }
 
-    if (log_cache_timestamp % (segment_size_blocks * 8) == 0) {
+    if (log_cache_timestamp % (segment_size_blocks * kGsDecisionPeriodSegs) == 0) {
         if (netfree_a_ratio.has_value() && netfree_b_ratio.has_value()) {
             double a = netfree_a_ratio.value();
             double b = netfree_b_ratio.value();
@@ -411,6 +432,61 @@ void LogCache::periodic() {
         }
     }
 #endif
+}
+
+void LogCache::periodic_ghost_delta_gc_sum() {
+    // GhostDelta_GC variant: estimate G(u+θ) via cumulative CB-sorted scan.
+    //   m = min { k : Σ_{i<k} (seg - v_i) ≥ θ · N · seg }
+    //   G(u+θ) cost rate per host write ≈ Σ v_i / Σ (seg-v_i) = u_avg/(1-u_avg)
+    // Advance a synthetic ghost_compacted_blocks_sum_ counter at that rate
+    // (done in prepare_gc on real compactions); here we just
+    // feed cumulative counters into EwmaRatio for rate extraction.
+
+    if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
+        compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
+        compaction_ratio_in_ghost_cache.updateFromCumulative(
+            log_cache_timestamp,
+            static_cast<uint64_t>(ghost_compacted_blocks_sum_));
+        eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
+        uint64_t evicted_in_ghost = ghost_cache.evictCount();
+        eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
+    }
+    if (log_cache_timestamp % (segment_size_blocks * kGsDecisionPeriodSegs) == 0) {
+        if (compaction_ratio.has_value() &&
+            compaction_ratio_in_ghost_cache.has_value() &&
+            eviction_ratio.has_value() &&
+            eviction_ratio_in_ghost_cache.has_value()) {
+            double current_valid_rate = (double)global_valid_blocks / total_cache_block_count;
+            const char *decision;
+            // r · Δflush · backend_waf  vs  Δcomp · fdp_waf
+            double delta_flush = eviction_ratio.value() - eviction_ratio_in_ghost_cache.value();
+            double delta_comp  = compaction_ratio_in_ghost_cache.value() - compaction_ratio.value();
+            double flush_cost = periodic_ratio_ * delta_flush * backend_waf_;
+            double comp_cost  = delta_comp * fdp_waf_;
+            if (flush_cost > comp_cost) {
+                target_valid_blk_rate = std::min(
+                    valid_blk_rate_hard_limit,
+                    current_valid_rate + util_step_);
+                decision = "RAISE";
+            } else {
+                target_valid_blk_rate = std::max(
+                    0.0,
+                    current_valid_rate - util_step_);
+                decision = "LOWER";
+            }
+            SPDK_NOTICELOG("periodic_gs: %s target=%.4f, flush_cost=%.6f, comp_cost=%.6f, "
+                           "fdp_waf=%.3f, backend_waf=%.3f, "
+                           "comp=%.6f, ghost_comp=%.6f, "
+                           "evict=%.6f, ghost_evict=%.6f, ghost_comp_sum=%.1f\n",
+                           decision, target_valid_blk_rate, flush_cost, comp_cost,
+                           fdp_waf_, backend_waf_,
+                           compaction_ratio.value(),
+                           compaction_ratio_in_ghost_cache.value(),
+                           eviction_ratio.value(),
+                           eviction_ratio_in_ghost_cache.value(),
+                           ghost_compacted_blocks_sum_);
+        }
+    }
 }
 
 void LogCache::batch_insert(int stream_id,
@@ -1350,15 +1426,56 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
                 compactor->add(victim, log_cache_timestamp);
                 return false;
             }
-            // Ghost compaction estimate: cost of GC if cache were GHOST_CACHE_RATIO larger
-            double g_u = ghost_reuse_ewma.has_value()
-                         ? ghost_reuse_ewma.value()
-                         : ghost_cache.utilization();
-            if (g_u > 0.0) {
-                double m = GHOST_CACHE_RATIO * total_cache_block_count / g_u / segment_size_blocks;
-                uint64_t valid_cost = compactor->get_kth_segment_valid_cnt_for_free_segments(m);
-                ghost_compacted_blocks += valid_cost;
-                ghost_gc_freed_blocks += (segment_size_blocks - valid_cost);
+            // Ghost compaction estimate: cost of GC if cache were util_step_ larger
+            if (periodic_mode_ == PeriodicMode::GhostDelta_GC) {
+                double g_u = ghost_reuse_ewma.has_value()
+                             ? ghost_reuse_ewma.value()
+                             : ghost_cache.utilization();
+                if (g_u > 0.0) {
+                    double m = util_step_ * total_cache_block_count / g_u / segment_size_blocks;
+                    uint64_t valid_cost = compactor->get_kth_segment_valid_cnt_for_free_segments(m);
+                    ghost_compacted_blocks += valid_cost;
+                    ghost_gc_freed_blocks += (segment_size_blocks - valid_cost);
+                }
+            }
+
+            // GS variant: ghost_compacted_blocks_sum_ advances at the
+            // θ-regime rate u_avg/(1-u_avg), but ONLY at real compaction
+            // events. No real comp → no ghost tick → Δcomp = 0.
+            if (periodic_mode_ == PeriodicMode::GhostDelta_GC_SUM) {
+                double inv_corr = 1.0;
+                if (ghost_sum_initialized_ && log_cache_timestamp > last_ghost_sum_ts_) {
+                    const uint64_t win_writes = log_cache_timestamp - last_ghost_sum_ts_;
+                    const uint64_t win_inv    = (invalidate_blocks > last_invalidate_at_comp_)
+                                              ? (invalidate_blocks - last_invalidate_at_comp_)
+                                              : 0;
+                    const double i_rate = std::min(0.95,
+                        static_cast<double>(win_inv) / static_cast<double>(win_writes));
+                    const double theta_i = util_step_ * i_rate;
+                    inv_corr = 1.0 / (1.0 - std::min(0.95, theta_i));
+                }
+                const double target_free_segs = util_step_ *
+                    static_cast<double>(total_segments) * inv_corr;
+                auto s = compactor->get_ghost_sum_for_free_segments(target_free_segs);
+                if (s.cum_invalid > 0.0) {
+                    if (ghost_sum_initialized_) {
+                        const double rate = s.cum_valid / s.cum_invalid;
+                        const uint64_t dt = (log_cache_timestamp > last_ghost_sum_ts_)
+                                          ? (log_cache_timestamp - last_ghost_sum_ts_)
+                                          : 0;
+                        // Anchor to compacted_blocks each tick (per doc §6.1).
+                        ghost_compacted_blocks_sum_ =
+                            static_cast<double>(compacted_blocks)
+                            + static_cast<double>(dt) * rate;
+                    } else {
+                        // First real comp: anchor base, dt=0 to avoid spike.
+                        ghost_compacted_blocks_sum_ =
+                            static_cast<double>(compacted_blocks);
+                        ghost_sum_initialized_ = true;
+                    }
+                    last_ghost_sum_ts_       = log_cache_timestamp;
+                    last_invalidate_at_comp_ = invalidate_blocks;
+                }
             }
             if (!victim) {
                 return false;

@@ -51,6 +51,18 @@ public:
      * k = min(k | sum(i=1..k) (1 - U_i) >= m), return k번째 segment의 valid_cnt */
     virtual uint64_t get_kth_segment_valid_cnt_for_free_segments(double m) const { return 0; }
 
+    /* Cumulative CB-scan: scan score-order until reclaimed free space
+     * reaches target_free_segments. Returns cumulative valid/invalid pages
+     * and segment count visited. Used by GhostDelta_GC_SUM. */
+    struct GhostSumResult {
+        double cum_valid   = 0.0;
+        double cum_invalid = 0.0;
+        double m           = 0.0;
+    };
+    virtual GhostSumResult get_ghost_sum_for_free_segments(double target_free_segments) const {
+        return {};
+    }
+
     /* Get current segment count in the policy */
     virtual size_t segment_count() const { return 0; }
 

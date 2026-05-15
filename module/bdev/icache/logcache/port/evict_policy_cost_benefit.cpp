@@ -99,3 +99,32 @@ uint64_t CbEvictPolicy::get_kth_segment_valid_cnt_for_free_segments(double m) co
 
     return last_valid_cnt;
 }
+
+EvictPolicy::GhostSumResult
+CbEvictPolicy::get_ghost_sum_for_free_segments(double target_free_segments) const
+{
+    GhostSumResult r;
+    if (target_free_segments <= 0.0 || heap_.empty()) return r;
+
+    double free_sum = 0.0;
+    for (auto it = heap_.ordered_begin(); it != heap_.ordered_end(); ++it) {
+        const uint64_t v   = it->seg->valid_cnt;
+        const uint64_t inv = (pages_in_segment > v) ? (pages_in_segment - v) : 0;
+        const double inv_frac = static_cast<double>(inv) / static_cast<double>(pages_in_segment);
+        if (free_sum + inv_frac >= target_free_segments) {
+            const double need = target_free_segments - free_sum;
+            const double frac = (inv > 0)
+                              ? (need * static_cast<double>(pages_in_segment) / static_cast<double>(inv))
+                              : 0.0;
+            r.cum_valid   += static_cast<double>(v)   * frac;
+            r.cum_invalid += static_cast<double>(inv) * frac;
+            r.m           += frac;
+            break;
+        }
+        free_sum      += inv_frac;
+        r.cum_valid   += static_cast<double>(v);
+        r.cum_invalid += static_cast<double>(inv);
+        r.m           += 1.0;
+    }
+    return r;
+}

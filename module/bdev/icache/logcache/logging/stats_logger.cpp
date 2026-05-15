@@ -30,6 +30,10 @@ StatsLogger::~StatsLogger()
         spdk_dma_free(log_page_buf_);
         log_page_buf_ = nullptr;
     }
+    if (backend_log_page_buf_) {
+        spdk_dma_free(backend_log_page_buf_);
+        backend_log_page_buf_ = nullptr;
+    }
 }
 
 void StatsLogger::set_nvme_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
@@ -46,6 +50,23 @@ void StatsLogger::set_nvme_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
                            sizeof(NvmeFdpStatsLog));
         } else {
             SPDK_WARNLOG("StatsLogger: failed to allocate log page buffer, NVMe FDP stats disabled\n");
+        }
+    }
+}
+
+void StatsLogger::set_backend_nvme_ctrlr(struct spdk_nvme_ctrlr *ctrlr)
+{
+    backend_nvme_ctrlr_ = ctrlr;
+    SPDK_NOTICELOG("StatsLogger: set_backend_nvme_ctrlr called with ctrlr=%p\n", ctrlr);
+
+    if (ctrlr && !backend_log_page_buf_) {
+        backend_log_page_buf_ = static_cast<VendorLogPage0xC0*>(
+            spdk_dma_zmalloc(sizeof(VendorLogPage0xC0), 4096, nullptr));
+        if (backend_log_page_buf_) {
+            SPDK_NOTICELOG("StatsLogger: allocated backend vendor log page buffer (%zu bytes)\n",
+                           sizeof(VendorLogPage0xC0));
+        } else {
+            SPDK_WARNLOG("StatsLogger: failed to allocate backend log page buffer\n");
         }
     }
 }
@@ -95,7 +116,9 @@ bool StatsLogger::start()
     fprintf(log_fp_, "time_sec,host_write_MB,cache_write_MB,backend_write_MB,gc_write_MB,"
                      "host_write_delta_MB,cache_write_delta_MB,backend_write_delta_MB,gc_write_delta_MB,"
                      "nvme_host_written_MB,nvme_media_written_MB,nvme_host_delta_MB,nvme_media_delta_MB,"
-                     "cache_read_MB,backend_read_MB,valid_blocks,write_hit_count,gc_victim_blocks,evict_victim_blocks,"
+                     "backend_nand_written_MB,backend_nand_delta_MB,"
+                     "cache_read_MB,backend_read_MB,fdp_waf,backend_waf,"
+                     "valid_blocks,write_hit_count,gc_victim_blocks,evict_victim_blocks,"
                      "gc_count,evict_count,flush_count,gc_segments_allocated\n");
     fflush(log_fp_);
 
@@ -147,9 +170,14 @@ int StatsLogger::poller_fn(void *arg)
     if (self->nvme_ctrlr_) {
         spdk_nvme_ctrlr_process_admin_completions(self->nvme_ctrlr_);
     }
+    // Process backend admin completions (separate controller)
+    if (self->backend_nvme_ctrlr_ && self->backend_nvme_ctrlr_ != self->nvme_ctrlr_) {
+        spdk_nvme_ctrlr_process_admin_completions(self->backend_nvme_ctrlr_);
+    }
 
-    // Try to read NVMe log page (async)
+    // Try to read NVMe log pages (async)
     self->read_nvme_log_page();
+    self->read_backend_log_page();
 
     // Log current stats
     self->log_stats();
@@ -183,6 +211,11 @@ void StatsLogger::log_page_done(void *cb_arg, const struct spdk_nvme_cpl *cpl)
     uint64_t hbmw_lo, mbmw_lo;
     memcpy(&hbmw_lo, self->log_page_buf_->hbmw, sizeof(uint64_t));
     memcpy(&mbmw_lo, self->log_page_buf_->mbmw, sizeof(uint64_t));
+    // Initialize prev on first successful read to avoid huge bogus delta
+    if (self->nvme_host_written_ == 0 && hbmw_lo != 0) {
+        self->prev_nvme_host_written_ = hbmw_lo;
+        self->prev_nvme_media_written_ = mbmw_lo;
+    }
     self->nvme_host_written_ = hbmw_lo;
     self->nvme_media_written_ = mbmw_lo;
 }
@@ -220,6 +253,51 @@ void StatsLogger::read_nvme_log_page()
     }
 }
 
+void StatsLogger::backend_log_page_done(void *cb_arg, const struct spdk_nvme_cpl *cpl)
+{
+    auto *self = static_cast<StatsLogger*>(cb_arg);
+    self->backend_log_page_pending_ = false;
+
+    if (spdk_nvme_cpl_is_error(cpl)) {
+        SPDK_WARNLOG("StatsLogger: backend vendor log page 0xC0 read failed, sct=%d sc=%d\n",
+                     cpl->status.sct, cpl->status.sc);
+        return;
+    }
+
+    // Extract bytes 24-31 (uint64_t little-endian) = NAND writes in SMART units
+    uint64_t nand_units = 0;
+    memcpy(&nand_units, &self->backend_log_page_buf_->data[24], sizeof(uint64_t));
+    // Convert SMART units to bytes: 1 unit = 512,000 bytes
+    uint64_t new_val = nand_units * 512000ULL;
+    // Initialize prev on first successful read to avoid huge bogus delta
+    if (self->backend_nand_written_ == 0 && new_val != 0) {
+        self->prev_backend_nand_written_ = new_val;
+    }
+    self->backend_nand_written_ = new_val;
+}
+
+void StatsLogger::read_backend_log_page()
+{
+    if (!backend_nvme_ctrlr_ || !backend_log_page_buf_ || backend_log_page_pending_) {
+        return;
+    }
+
+    // Read vendor-specific log page 0xC0 from backend controller
+    int rc = spdk_nvme_ctrlr_cmd_get_log_page(
+        backend_nvme_ctrlr_,
+        0xC0,                              // Log Page ID
+        SPDK_NVME_GLOBAL_NS_TAG,           // nsid
+        backend_log_page_buf_,
+        sizeof(VendorLogPage0xC0),
+        0,                                 // offset
+        backend_log_page_done,
+        this);
+
+    if (rc == 0) {
+        backend_log_page_pending_ = true;
+    }
+}
+
 void StatsLogger::log_stats()
 {
     if (!log_fp_) {
@@ -252,6 +330,42 @@ void StatsLogger::log_stats()
     uint64_t nvme_host_delta = nvme_host_written_ - prev_nvme_host_written_;
     uint64_t nvme_media_delta = nvme_media_written_ - prev_nvme_media_written_;
 
+    // Backend NAND writes delta
+    uint64_t backend_nand_delta = backend_nand_written_ - prev_backend_nand_written_;
+
+    // Compute WAF as cumulative average from the point where both writes became non-zero
+    // FDP WAF = (MBMW - start_MBMW) / (HBMW - start_HBMW)
+    if (!waf_fdp_started_) {
+        if (nvme_host_written_ > 0 && nvme_media_written_ > 0) {
+            waf_start_nvme_host_ = nvme_host_written_;
+            waf_start_nvme_media_ = nvme_media_written_;
+            waf_fdp_started_ = true;
+        }
+        // until started, keep fdp_waf_ at initial 1.0
+    } else {
+        uint64_t d_host = nvme_host_written_ - waf_start_nvme_host_;
+        uint64_t d_media = nvme_media_written_ - waf_start_nvme_media_;
+        if (d_host > 0) {
+            fdp_waf_ = static_cast<double>(d_media) / static_cast<double>(d_host);
+        }
+    }
+    // Backend WAF = (nand - start_nand) / (backend_write - start_backend_write)
+    uint64_t backend_write_now = stats_.backend_write_bytes.load(std::memory_order_relaxed);
+    if (!waf_backend_started_) {
+        if (backend_nand_written_ > 0 && backend_write_now > 0) {
+            waf_start_backend_nand_ = backend_nand_written_;
+            waf_start_backend_write_ = backend_write_now;
+            waf_backend_started_ = true;
+        }
+        // until started, keep backend_waf_ at initial 1.0
+    } else {
+        uint64_t d_nand = backend_nand_written_ - waf_start_backend_nand_;
+        uint64_t d_host = backend_write_now - waf_start_backend_write_;
+        if (d_host > 0) {
+            backend_waf_ = static_cast<double>(d_nand) / static_cast<double>(d_host);
+        }
+    }
+
     // Update previous values
     prev_host_write_ = host_write;
     prev_cache_write_ = cache_write;
@@ -261,6 +375,7 @@ void StatsLogger::log_stats()
     prev_backend_read_ = backend_read;
     prev_nvme_host_written_ = nvme_host_written_;
     prev_nvme_media_written_ = nvme_media_written_;
+    prev_backend_nand_written_ = backend_nand_written_;
 
     // Calculate elapsed time
     uint64_t now_us = spdk_get_ticks() * 1000000 / spdk_get_ticks_hz();
@@ -271,7 +386,7 @@ void StatsLogger::log_stats()
 
     // Write log line
     // FDP stats (hbmw, mbmw) are already in bytes, just convert to MB
-    fprintf(log_fp_, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+    fprintf(log_fp_, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
             elapsed_sec,
             host_write / MB,
             cache_write / MB,
@@ -285,8 +400,12 @@ void StatsLogger::log_stats()
             nvme_media_written_ / MB,
             nvme_host_delta / MB,
             nvme_media_delta / MB,
+            backend_nand_written_ / MB,
+            backend_nand_delta / MB,
             cache_read / MB,
             backend_read / MB,
+            fdp_waf_,
+            backend_waf_,
             valid_blocks,
             write_hit_count,
             gc_victim_blocks,

@@ -53,6 +53,12 @@ static constexpr size_t LOW_FREE_SEGMENTS = 10;       // Trigger GC if <= this
 #define GHOST_CACHE 1
 #define NETFREE_TCO_ENABLED 0
 
+enum class PeriodicMode {
+    GhostDelta_GC,          // 기존 ghost cache boundary-segment 방식
+    NetFree_TCO,            // net-free TCO 방식
+    GhostDelta_GC_SUM,      // G(u+θ) via cumulative CB-sorted scan
+};
+
 class LogCache final : public ICache
 {
 public:
@@ -128,7 +134,8 @@ public:
              double max_age_ratio_by_gc = 0.0,
              bool input_ghost_cache = false,
              std::string stat_log_file = "",
-             CacheDeviceInterface *device_io = nullptr
+             CacheDeviceInterface *device_io = nullptr,
+             double input_util_step = 0.02
             );
 
     ~LogCache();
@@ -201,6 +208,12 @@ public:
     // Number of host streams (for dynamic GC PH base offset)
     int getNumHostStreams() const { return stream_policy ? stream_policy->getNumHostStreams() : 2; }
 
+    // Periodic policy selection
+    void setPeriodicMode(PeriodicMode mode) { periodic_mode_ = mode; }
+    void setPeriodicRatio(double r) { periodic_ratio_ = r; }
+    void setFdpWaf(double waf) { fdp_waf_ = waf; }
+    void setBackendWaf(double waf) { backend_waf_ = waf; }
+
     // Stats getters for StatsLogger
     uint64_t get_valid_blocks() const { return global_valid_blocks; }
     uint64_t get_write_hit_count() const { return write_hit_size; }
@@ -240,6 +253,9 @@ private:
     LogCacheSegment* get_segment_to_active_stream(bool gc, int stream, bool check_only = false);
     LogCacheSegment* get_segment_with_stream_policy(bool gc, uint64_t key, bool check_only = false);
     void periodic();
+    void periodic_ghost_delta_gc();
+    void periodic_netfree_tco();
+    void periodic_ghost_delta_gc_sum();
 
     /* trace(optional) *****************************************************/
     bool  cache_trace_;
@@ -272,8 +288,10 @@ private:
     std::unique_ptr<Histogram> gc_copied_lifetime_histogram;
     static const int HISTOGRAM_BUCKETS = 40;
     static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = (262144 * 6) * 4;
-    static constexpr double GHOST_CACHE_RATIO = 0.1;  // 5% of cache size
-    static constexpr double QLC_TLC_COST_RATIO = 2.88 * 3;//(2.88 * 1); // QLC write cost / TLC write cost
+    static const uint64_t GS_HALF_LIFE_IN_BLOCKS = 1572864;  // = 1 segment (6GB / 4KB) for GS_SUM EWMA
+    static constexpr int kGsDecisionPeriodSegs = 2;  // GS hill-climb period in segments
+    static constexpr double GHOST_CACHE_RATIO = 0.1;  // default, overridden by util_step_ at runtime
+    static constexpr double QLC_TLC_COST_RATIO = 8.64;//(2.88 * 1); // QLC write cost / TLC write cost
     bool is_ghost_cache = false;
     uint64_t bypass_blocks_threshold = 128; // 128* 4k bytes = 512K bytes
     EwmaRatio compaction_ratio;
@@ -286,6 +304,23 @@ private:
     EwmaRatio ghost_reuse_ewma;          // d(accessHit) / d(push), reuse rate of evicted blocks
     uint64_t ghost_compacted_blocks = 0;
     uint64_t ghost_gc_freed_blocks = 0;
+    PeriodicMode periodic_mode_ = PeriodicMode::GhostDelta_GC;
+    double   util_step_  = 0.02;     // θ: hill-climb increment
+    double   periodic_ratio_ = 1.0;  // r: flush-vs-compact weight
+    double   fdp_waf_ = 1.0;        // cache SSD WAF from FDP (MBMW/HBMW)
+    double   backend_waf_ = 1.0;    // backend SSD WAF from vendor log 0xC0
+
+    // GhostDelta_GC_SUM state
+    double   ghost_compacted_blocks_sum_ = 0.0;
+    uint64_t last_ghost_sum_ts_          = 0;
+    bool     ghost_sum_initialized_      = false;
+    uint64_t last_invalidate_at_comp_    = 0;
+
+    // GhostDelta_GC_SUM uses these from GhostDelta_GC:
+    // compaction_ratio, eviction_ratio (already exist)
+    // Plus separate ghost-cache cumulative ratios:
+    EwmaRatio compaction_ratio_in_ghost_cache;
+    EwmaRatio eviction_ratio_in_ghost_cache;
 #if NETFREE_TCO_ENABLED
     uint64_t gc_victim_count_ = 0;           // cumulative GC victim segments
     uint64_t gc_active_alloc_count_ = 0;     // cumulative GC new segment allocations
