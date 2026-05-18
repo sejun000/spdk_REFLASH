@@ -660,7 +660,7 @@ def plot_graph_d():
         print("Graph D: No workloads with data, skipping.")
         return
 
-    fig, axes = plt.subplots(1, n_multipliers, figsize=(14 * n_multipliers, 4))
+    fig, axes = plt.subplots(1, n_multipliers, figsize=(14 * n_multipliers, 8))
     if n_multipliers == 1:
         axes = [axes]
 
@@ -722,7 +722,18 @@ def plot_graph_d():
         for workload in active_workloads:
             base_costs[workload] = raw_costs.get((NORMALIZATION_BASE, workload), 1.0)
 
-        y_max = 2.5
+        # First pass: compute all normalized vals so we can pick a tight y_max
+        all_vals_for_ymax = []
+        for config_name in all_labels:
+            for workload in active_workloads:
+                raw = raw_costs.get((config_name, workload), 0)
+                base = base_costs[workload]
+                v = raw / base if base > 0 else 0
+                if v > 0:
+                    all_vals_for_ymax.append(v)
+        max_v = max(all_vals_for_ymax) if all_vals_for_ymax else 1.0
+        y_max = max(1.2, max_v * 1.15)
+
         overflow_annotations = {}  # bi -> list of (x_pos, value)
         for i, config_name in enumerate(all_labels):
             vals = []
@@ -735,6 +746,12 @@ def plot_graph_d():
             bars = ax.bar(x + offset, vals, width, label=display_name(config_name),
                           color=CONFIG_COLORS.get(config_name, "#333333"),
                           edgecolor='black', linewidth=1.5)
+            # Small per-bar value labels above each bar
+            for bi, v in enumerate(vals):
+                if v > 0 and v <= y_max:
+                    ax.annotate(f'{v:.2f}', xy=(x[bi] + offset, v),
+                                xytext=(0, 2), textcoords="offset points",
+                                ha='center', va='bottom', fontsize=10, rotation=90)
             # Collect bars that exceed y_max
             for bi, v in enumerate(vals):
                 if v > y_max:
@@ -751,15 +768,17 @@ def plot_graph_d():
                             ha='center', va='bottom', fontsize=21, fontweight='bold')
 
 
-        ax.axhline(y=1.0, color=CONFIG_COLORS["NearOpt"], linestyle='--',
-                   linewidth=2.5, label='NearOpt' if mi == 0 else None)
+        # Draw a horizontal reference line at y=1.0 only when NearOpt is the base.
+        if NORMALIZATION_BASE == "NearOpt":
+            ax.axhline(y=1.0, color=CONFIG_COLORS["NearOpt"], linestyle='--',
+                       linewidth=2.5, label='NearOpt' if mi == 0 else None)
 
         if mi == 0:
             ax.set_ylabel("Normalized TEC")
         ax.set_xticks(x)
         ax.set_xticklabels(active_workloads)
         ax.grid(True, axis='y')
-        ax.set_ylim(bottom=0, top=2.5)
+        ax.set_ylim(bottom=0, top=y_max)
         # Title below subplot
         ax.set_xlabel(f"({labels_abc[mi]}) r={multiplier}")
 

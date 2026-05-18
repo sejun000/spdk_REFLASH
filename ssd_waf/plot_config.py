@@ -132,100 +132,115 @@ CONFIGS = {
             "cache_size_gb": 1880,
         },
     },
-    # REFlash: list format - each workload has a list of run configs (multiple csv/stat_log/replay_trace)
+    # REFlash: list format - each workload has a list of run configs
+    # Index [0] -> r=8.64 (REFLASH_R864), index [1] -> r=2.88 (REFLASH_R288)
+    # NEW (Phase 1+2 GS_SUM port). Old entries below kept as "# old:" comments.
+    # YCSB/Varmail/FIO R288 runs not finished yet -> list has only [0] (r=2.88 subplot skipped for these).
     "REFlash": {
         "Alibaba1": [
-            {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260227_141502.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260227_141500"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_20260227_142612.replay"),
+            # old: LOG_GREEDY_COST_BENEFIT_10_20260227_141502.csv (r=8.64)
+            {  # r=8.64 (NEW)
+                "csv": os.path.join(LOGGING_DIR, "REFLASH_R864_20260516_095455.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260516_095453"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_alibaba_dwpd2_5x_20260516_100605.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
-            {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260303_230256.ali2.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260226_033136"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_20260226_034248.replay"),
+            # old: LOG_GREEDY_COST_BENEFIT_10_20260303_230256.ali2.csv (r=2.88)
+            {  # r=2.88 (NEW)
+                "csv": os.path.join(LOGGING_DIR, "REFLASH_R288_20260516_134016.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260516_134014"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_alibaba_dwpd2_5x_20260516_135126.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
         ],
         "Alibaba2": [
-            {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260226_033138.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260226_033136"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_20260226_034248.replay"),
+            # old: LOG_GREEDY_COST_BENEFIT_10_20260226_033138.csv (r=8.64)
+            {  # r=8.64 (NEW)
+                "csv": os.path.join(LOGGING_DIR, "REFLASH_R864_20260515_144958.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260515_144955"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_alibaba_dwpd1to2_4x_20260515_150107.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
-            {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260303_190521.ali1.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260226_033136"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_20260226_034248.replay"),
+            # old: LOG_GREEDY_COST_BENEFIT_10_20260303_190521.ali1.csv (r=2.88)
+            {  # r=2.88 (NEW)
+                "csv": os.path.join(LOGGING_DIR, "REFLASH_R288_20260515_221406.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260515_221404"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_alibaba_dwpd1to2_4x_20260515_222516.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
         ],
         "Alibaba3": [
-            {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260302_095057.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260302_095055"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_20260302_100206.replay"),
+            # old: LOG_GREEDY_COST_BENEFIT_10_20260302_095057.csv (r=8.64)
+            {  # r=8.64 (NEW)
+                "csv": os.path.join(LOGGING_DIR, "REFLASH_R864_20260516_021332.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260516_021329"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_alibaba_dwpd01to1_20260516_022441.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
-            {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260303_112411.alilow.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260302_095055"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_20260302_100206.replay"),
+            # old: LOG_GREEDY_COST_BENEFIT_10_20260303_112411.alilow.csv (r=2.88)
+            {  # r=2.88 (NEW)
+                "csv": os.path.join(LOGGING_DIR, "REFLASH_R288_20260516_060559.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260516_060557"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_alibaba_dwpd01to1_20260516_061709.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
         ],
         "YCSB-A": [
-            {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260228_210650.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260228_210648"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_20260228_211800.replay"),
+            # old: LOG_GREEDY_COST_BENEFIT_10_20260228_210650.csv (r=8.64)
+            {  # r=8.64 (NEW)
+                "csv": os.path.join(LOGGING_DIR, "REFLASH_R864_20260516_203317.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260516_203315"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_ssdtrace_scaled_4x_20260516_204427.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
-            {
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260304_081151.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260228_210648"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_20260228_211800.replay"),
+            # old: LOG_GREEDY_COST_BENEFIT_10_20260304_081151.csv (r=2.88)
+            {  # r=2.88 (NEW)
+                "csv": os.path.join(LOGGING_DIR, "REFLASH_R288_20260517_082717.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260517_082714"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_ssdtrace_scaled_4x_20260517_083826.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
         ],
         "Varmail": [
-            {  # r=8.64
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260312_220439.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260312_220437"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_varmail_2tb_6x_16t_20260309_084226.replay"),
+            # old: LOG_GREEDY_COST_BENEFIT_10_20260312_220439.csv (r=8.64)
+            {  # r=8.64 (NEW)
+                "csv": os.path.join(LOGGING_DIR, "REFLASH_R864_20260517_003640.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260517_003638"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_varmail_2tb_6x_16t_20260517_004750.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
-            {  # r=2.88
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260309_083117.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260309_083114"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_varmail_2tb_6x_16t_20260312_221549.replay"),
+            # old: LOG_GREEDY_COST_BENEFIT_10_20260309_083117.csv (r=2.88)
+            {  # r=2.88 (NEW)
+                "csv": os.path.join(LOGGING_DIR, "REFLASH_R288_20260517_122755.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260517_122753"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_varmail_2tb_6x_16t_20260517_123905.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
         ],
         "FIO": [
-            {  # r=8.64
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260313_024813.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260313_024811"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_fio_zipf0.9_20260313_025922.replay"),
+            # old: LOG_GREEDY_COST_BENEFIT_10_20260313_024813.csv (r=8.64)
+            {  # r=8.64 (NEW)
+                "csv": os.path.join(LOGGING_DIR, "REFLASH_R864_20260517_043947.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260517_043945"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_fio_zipf0.9_20260517_045057.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
-            {  # r=2.88
-                "csv": os.path.join(LOGGING_DIR, "LOG_GREEDY_COST_BENEFIT_10_20260310_204648.csv"),
-                "stat_log": os.path.join(BASE_DIR, "stat.log.20260310_204645"),
-                "replay_trace": os.path.join(BASE_DIR, "reflash_fio_zipf0.9_20260310_205757.replay"),
+            # old: LOG_GREEDY_COST_BENEFIT_10_20260310_204648.csv (r=2.88)
+            {  # r=2.88 (NEW)
+                "csv": os.path.join(LOGGING_DIR, "REFLASH_R288_20260517_163001.csv"),
+                "stat_log": os.path.join(BASE_DIR, "stat.log.20260517_162958"),
+                "replay_trace": os.path.join(BASE_DIR, "reflash_fio_zipf0.9_20260517_164110.replay"),
                 "csv_type": "icache",
                 "cache_size_gb": 1880,
             },
@@ -391,10 +406,10 @@ QLC_COST_MULTIPLIERS = [8.64, 2.88]
 
 # Start measuring TLC/QLC writes from this host write point (GB) for cost graphs (A, D, D2)
 # Set to 0 to use the full trace from the beginning
-COST_START_HOST_WRITE_GB = 6072 # 4TB
+COST_START_HOST_WRITE_GB = 0 # 0TB (full trace from first host write)
 
 # Normalization base for Graph D
-NORMALIZATION_BASE = "NearOpt"
+NORMALIZATION_BASE = "CSAL"
 
 # NearOpt (lower bound) cost values in TB, per (workload, QLC_COST_MULTIPLIER)
 NEAROPT_COSTS_TB = {
