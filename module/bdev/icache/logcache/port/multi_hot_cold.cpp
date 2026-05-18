@@ -1,4 +1,5 @@
 #include "multi_hot_cold.h"
+#include "istream.h"
 #include <cfloat>
 #include <cstring>
 
@@ -23,6 +24,12 @@ MultiHotCold::MultiHotCold(int max_gc_streams, int timestamp_granularity, bool c
 extern uint64_t g_threshold;
 
 int MultiHotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) {
+    // Refresh timestamp granularity from current g_threshold (per porting.md §9).
+    uint64_t fresh = compute_stream_interval(0);
+    if (fresh > 0 && static_cast<uint64_t>(mTimestampGranularity) != fresh) {
+        mTimestampGranularity = static_cast<int>(fresh);
+        g_cycle_length = static_cast<uint64_t>(mTimestampGranularity) * mMaxGcStreams;
+    }
     uint64_t time_diff = global_timestamp - created_timestamp;
     if (!isGcAppend) {
         uint64_t lifespan = time_diff;

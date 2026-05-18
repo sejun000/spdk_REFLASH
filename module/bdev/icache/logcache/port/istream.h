@@ -17,4 +17,9 @@ static const int MAX_STREAMS = 40;
 
 IStream* createIstreamPolicy(std::string policy_type);
 void set_stream_interval(uint64_t cache_block_count, uint64_t segment_size_blocks = 0);
+// Dynamic recomputation of stream interval based on g_threshold (GS policy).
+// Pass fallback_cache_blocks=0 to use the cached fallback.
+uint64_t compute_stream_interval(uint64_t fallback_cache_blocks = 0);
 extern uint64_t interval;  // = granularity (timestamp units per GC stream)
+extern uint64_t g_stream_fallback_blocks;
+extern uint64_t g_stream_segment_size_blocks;

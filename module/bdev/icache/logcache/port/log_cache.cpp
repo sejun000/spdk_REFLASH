@@ -452,6 +452,11 @@ void LogCache::periodic_ghost_delta_gc_sum() {
         eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
     }
     if (log_cache_timestamp % (segment_size_blocks * kGsDecisionPeriodSegs) == 0) {
+        // Force flush when free_pool is critically low — skip GC copy cost.
+        if (free_pool.size() <= FORCE_FLUSH_FREE_SEGMENTS) {
+            target_valid_blk_rate = 0.0;
+            return;
+        }
         if (compaction_ratio.has_value() &&
             compaction_ratio_in_ghost_cache.has_value() &&
             eviction_ratio.has_value() &&

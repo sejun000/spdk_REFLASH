@@ -49,6 +49,7 @@ static constexpr bool INCREMENTAL_GC_ENABLED = false;
 
 // Free segment thresholds for GC triggering
 static constexpr size_t CRITICAL_FREE_SEGMENTS = 2;   // Block host IO if <= this
+static constexpr size_t FORCE_FLUSH_FREE_SEGMENTS = 4; // Force flush (no GC copy) if <= this
 static constexpr size_t LOW_FREE_SEGMENTS = 10;       // Trigger GC if <= this
 #define GHOST_CACHE 1
 #define NETFREE_TCO_ENABLED 0
