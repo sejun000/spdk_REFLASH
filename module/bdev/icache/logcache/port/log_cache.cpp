@@ -59,6 +59,7 @@ LogCache::LogCache(uint64_t              cold_capacity,
       ghost_reuse_ewma(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       compaction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       eviction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      flush_avg_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
 #if NETFREE_TCO_ENABLED
       netfree_a_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       netfree_b_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
@@ -99,6 +100,7 @@ LogCache::LogCache(uint64_t              cold_capacity,
     ghost_reuse_ewma = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
     compaction_ratio_in_ghost_cache = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
     eviction_ratio_in_ghost_cache = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    flush_avg_ratio = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
 #if NETFREE_TCO_ENABLED
     netfree_a_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
     netfree_b_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
@@ -330,6 +332,9 @@ void LogCache::periodic() {
     case PeriodicMode::GhostDelta_GC_SUM:
         periodic_ghost_delta_gc_sum();
         break;
+    case PeriodicMode::GhostDelta_GC_SUM_Final:
+        periodic_ghost_delta_gc_sum_final();
+        break;
     }
 }
 
@@ -491,6 +496,71 @@ void LogCache::periodic_ghost_delta_gc_sum() {
                            eviction_ratio_in_ghost_cache.value(),
                            ghost_compacted_blocks_sum_);
         }
+    }
+}
+
+// PORTING_GS_FINAL §4.1 — cum_valid 단조 누적, dt × rate 외삽 없음.
+// target_free_segs = D = util_step · N_seg (inv_corr 보정 없음, §6.2).
+void LogCache::update_ghost_compacted_blocks_sum_cum() {
+    if (!compactor) return;
+    const double target_free_segs = util_step_ * static_cast<double>(total_segments);
+    auto s = compactor->get_ghost_sum_for_free_segments(target_free_segs);
+    if (s.cum_invalid > 0.0) {
+        ghost_compacted_blocks_sum_ += s.cum_valid;
+        ghost_sum_initialized_       = true;
+        last_ghost_sum_ts_           = log_cache_timestamp;
+    }
+}
+
+// PORTING_GS_FINAL §4.2 — LHS = r·waf·F_frac·D vs RHS = G(u+δ).
+// flush event 평균 F_frac (D-symmetric with GC cum_valid). target ± util_step_.
+void LogCache::periodic_ghost_delta_gc_sum_final() {
+    if (!is_ghost_cache) return;
+
+    if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
+        update_ghost_compacted_blocks_sum_cum();
+        compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
+        compaction_ratio_in_ghost_cache.updateFromCumulative(
+            log_cache_timestamp,
+            static_cast<uint64_t>(ghost_compacted_blocks_sum_));
+        eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
+        flush_avg_ratio.updateFromCumulative(
+            flush_event_count_ * segment_size_blocks, evicted_blocks);
+    }
+
+    if (log_cache_timestamp % segment_size_blocks == 0) {
+        // Force-flush guard (Phase 2): preserved on FINAL path too (porting doc §6.4).
+        if (free_pool.size() <= FORCE_FLUSH_FREE_SEGMENTS) {
+            target_valid_blk_rate = 0.0;
+            return;
+        }
+        if (!compaction_ratio.has_value() ||
+            !compaction_ratio_in_ghost_cache.has_value() ||
+            !eviction_ratio.has_value()) return;
+
+        const double waf_w  = (backend_waf_ > 0.0) ? backend_waf_ : 1.0;
+        const double Gud    = compaction_ratio_in_ghost_cache.value();
+        const double F_frac = flush_avg_ratio.has_value()
+                            ? flush_avg_ratio.value() : 1.0;   // §6.3 conservative fallback
+
+        const double lhs = periodic_ratio_ * waf_w * F_frac
+                         * util_step_ * static_cast<double>(total_segments);
+        const double rhs = Gud;
+        const bool   raise = (lhs > rhs);
+
+        const double cur_util = (total_cache_block_count > 0)
+                              ? (double)global_valid_blocks / total_cache_block_count : 0.0;
+        const double raw_target = raise ? (cur_util + util_step_) : (cur_util - util_step_);
+
+        if (raise) target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, raw_target);
+        else       target_valid_blk_rate = std::max(0.0, raw_target);
+
+        SPDK_NOTICELOG("periodic_gs_final: %s target=%.4f, lhs=%.6f, rhs=%.6f, "
+                       "F_frac=%.4f, backend_waf=%.3f, Gud=%.6f, flush_events=%lu, sum=%.1f\n",
+                       raise ? "RAISE" : "LOWER",
+                       target_valid_blk_rate, lhs, rhs,
+                       F_frac, backend_waf_, Gud, flush_event_count_,
+                       ghost_compacted_blocks_sum_);
     }
 }
 
@@ -1164,6 +1234,9 @@ void LogCache::evict_segment(LogCacheSegment* s)
     }
     evict_freed_blocks += segment_size_blocks;
     reset_segment(s);
+    // PORTING_GS_FINAL §5: ++flush_event_count_ at end of evict_segment.
+    // Drives flush_avg_ratio sample = evicted_blocks / (flush_events × seg_blocks).
+    ++flush_event_count_;
 }
 
 
@@ -1401,8 +1474,11 @@ bool LogCache::prepare_gc(GcPrepareResult &result)
         }
 
         // Determine if we should compact or just evict
+        // PORTING_GS_FINAL §5: gate uses util_step_ for FINAL; legacy 0.1 elsewhere.
+        const double compact_gate_threshold =
+            (periodic_mode_ == PeriodicMode::GhostDelta_GC_SUM_Final) ? util_step_ : 0.1;
         bool compact = false;
-        if (target_valid_blk_rate >= 0.1) {
+        if (target_valid_blk_rate >= compact_gate_threshold) {
             if (compactor && (double)target_valid_blk_rate * total_cache_block_count > global_valid_blocks) {
                 compact = true;
             }

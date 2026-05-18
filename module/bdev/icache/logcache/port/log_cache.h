@@ -57,7 +57,8 @@ static constexpr size_t LOW_FREE_SEGMENTS = 10;       // Trigger GC if <= this
 enum class PeriodicMode {
     GhostDelta_GC,          // 기존 ghost cache boundary-segment 방식
     NetFree_TCO,            // net-free TCO 방식
-    GhostDelta_GC_SUM,      // G(u+θ) via cumulative CB-sorted scan
+    GhostDelta_GC_SUM,      // G(u+θ) via cumulative CB-sorted scan (dt*rate anchor)
+    GhostDelta_GC_SUM_Final,// FINAL: monotone += cum_valid + flush_avg_ratio
 };
 
 class LogCache final : public ICache
@@ -257,6 +258,8 @@ private:
     void periodic_ghost_delta_gc();
     void periodic_netfree_tco();
     void periodic_ghost_delta_gc_sum();
+    void periodic_ghost_delta_gc_sum_final();
+    void update_ghost_compacted_blocks_sum_cum();
 
     /* trace(optional) *****************************************************/
     bool  cache_trace_;
@@ -322,6 +325,11 @@ private:
     // Plus separate ghost-cache cumulative ratios:
     EwmaRatio compaction_ratio_in_ghost_cache;
     EwmaRatio eviction_ratio_in_ghost_cache;
+
+    // GhostDelta_GC_SUM_Final (GS_FINAL) state — porting.md PORTING_GS_FINAL §3
+    // cum_valid 단조 누적 + flush-event 평균 (D-symmetric with GC).
+    uint64_t flush_event_count_  = 0;     // ++ in evict_segment()
+    EwmaRatio flush_avg_ratio;            // sample = evicted_blocks / (flush_events * seg_blocks)
 #if NETFREE_TCO_ENABLED
     uint64_t gc_victim_count_ = 0;           // cumulative GC victim segments
     uint64_t gc_active_alloc_count_ = 0;     // cumulative GC new segment allocations

@@ -2584,11 +2584,15 @@ public:
 		// Set periodic mode and ratio for REFLASH policies
 		if (cache_type == "REFLASH" || cache_type == "REFLASH_80" ||
 		    cache_type == "REFLASH_R864" || cache_type == "REFLASH_R288") {
-			cache_->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM);
+			// REFLASH_R864/R288 use GS_FINAL (PORTING_GS_FINAL.md). REFLASH/_80 retain GS_SUM.
 			if (cache_type == "REFLASH_R864") {
+				cache_->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM_Final);
 				cache_->setPeriodicRatio(8.64);
 			} else if (cache_type == "REFLASH_R288") {
+				cache_->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM_Final);
 				cache_->setPeriodicRatio(2.88);
+			} else {
+				cache_->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM);
 			}
 		}
 
