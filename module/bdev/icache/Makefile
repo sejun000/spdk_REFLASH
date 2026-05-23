@@ -17,6 +17,7 @@ CXX_SRCS += \
 	$(PORT_DIR)/log_cache.cpp \
 	$(PORT_DIR)/icache.cpp \
 	$(PORT_DIR)/ghost_cache.cpp \
+	$(PORT_DIR)/age_ghost_cache.cpp \
 	$(PORT_DIR)/histogram.cpp \
 	$(PORT_DIR)/emwa.cpp \
 	$(PORT_DIR)/evict_policy_fifo.cpp \

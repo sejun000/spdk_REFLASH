@@ -7,6 +7,7 @@
 #include "histogram.h"
 #include "emwa_ratio.h"
 #include "ghost_cache.h"
+#include "age_ghost_cache.h"
 #include "cache_device.h"
 
 #include <unordered_map>
@@ -58,7 +59,7 @@ enum class PeriodicMode {
     GhostDelta_GC,          // 기존 ghost cache boundary-segment 방식
     NetFree_TCO,            // net-free TCO 방식
     GhostDelta_GC_SUM,      // G(u+θ) via cumulative CB-sorted scan (dt*rate anchor)
-    GhostDelta_GC_SUM_Final,// FINAL: monotone += cum_valid + flush_avg_ratio
+    GhostDelta_GC_SUM_Final,// FINAL (PrGh): LHS = r·waf·(F_pred − F_ghost), age_ghost_cache
 };
 
 class LogCache final : public ICache
@@ -223,6 +224,10 @@ public:
     uint64_t get_evicted_blocks() const { return evicted_blocks; }
     uint64_t get_gc_segments_allocated() const { return gc_segments_allocated; }
 
+    // D = single tunable for GS/PrGh. See log_cache.h class body comment.
+    // Exposed publicly so the wrapper can derive util_step = D·seg_blocks / cache_blocks.
+    static constexpr int kGsDecisionPeriodSegs = 1;
+
 private:
     /* configuration ******************************************************/
     const int         cache_block_size;
@@ -293,7 +298,7 @@ private:
     static const int HISTOGRAM_BUCKETS = 40;
     static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = (262144 * 6) * 4;
     static const uint64_t GS_HALF_LIFE_IN_BLOCKS = 1572864;  // = 1 segment (6GB / 4KB) for GS_SUM EWMA
-    static constexpr int kGsDecisionPeriodSegs = 2;  // GS hill-climb period in segments
+    // (kGsDecisionPeriodSegs is declared in the public section above.)
     static constexpr double GHOST_CACHE_RATIO = 0.1;  // default, overridden by util_step_ at runtime
     static constexpr double QLC_TLC_COST_RATIO = 8.64;//(2.88 * 1); // QLC write cost / TLC write cost
     bool is_ghost_cache = false;
@@ -326,10 +331,13 @@ private:
     EwmaRatio compaction_ratio_in_ghost_cache;
     EwmaRatio eviction_ratio_in_ghost_cache;
 
-    // GhostDelta_GC_SUM_Final (GS_FINAL) state — porting.md PORTING_GS_FINAL §3
-    // cum_valid 단조 누적 + flush-event 평균 (D-symmetric with GC).
-    uint64_t flush_event_count_  = 0;     // ++ in evict_segment()
-    EwmaRatio flush_avg_ratio;            // sample = evicted_blocks / (flush_events * seg_blocks)
+    // GhostDelta_GC_SUM_Final (PrGh) state — porting_final_final.md
+    // Decision: LHS = r · waf · (F_pred − F_ghost), RHS = G(u+δ).
+    EwmaRatio flush_pred_ratio;           // EWMA of cumulative evictor->get_mth_score_valid_pages(D)
+    EwmaRatio flush_ghost_ratio;          // EWMA of cumulative age_ghost_cache.totalValidCount()
+    double    ghost_flush_valid_sum_ = 0.0;
+    double    ghost_seg_valid_sum_   = 0.0;
+    AgeGhostCache age_ghost_cache;
 #if NETFREE_TCO_ENABLED
     uint64_t gc_victim_count_ = 0;           // cumulative GC victim segments
     uint64_t gc_active_alloc_count_ = 0;     // cumulative GC new segment allocations

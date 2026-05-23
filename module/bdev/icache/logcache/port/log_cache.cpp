@@ -59,12 +59,14 @@ LogCache::LogCache(uint64_t              cold_capacity,
       ghost_reuse_ewma(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       compaction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       eviction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
-      flush_avg_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      flush_pred_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      flush_ghost_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
 #if NETFREE_TCO_ENABLED
       netfree_a_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       netfree_b_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
 #endif
       ghost_cache(cache_block_count * util_step_),
+      age_ghost_cache(1),
       device_io_(device_io)
 {
     // For striping: segment_bytes = zone_capacity * stripe_width
@@ -100,7 +102,9 @@ LogCache::LogCache(uint64_t              cold_capacity,
     ghost_reuse_ewma = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
     compaction_ratio_in_ghost_cache = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
     eviction_ratio_in_ghost_cache = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
-    flush_avg_ratio = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    flush_pred_ratio  = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    flush_ghost_ratio = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    age_ghost_cache.setCapacity(1);  // porting_final_final.md: D=1 segment
 #if NETFREE_TCO_ENABLED
     netfree_a_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
     netfree_b_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
@@ -512,8 +516,10 @@ void LogCache::update_ghost_compacted_blocks_sum_cum() {
     }
 }
 
-// PORTING_GS_FINAL §4.2 — LHS = r·waf·F_frac·D vs RHS = G(u+δ).
-// flush event 평균 F_frac (D-symmetric with GC cum_valid). target ± util_step_.
+// porting_final_final.md §5 — PrGh decision:
+//   LHS = r · waf · (F_pred − F_ghost), RHS = G(u+δ)
+// F_pred  = EWMA(cum evictor->get_mth_score_valid_pages(D))
+// F_ghost = EWMA(cum age_ghost_cache.totalValidCount())
 void LogCache::periodic_ghost_delta_gc_sum_final() {
     if (!is_ghost_cache) return;
 
@@ -524,12 +530,27 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
             log_cache_timestamp,
             static_cast<uint64_t>(ghost_compacted_blocks_sum_));
         eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
-        flush_avg_ratio.updateFromCumulative(
-            flush_event_count_ * segment_size_blocks, evicted_blocks);
+
+        if (evictor) {
+            const double target_segs = util_step_ * static_cast<double>(total_segments);
+            if (target_segs > 0.0) {
+                const uint64_t top_n_valid =
+                    evictor->get_mth_score_valid_pages(target_segs);
+                ghost_flush_valid_sum_ += static_cast<double>(top_n_valid);
+            }
+        }
+        flush_pred_ratio.updateFromCumulative(
+            log_cache_timestamp,
+            static_cast<uint64_t>(ghost_flush_valid_sum_));
+
+        ghost_seg_valid_sum_ += static_cast<double>(age_ghost_cache.totalValidCount());
+        flush_ghost_ratio.updateFromCumulative(
+            log_cache_timestamp,
+            static_cast<uint64_t>(ghost_seg_valid_sum_));
     }
 
     if (log_cache_timestamp % segment_size_blocks == 0) {
-        // Force-flush guard (Phase 2): preserved on FINAL path too (porting doc §6.4).
+        // Force-flush guard (Phase 2): preserved on FINAL path too.
         if (free_pool.size() <= FORCE_FLUSH_FREE_SEGMENTS) {
             target_valid_blk_rate = 0.0;
             return;
@@ -538,13 +559,14 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
             !compaction_ratio_in_ghost_cache.has_value() ||
             !eviction_ratio.has_value()) return;
 
-        const double waf_w  = (backend_waf_ > 0.0) ? backend_waf_ : 1.0;
-        const double Gud    = compaction_ratio_in_ghost_cache.value();
-        const double F_frac = flush_avg_ratio.has_value()
-                            ? flush_avg_ratio.value() : 1.0;   // §6.3 conservative fallback
+        const double waf_w   = (backend_waf_ > 0.0) ? backend_waf_ : 1.0;
+        const double Gud     = compaction_ratio_in_ghost_cache.value();
+        const double F_pred  = flush_pred_ratio.has_value()
+                             ? flush_pred_ratio.value()  : 0.0;
+        const double F_ghost = flush_ghost_ratio.has_value()
+                             ? flush_ghost_ratio.value() : 0.0;
 
-        const double lhs = periodic_ratio_ * waf_w * F_frac
-                         * util_step_ * static_cast<double>(total_segments);
+        const double lhs = periodic_ratio_ * waf_w * (F_pred - F_ghost);
         const double rhs = Gud;
         const bool   raise = (lhs > rhs);
 
@@ -555,12 +577,13 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
         if (raise) target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, raw_target);
         else       target_valid_blk_rate = std::max(0.0, raw_target);
 
-        SPDK_NOTICELOG("periodic_gs_final: %s target=%.4f, lhs=%.6f, rhs=%.6f, "
-                       "F_frac=%.4f, backend_waf=%.3f, Gud=%.6f, flush_events=%lu, sum=%.1f\n",
+        SPDK_NOTICELOG("periodic_gs_prgh: %s target=%.4f, lhs=%.6f, rhs=%.6f, "
+                       "F_pred=%.6f, F_ghost=%.6f, backend_waf=%.3f, Gud=%.6f, "
+                       "age_ghost_valid=%lu\n",
                        raise ? "RAISE" : "LOWER",
                        target_valid_blk_rate, lhs, rhs,
-                       F_frac, backend_waf_, Gud, flush_event_count_,
-                       ghost_compacted_blocks_sum_);
+                       F_pred, F_ghost, backend_waf_, Gud,
+                       age_ghost_cache.totalValidCount());
     }
 }
 
@@ -584,6 +607,8 @@ void LogCache::append_block(int stream_id, long key, int lba_sz, const void *pay
 {
     periodic();
     ghost_cache.access(key);
+    // porting_final_final.md §6: host write hit → invalidate in age_ghost_cache.
+    age_ghost_cache.invalidate(static_cast<uint64_t>(key));
     LogCacheSegment* seg = nullptr;
     if (stream_policy) {
         seg = get_segment_with_stream_policy(false, key);
@@ -626,6 +651,8 @@ bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64
 {
     periodic();
     ghost_cache.access(key);
+    // porting_final_final.md §6: host write hit → invalidate in age_ghost_cache.
+    age_ghost_cache.invalidate(static_cast<uint64_t>(key));
     LogCacheSegment* seg = nullptr;
     if (stream_policy) {
         seg = get_segment_with_stream_policy(false, key);
@@ -1157,6 +1184,7 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
 #endif
     LogCacheSegment* target_seg = nullptr;
     int evicted_blocks_for_victim = 0, compacted_blocks_for_victim = 0;
+    std::vector<uint64_t> flushed_keys;
     if (!stream_policy) {
         target_seg = get_segment_to_active_stream(true, gc_stream_id);
     }
@@ -1167,6 +1195,7 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
         if (threshold > 0 && log_cache_timestamp - blk.create_timestamp >= threshold) {
             if (is_ghost_cache) {
                 ghost_cache.push(blk.key);
+                flushed_keys.push_back(static_cast<uint64_t>(blk.key));
             }
             print_objects("evict", log_cache_timestamp - blk.create_timestamp);
             evicted_blocks += cfg_.evicted_blk_size;
@@ -1203,6 +1232,10 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
     // Track net freed blocks from GC: segment freed minus compacted blocks that consume space in target
     gc_freed_blocks += (segment_size_blocks - compacted_blocks_for_victim);
     reset_segment(s);
+    // porting_final_final.md §6: partial flush — push flushed keys into age_ghost_cache.
+    if (is_ghost_cache && !flushed_keys.empty()) {
+        age_ghost_cache.pushSegment(flushed_keys);
+    }
     return target_seg;
 }
 
@@ -1210,6 +1243,7 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
 void LogCache::evict_segment(LogCacheSegment* s)
 {
     int evicted_blocks_for_victim = 0;
+    std::vector<uint64_t> flushed_keys;
     /* 모든 valid page flush */
     if (s->valid_cnt == 0) {
         SPDK_NOTICELOG("valid_cnt=%ld\n", s->valid_cnt);
@@ -1224,6 +1258,7 @@ void LogCache::evict_segment(LogCacheSegment* s)
         }
         if (is_ghost_cache) {
             ghost_cache.push(blk.key);
+            flushed_keys.push_back(static_cast<uint64_t>(blk.key));
         }
         print_objects("evict", log_cache_timestamp - blk.create_timestamp);
         evicted_blocks += cfg_.evicted_blk_size;
@@ -1234,9 +1269,10 @@ void LogCache::evict_segment(LogCacheSegment* s)
     }
     evict_freed_blocks += segment_size_blocks;
     reset_segment(s);
-    // PORTING_GS_FINAL §5: ++flush_event_count_ at end of evict_segment.
-    // Drives flush_avg_ratio sample = evicted_blocks / (flush_events × seg_blocks).
-    ++flush_event_count_;
+    // porting_final_final.md §6: push just-flushed segment into age_ghost_cache.
+    if (is_ghost_cache && !flushed_keys.empty()) {
+        age_ghost_cache.pushSegment(flushed_keys);
+    }
 }
 
 
@@ -1768,6 +1804,7 @@ void LogCache::finalize_gc(GcPrepareResult &result)
 {
     LogCacheSegment *victim = result.victim_seg;
     int compacted_blocks_for_victim = 0;
+    std::vector<uint64_t> flushed_keys;
 
     // Update mapping for copied blocks
     for (auto &info : result.blocks_to_copy) {
@@ -1850,6 +1887,7 @@ void LogCache::finalize_gc(GcPrepareResult &result)
         // This block was not copied, so it should be evicted
         if (is_ghost_cache) {
             ghost_cache.push(blk.key);
+            flushed_keys.push_back(static_cast<uint64_t>(blk.key));
         }
         evicted_blocks += cfg_.evicted_blk_size;
         mapping.erase(blk.key);
@@ -1869,11 +1907,16 @@ void LogCache::finalize_gc(GcPrepareResult &result)
             stream_policy->CollectSegment(victim, log_cache_timestamp);
         }*/
     }
+    // porting_final_final.md §6: partial flush — push flushed keys into age_ghost_cache.
+    if (is_ghost_cache && !flushed_keys.empty()) {
+        age_ghost_cache.pushSegment(flushed_keys);
+    }
 }
 
 void LogCache::finalize_evict(EvictPrepareResult &result)
 {
     LogCacheSegment *victim = result.victim_seg;
+    std::vector<uint64_t> flushed_keys;
 
     // Invalidate all blocks and update mapping
     for (auto &chunk : result.chunks) {
@@ -1889,6 +1932,7 @@ void LogCache::finalize_evict(EvictPrepareResult &result)
                 if (blk.valid) {
                     if (is_ghost_cache) {
                         ghost_cache.push(key);
+                        flushed_keys.push_back(static_cast<uint64_t>(key));
                     }
                     evicted_blocks += cfg_.evicted_blk_size;
                     blk.valid = false;
@@ -1904,6 +1948,10 @@ void LogCache::finalize_evict(EvictPrepareResult &result)
         evict_freed_blocks += segment_size_blocks;
         reset_segment(victim);
     }
+    // porting_final_final.md §6: push just-flushed keys into age_ghost_cache.
+    if (is_ghost_cache && !flushed_keys.empty()) {
+        age_ghost_cache.pushSegment(flushed_keys);
+    }
 }
 
 void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb, void *cb_arg)
@@ -1911,6 +1959,7 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
     LogCacheSegment *victim = result.victim_seg;
     int compacted_blocks_for_victim = 0;
     int evicted_blocks_for_victim = 0;
+    std::vector<uint64_t> flushed_keys;
 
     // Collect victim segment lifespan BEFORE GC append/classify
     // so that mAvgLifespan is up-to-date for stream classification
@@ -2004,6 +2053,7 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
         // This block was not copied, so it should be evicted
         if (is_ghost_cache) {
             ghost_cache.push(blk.key);
+            flushed_keys.push_back(static_cast<uint64_t>(blk.key));
         }
         evicted_blocks += cfg_.evicted_blk_size;
         evicted_blocks_for_victim++;
@@ -2023,6 +2073,11 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
         global_valid_blocks--;
     }
 
+    // porting_final_final.md §6: partial flush — push flushed keys into age_ghost_cache.
+    if (is_ghost_cache && !flushed_keys.empty()) {
+        age_ghost_cache.pushSegment(flushed_keys);
+    }
+
     // Reset victim segment only on final chunk
     if (result.is_final_chunk) {
         gc_freed_blocks += (segment_size_blocks - compacted_blocks_for_victim);
@@ -2039,6 +2094,7 @@ void LogCache::finalize_evict_async(EvictPrepareResult &result, cache_device_io_
 {
     LogCacheSegment *victim = result.victim_seg;
     int evicted_blocks_for_victim = 0;
+    std::vector<uint64_t> flushed_keys;
 
     // Invalidate all blocks and update mapping (chunks already contain only current range)
     for (auto &chunk : result.chunks) {
@@ -2054,6 +2110,7 @@ void LogCache::finalize_evict_async(EvictPrepareResult &result, cache_device_io_
                 if (blk.valid) {
                     if (is_ghost_cache) {
                         ghost_cache.push(key);
+                        flushed_keys.push_back(static_cast<uint64_t>(key));
                     }
                     evicted_blocks += cfg_.evicted_blk_size;
                     evicted_blocks_for_victim++;
@@ -2069,6 +2126,11 @@ void LogCache::finalize_evict_async(EvictPrepareResult &result, cache_device_io_
                 mapping.erase(it);
             }
         }
+    }
+
+    // porting_final_final.md §6: push just-flushed keys into age_ghost_cache.
+    if (is_ghost_cache && !flushed_keys.empty()) {
+        age_ghost_cache.pushSegment(flushed_keys);
     }
 
     // Reset victim segment only on final chunk

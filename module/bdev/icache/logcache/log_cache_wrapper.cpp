@@ -2549,15 +2549,15 @@ public:
 		set_stream_interval(static_cast<uint64_t>(cache_block_count), segment_size_blocks);
 		IStream *input_stream_policy = createIstreamPolicy(istream_policy_name);
 
-		// GS_SUM doc: util_step = (kGsDecisionPeriodSegs * segment_size_blocks) / total_cache_block_count,
-		// floor 0.02. For REFLASH policies; other policies keep default 0.02 implicitly.
-		const int gs_decision_period_segs = 2;
-		double auto_util_step = static_cast<double>(segment_size_blocks * gs_decision_period_segs)
-		                       / static_cast<double>(cache_block_count);
-		double effective_util_step = std::max(0.02, auto_util_step);
-		SPDK_NOTICELOG("LogCacheAsync: cache_type=%s, valid_rate=%.2f, has_compactor=%d, istream=%p, util_step=%.6f (auto=%.6f)\n",
+		// porting_final_final.md: util_step · total_segments == D (kGsDecisionPeriodSegs).
+		// D is the single tunable in log_cache.h. No floor — invariant held exactly.
+		double effective_util_step =
+			static_cast<double>(segment_size_blocks * LogCache::kGsDecisionPeriodSegs)
+			/ static_cast<double>(cache_block_count);
+		SPDK_NOTICELOG("LogCacheAsync: cache_type=%s, valid_rate=%.2f, has_compactor=%d, istream=%p, D=%d util_step=%.6f (util_step*N_seg=%.4f)\n",
 			       cache_type.c_str(), effective_valid_rate, compactor != nullptr, input_stream_policy,
-			       effective_util_step, auto_util_step);
+			       LogCache::kGsDecisionPeriodSegs, effective_util_step,
+			       effective_util_step * static_cast<double>(cache_block_count) / static_cast<double>(segment_size_blocks));
 
 		cache_ = std::make_unique<LogCache>(
 			cold_capacity,
