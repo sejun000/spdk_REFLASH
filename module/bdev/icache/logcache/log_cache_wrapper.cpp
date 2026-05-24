@@ -2482,7 +2482,7 @@ public:
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
 			compactor = std::make_unique<CbEvictPolicy>(score_warm_first);
 			effective_valid_rate = 0.80;
-			score_low_valid_first = true;
+			score_low_valid_first = false;
 		}
 		else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GREEDY") {
 			evictor = std::make_unique<CbEvictPolicy>(score_age_evict);
