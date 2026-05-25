@@ -337,6 +337,13 @@ private:
     EwmaRatio flush_ghost_ratio;          // EWMA of cumulative age_ghost_cache.totalValidCount()
     double    ghost_flush_valid_sum_ = 0.0;
     double    ghost_seg_valid_sum_   = 0.0;
+    // 2-step lookahead candidate costs (GhostDelta_GC_SUM_Final, change.md §3).
+    EwmaRatio gg_ratio;          // ghost_sum(2δN).cum_valid
+    double    gg_ghost_sum_ = 0.0;
+    EwmaRatio ff_ratio;          // get_mth(2δN)
+    double    ff_flush_sum_ = 0.0;
+    EwmaRatio gf_flush_ratio;    // get_mth(δN)  (GF's flush leg; GC leg = Gud)
+    double    gf_flush_sum_ = 0.0;
     AgeGhostCache age_ghost_cache;
 #if NETFREE_TCO_ENABLED
     uint64_t gc_victim_count_ = 0;           // cumulative GC victim segments

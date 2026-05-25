@@ -61,6 +61,9 @@ LogCache::LogCache(uint64_t              cold_capacity,
       eviction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       flush_pred_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       flush_ghost_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      gg_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      ff_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      gf_flush_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
 #if NETFREE_TCO_ENABLED
       netfree_a_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       netfree_b_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
@@ -104,6 +107,9 @@ LogCache::LogCache(uint64_t              cold_capacity,
     eviction_ratio_in_ghost_cache = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
     flush_pred_ratio  = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
     flush_ghost_ratio = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    gg_ratio          = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    ff_ratio          = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    gf_flush_ratio    = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
     age_ghost_cache.setCapacity(1);  // porting_final_final.md: D=1 segment
 #if NETFREE_TCO_ENABLED
     netfree_a_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
@@ -547,6 +553,29 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
         flush_ghost_ratio.updateFromCumulative(
             log_cache_timestamp,
             static_cast<uint64_t>(ghost_seg_valid_sum_));
+
+        // 2-step lookahead candidates (change.md §3 [C2]).
+        // δN = util_step_·N segments freed per step.
+        //   GG: GC frees 2δN  → ghost_sum(2δN).cum_valid
+        //   FF: flush frees 2δN → get_mth(2δN)
+        //   F : flush frees δN  → get_mth(δN)   (GF's flush leg; GC leg = Gud)
+        const double dN = util_step_ * static_cast<double>(total_segments);
+        if (compactor) {
+            gg_ghost_sum_ +=
+                compactor->get_ghost_sum_for_free_segments(2.0 * dN).cum_valid;
+            gg_ratio.updateFromCumulative(
+                log_cache_timestamp, static_cast<uint64_t>(gg_ghost_sum_));
+        }
+        if (evictor) {
+            ff_flush_sum_ +=
+                static_cast<double>(evictor->get_mth_score_valid_pages(2.0 * dN));
+            ff_ratio.updateFromCumulative(
+                log_cache_timestamp, static_cast<uint64_t>(ff_flush_sum_));
+            gf_flush_sum_ +=
+                static_cast<double>(evictor->get_mth_score_valid_pages(dN));
+            gf_flush_ratio.updateFromCumulative(
+                log_cache_timestamp, static_cast<uint64_t>(gf_flush_sum_));
+        }
     }
 
     if (log_cache_timestamp % segment_size_blocks == 0) {
@@ -566,9 +595,21 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
         const double F_ghost = flush_ghost_ratio.has_value()
                              ? flush_ghost_ratio.value() : 0.0;
 
-        const double lhs = periodic_ratio_ * waf_w * (F_pred - F_ghost);
-        const double rhs = Gud;
-        const bool   raise = (lhs > rhs);
+        // Marginal next-step comparison (change.md §3 [C3]).
+        //   LHS = Gnext − G          = GG − 2·Gud
+        //   RHS = r·waf·(F − Fnext)  = r·waf·(2F − FF)
+        // do G (RAISE) if LHS < RHS, else flush (LOWER).
+        (void)F_pred;   // unused in decision (logging only)
+        (void)F_ghost;  // unused in decision (logging only)
+        const double rwaf  = periodic_ratio_ * waf_w;
+        const double GG    = gg_ratio.has_value()       ? gg_ratio.value()       : 0.0;
+        const double FFv   = ff_ratio.has_value()       ? ff_ratio.value()       : 0.0; // get_mth(2δN)
+        const double Fv    = gf_flush_ratio.has_value() ? gf_flush_ratio.value() : 0.0; // get_mth(δN)
+        const double Gnext = GG  - Gud;
+        const double Fnext = FFv - Fv;
+        const double lhs   = Gnext - Gud;          // GG − 2·Gud
+        const double rhs   = rwaf * (Fv - Fnext);  // r·waf·(2F − FF)
+        const bool   raise = (lhs < rhs);
 
         const double cur_util = (total_cache_block_count > 0)
                               ? (double)global_valid_blocks / total_cache_block_count : 0.0;
