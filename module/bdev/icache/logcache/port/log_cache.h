@@ -266,6 +266,12 @@ private:
     void periodic_ghost_delta_gc_sum_final();
     void update_ghost_compacted_blocks_sum_cum();
 
+    // Σ invalidate_rate over every evictor (WT-ordered) segment with
+    // create_timestamp <= wt_hi. O(rank) scan with early-stop (evictor is WT
+    // ascending). Pair with get_victim_wt_span_for_free_segments by passing
+    // span.max_wt → prefix invalidate-rate mass up to and including victim v.
+    double sum_invalidate_rate_in_wt_range(uint64_t wt_hi) const;
+
     /* trace(optional) *****************************************************/
     bool  cache_trace_;
     FILE* trace_fp_      = nullptr;
@@ -344,6 +350,9 @@ private:
     double    ff_flush_sum_ = 0.0;
     EwmaRatio gf_flush_ratio;    // get_mth(δN)  (GF's flush leg; GC leg = Gud)
     double    gf_flush_sum_ = 0.0;
+    // λ: device blocks invalidated per host-write page (EWMA). Kept for the log
+    //    column only — the invrate-rule uses per-seg invalidate_rate sums, not λ.
+    EwmaRatio lambda_ratio;
     AgeGhostCache age_ghost_cache;
 #if NETFREE_TCO_ENABLED
     uint64_t gc_victim_count_ = 0;           // cumulative GC victim segments

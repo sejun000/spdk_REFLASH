@@ -25,8 +25,13 @@ public:
 
     void reset();
 
-    // 한 단위(step) 업데이트
-    void update(double x);
+    // 한 단위(step) 업데이트. 핫 경로(세그먼트별 invalidation 폴딩 등)에서 호출
+    // 오버헤드를 없애려 헤더 inline 정의. exp/log 없는 고정-α 재귀.
+    void update(double x) {
+        updateWithAlpha(x, alpha_);
+        steps_ += 1;
+        bias_prod_ *= (1.0 - alpha_);
+    }
 
     // 임의의 경과 "단위 수"로 가중 업데이트 (가중치=units)
     void updateWithUnits(double x, double units);
@@ -50,7 +55,12 @@ public:
     std::uint64_t steps() const { return steps_; }
 private:
     static double clampAlpha(double a);
-    void updateWithAlpha(double x, double alpha_eff);
+    // inline (header) so update() above and updateWithUnits() in the .cpp both
+    // inline the core recurrence; no exp/log here.
+    void updateWithAlpha(double x, double alpha_eff) {
+        if (!initialized_) { m_ = x; initialized_ = true; }
+        else { m_ = alpha_eff * x + (1.0 - alpha_eff) * m_; }
+    }
 
     double        alpha_;
     bool          bias_correction_;

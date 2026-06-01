@@ -78,5 +78,6 @@ public:
             b.create_timestamp = UINT32_MAX;
             b.gc_copied_timestamp = 0;
         }
+        reset_invalidate_rate();
     }
 };

@@ -64,6 +64,7 @@ LogCache::LogCache(uint64_t              cold_capacity,
       gg_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       ff_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       gf_flush_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      lambda_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
 #if NETFREE_TCO_ENABLED
       netfree_a_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       netfree_b_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
@@ -110,6 +111,7 @@ LogCache::LogCache(uint64_t              cold_capacity,
     gg_ratio          = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
     ff_ratio          = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
     gf_flush_ratio    = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
+    lambda_ratio      = EwmaRatio::FromHalfLifeBlocks(GS_HALF_LIFE_IN_BLOCKS);
     age_ghost_cache.setCapacity(1);  // porting_final_final.md: D=1 segment
 #if NETFREE_TCO_ENABLED
     netfree_a_ratio = EwmaRatio::FromHalfLifeBlocks(segment_size_blocks * 4);
@@ -280,6 +282,7 @@ void LogCache::invalidate(long key, int lba_sz) {
             }
             loc.seg->blocks[loc.idx].valid = false;
             --loc.seg->valid_cnt;
+            loc.seg->note_invalidation();   // per-seg cumulative inval count (++ only)
             global_valid_blocks -= 1;
             if (loc.seg->full()){
                 evict_policy_update(loc.seg);
@@ -522,6 +525,21 @@ void LogCache::update_ghost_compacted_blocks_sum_cum() {
     }
 }
 
+double LogCache::sum_invalidate_rate_in_wt_range(uint64_t wt_hi) const
+{
+    double sum = 0.0;
+    if (!evictor) return sum;
+    // evictor (score_age_evict = -create_timestamp, max-heap) hands out segments
+    // in WT-ascending order → once we pass wt_hi every later seg is also out.
+    // No lower bound: accumulate every resident seg up to victim v (wt_hi).
+    evictor->for_each_victim_in_order([&](Segment* s) -> bool {
+        if (s->get_create_time() > wt_hi) return false;   // ascending → done
+        sum += s->invalidate_rate();
+        return true;
+    });
+    return sum;
+}
+
 // porting_final_final.md §5 — PrGh decision:
 //   LHS = r · waf · (F_pred − F_ghost), RHS = G(u+δ)
 // F_pred  = EWMA(cum evictor->get_mth_score_valid_pages(D))
@@ -529,7 +547,7 @@ void LogCache::update_ghost_compacted_blocks_sum_cum() {
 void LogCache::periodic_ghost_delta_gc_sum_final() {
     if (!is_ghost_cache) return;
 
-    if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
+    if (log_cache_timestamp % segment_size_blocks == 0) {
         update_ghost_compacted_blocks_sum_cum();
         compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
         compaction_ratio_in_ghost_cache.updateFromCumulative(
@@ -576,6 +594,20 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
             gf_flush_ratio.updateFromCumulative(
                 log_cache_timestamp, static_cast<uint64_t>(gf_flush_sum_));
         }
+        // λ: device blocks invalidated per host-write page. invalidate_blocks =
+        //   cumulative host-overwrite/trim invalidations; log_cache_timestamp =
+        //   cumulative host-write pages. (log column only; not used by the rule.)
+        lambda_ratio.updateFromCumulative(log_cache_timestamp, invalidate_blocks);
+        // Per-segment invalidation rate: fold each resident (sealed) segment's
+        // cumulative count at this regular cadence — same updateFromCumulative
+        // pattern as the ratios above, so invrate_sum reads a recency-weighted
+        // rate while the per-event path stays a bare ++. ~O(sealed segs) per tick.
+        if (evictor) {
+            evictor->for_each_victim_in_order([this](Segment* s) -> bool {
+                s->fold_invalidate_rate(log_cache_timestamp);
+                return true;
+            });
+        }
     }
 
     if (log_cache_timestamp % segment_size_blocks == 0) {
@@ -595,21 +627,33 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
         const double F_ghost = flush_ghost_ratio.has_value()
                              ? flush_ghost_ratio.value() : 0.0;
 
-        // Marginal next-step comparison (change.md §3 [C3]).
-        //   LHS = Gnext − G          = GG − 2·Gud
-        //   RHS = r·waf·(F − Fnext)  = r·waf·(2F − FF)
-        // do G (RAISE) if LHS < RHS, else flush (LOWER).
-        (void)F_pred;   // unused in decision (logging only)
-        (void)F_ghost;  // unused in decision (logging only)
-        const double rwaf  = periodic_ratio_ * waf_w;
-        const double GG    = gg_ratio.has_value()       ? gg_ratio.value()       : 0.0;
-        const double FFv   = ff_ratio.has_value()       ? ff_ratio.value()       : 0.0; // get_mth(2δN)
-        const double Fv    = gf_flush_ratio.has_value() ? gf_flush_ratio.value() : 0.0; // get_mth(δN)
-        const double Gnext = GG  - Gud;
-        const double Fnext = FFv - Fv;
-        const double lhs   = Gnext - Gud;          // GG − 2·Gud
-        const double rhs   = rwaf * (Fv - Fnext);  // r·waf·(2F − FF)
+        // ── invrate-rule (porting_last.md): GC if its copy cost beats the
+        //    natural-death credit ──
+        //   invrate_sum = Σ per-seg invalidate_rate over resident segs with
+        //   WT ≤ v, where victim v = newest seg GC must touch to free
+        //   util_step_·N. Each invalidate_rate ≈ invalidated pages per host-write
+        //   page on that seg → the sum is the host-page death rate of the old
+        //   cohort GC would reclaim. Routing that reclaim through cold-tier flush
+        //   costs invrate_sum·r writes; GC instead copies Gud valid pages.
+        //   → GC (RAISE) iff Gud < invrate_sum·r, else flush (LOWER).
+        (void)F_pred;   // kept for logging only
+        (void)F_ghost;  // kept for logging only
+        (void)waf_w;    // kept for logging only (no longer in the rule)
+        const double vic_target_free =
+            util_step_ * static_cast<double>(total_segments);
+        EvictPolicy::VictimWtSpanResult vspan;
+        double invrate_sum = 0.0;
+        if (compactor) {
+            vspan = compactor->get_victim_wt_span_for_free_segments(vic_target_free);
+            invrate_sum = sum_invalidate_rate_in_wt_range(vspan.max_wt);
+        }
+        const double lambda = lambda_ratio.has_value() ? lambda_ratio.value() : 0.0;
+        (void)lambda;   // kept for logging only (no longer in the rule)
+        const double lhs   = Gud;                            // GC copy cost / host page
+        const double rhs   = invrate_sum * periodic_ratio_;  // invrate·r / host page
         const bool   raise = (lhs < rhs);
+        // (anti-stuck cap removed per request: decision is purely Gud < invrate_sum·r,
+        //  no forced flush after N consecutive RAISEs.)
 
         const double cur_util = (total_cache_block_count > 0)
                               ? (double)global_valid_blocks / total_cache_block_count : 0.0;
@@ -618,12 +662,13 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
         if (raise) target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, raw_target);
         else       target_valid_blk_rate = std::max(0.0, raw_target);
 
-        SPDK_NOTICELOG("periodic_gs_prgh: %s target=%.4f, lhs=%.6f, rhs=%.6f, "
-                       "F_pred=%.6f, F_ghost=%.6f, backend_waf=%.3f, Gud=%.6f, "
-                       "age_ghost_valid=%lu\n",
+        SPDK_NOTICELOG("periodic_gs_invrate: %s target=%.4f, lhs(Gud)=%.6f, rhs=%.6f, "
+                       "invrate_sum=%.6f, r=%.3f, lambda=%.6f, vic_v_wt=%lu, "
+                       "F_pred=%.6f, F_ghost=%.6f, backend_waf=%.3f, age_ghost_valid=%lu\n",
                        raise ? "RAISE" : "LOWER",
                        target_valid_blk_rate, lhs, rhs,
-                       F_pred, F_ghost, backend_waf_, Gud,
+                       invrate_sum, periodic_ratio_, lambda, vspan.max_wt,
+                       F_pred, F_ghost, backend_waf_,
                        age_ghost_cache.totalValidCount());
     }
 }

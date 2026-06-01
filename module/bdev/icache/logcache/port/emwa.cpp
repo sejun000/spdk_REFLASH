@@ -53,11 +53,7 @@ void Ewma::reset() {
     bias_prod_ = 1.0;
 }
 
-void Ewma::update(double x) {
-    updateWithAlpha(x, alpha_);
-    steps_ += 1;
-    bias_prod_ *= (1.0 - alpha_);
-}
+// Ewma::update — now inline in emwa.h (hot per-event path).
 
 void Ewma::updateWithUnits(double x, double units) {
     if (units <= 0.0) throw std::invalid_argument("units must be > 0");
@@ -84,11 +80,4 @@ double Ewma::clampAlpha(double a) {
     return a;
 }
 
-void Ewma::updateWithAlpha(double x, double alpha_eff) {
-    if (!initialized_) {
-        m_ = x;
-        initialized_ = true;
-    } else {
-        m_ = alpha_eff * x + (1.0 - alpha_eff) * m_;
-    }
-}
+// Ewma::updateWithAlpha — now inline in emwa.h.

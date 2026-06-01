@@ -128,3 +128,35 @@ CbEvictPolicy::get_ghost_sum_for_free_segments(double target_free_segments) cons
     }
     return r;
 }
+
+EvictPolicy::VictimWtSpanResult
+CbEvictPolicy::get_victim_wt_span_for_free_segments(double target_free_segments) const
+{
+    VictimWtSpanResult r;
+    if (target_free_segments <= 0.0 || heap_.empty()) return r;
+
+    double free_sum = 0.0;
+    for (auto it = heap_.ordered_begin(); it != heap_.ordered_end(); ++it) {
+        Segment* s = it->seg;
+        const uint64_t v   = s->valid_cnt;
+        const uint64_t inv = (pages_in_segment > v) ? (pages_in_segment - v) : 0;
+        const double inv_frac = static_cast<double>(inv) / static_cast<double>(pages_in_segment);
+
+        // Segment is part of the cleaned set → track the newest WT (victim v).
+        const uint64_t wt = s->get_create_time();
+        if (r.v_seg == nullptr || wt > r.max_wt) { r.max_wt = wt; r.v_seg = s; }
+        r.m += 1.0;
+
+        if (free_sum + inv_frac >= target_free_segments) break;  // target reached
+        free_sum += inv_frac;
+    }
+    return r;
+}
+
+void CbEvictPolicy::for_each_victim_in_order(const std::function<bool(Segment*)>& fn) const
+{
+    // max→min score order == the order choose_segment() would hand out victims.
+    for (auto it = heap_.ordered_begin(); it != heap_.ordered_end(); ++it) {
+        if (!fn(it->seg)) break;
+    }
+}

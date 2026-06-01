@@ -2,6 +2,7 @@
 #include <list>
 #include <cstdint>
 #include <cstddef>
+#include <functional>
 
 class Segment;
 
@@ -62,6 +63,23 @@ public:
     virtual GhostSumResult get_ghost_sum_for_free_segments(double target_free_segments) const {
         return {};
     }
+
+    /* Same score-order scan as get_ghost_sum_for_free_segments, but instead of
+     * page sums it reports "victim v" — the newest segment (max create_timestamp)
+     * GC must touch to free `target_free_segments`.  Boundary segment is folded
+     * in whole (WT is atomic). Used as the upper bound of a later WT query. */
+    struct VictimWtSpanResult {
+        uint64_t max_wt = 0;            // "victim v": largest create_timestamp in cleaned set
+        double   m      = 0.0;          // segments folded in (boundary inclusive)
+        Segment* v_seg  = nullptr;      // the max-WT victim segment
+    };
+    virtual VictimWtSpanResult get_victim_wt_span_for_free_segments(double target_free_segments) const {
+        return {};
+    }
+
+    /* Visit victim segments in selection (score) order.  fn returns false to
+     * stop early.  Default no-op for policies without an ordered victim list. */
+    virtual void for_each_victim_in_order(const std::function<bool(Segment*)>& fn) const {}
 
     /* Get current segment count in the policy */
     virtual size_t segment_count() const { return 0; }

@@ -43,6 +43,8 @@ public:
     uint64_t get_mth_score_valid_pages(double m) const override;
     uint64_t get_kth_segment_valid_cnt_for_free_segments(double m) const override;
     GhostSumResult get_ghost_sum_for_free_segments(double target_free_segments) const override;
+    VictimWtSpanResult get_victim_wt_span_for_free_segments(double target_free_segments) const override;
+    void for_each_victim_in_order(const std::function<bool(Segment*)>& fn) const override;
 private:
     /* 실제 점수 계산: age/u  (u==0 → ∞) */
     inline double score(Segment* s) const {
