@@ -517,20 +517,18 @@ def plot_graph_c3():
                 vals.append(0)
                 continue
             v = _get_avg_utilization(config_name, workload)
-            if config_name in ("REFlash_80", "SepBIT", "Greedy"):
-                v = round(v, 1)
             vals.append(v)
 
         offset = (i - (n_configs - 1) / 2) * width
         bars = ax_right.bar(x + offset, vals, width, label=display_name(config_name),
                             color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=1.5)
-    ax_right.set_ylabel("BUtil", fontsize=24)
+    ax_right.set_ylabel(r"$U_B$", fontsize=24)
     ax_right.set_xticks(x)
     ax_right.set_xticklabels(active_workloads, fontsize=23)
     ax_right.tick_params(axis='y', labelsize=23)
     ax_right.grid(True, axis='y')
     ax_right.set_ylim(bottom=0, top=1.2)
-    ax_right.set_xlabel("(b) BUtil", fontsize=28)
+    ax_right.set_xlabel(r"(b) $U_B$", fontsize=28)
 
     handles, labels = ax_left.get_legend_handles_labels()
     fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.06),
@@ -558,24 +556,15 @@ def plot_graph_c4():
         print("Graph C4: No workloads with data, skipping.")
         return
 
-    # W layout: top row has ceil(n/2) subplots, bottom row has floor(n/2) centered
-    top_count = (n_workloads + 1) // 2
-    bot_count = n_workloads - top_count
-    ncols_grid = top_count * 2  # use double grid for centering bottom row
-    fig = plt.figure(figsize=(12 * top_count, 7 * 2))
-    import matplotlib.gridspec as gridspec
-    gs = gridspec.GridSpec(2, ncols_grid, figure=fig)
-    axes_list = []
-    # Top row: evenly spaced across full width
-    for i in range(top_count):
-        ax = fig.add_subplot(gs[0, i * 2:(i + 1) * 2])
-        axes_list.append(ax)
-    # Bottom row: centered
-    bot_offset = top_count - bot_count  # offset in grid units to center
-    for i in range(bot_count):
-        ax = fig.add_subplot(gs[1, bot_offset + i * 2:bot_offset + (i + 1) * 2])
-        axes_list.append(ax)
+    # 2-col × ceil(n/2)-row layout
+    ncols = 2
+    nrows = (n_workloads + ncols - 1) // ncols
+    fig, axes_grid = plt.subplots(nrows, ncols, figsize=(12 * ncols, 7 * nrows))
+    axes_list = list(axes_grid.flatten()) if nrows * ncols > 1 else [axes_grid]
     axes = axes_list
+    # Hide unused subplots when n_workloads is odd
+    for ax in axes_list[n_workloads:]:
+        ax.set_visible(False)
 
     for wi, workload in enumerate(active_workloads):
         ax = axes[wi]
@@ -622,23 +611,23 @@ def plot_graph_c4():
                 ax.annotate(f'{total_wa_vals[ci]:.2f}',
                             xy=(x[ci], total_wa_vals[ci]),
                             xytext=(0, 8), textcoords="offset points",
-                            ha='center', va='bottom', fontsize=36, fontweight='bold', color='red')
+                            ha='center', va='bottom', fontsize=43, fontweight='bold', color='red')
 
-        ax.set_ylabel("Write amplification", fontsize=40)
+        ax.set_ylabel("WA", fontsize=48)
         ax.set_xticks(x)
-        ax.set_xticklabels([display_name(c) for c in configs], rotation=15, ha='right', fontsize=36)
+        ax.set_xticklabels([display_name(c) for c in configs], rotation=25, ha='right', fontsize=43)
         labels_abc = "abcdefghijklmnopqrstuvwxyz"
-        ax.set_xlabel(f"({labels_abc[wi]}) {workload}", fontsize=48)
-        ax.tick_params(axis='y', labelsize=36)
+        ax.set_xlabel(f"({labels_abc[wi]}) {workload}", fontsize=58, labelpad=14)
+        ax.tick_params(axis='y', labelsize=43)
         ax.grid(True, axis='y')
         ax.set_ylim(bottom=0, top=4.5)
 
     # Single shared legend
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.03),
-               ncol=len(labels), frameon=False, fontsize=40)
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.015),
+               ncol=len(labels), frameon=False, fontsize=48)
     plt.tight_layout()
-    plt.subplots_adjust(top=0.94)
+    plt.subplots_adjust(top=0.95, hspace=0.85, wspace=0.20)
     plt.savefig(OUTPUT_FILES["graph_c4"], dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {OUTPUT_FILES['graph_c4']}")
@@ -660,7 +649,7 @@ def plot_graph_d():
         print("Graph D: No workloads with data, skipping.")
         return
 
-    fig, axes = plt.subplots(1, n_multipliers, figsize=(14 * n_multipliers, 8))
+    fig, axes = plt.subplots(1, n_multipliers, figsize=(14 * n_multipliers, 5.0))
     if n_multipliers == 1:
         axes = [axes]
 
@@ -732,7 +721,7 @@ def plot_graph_d():
                 if v > 0:
                     all_vals_for_ymax.append(v)
         max_v = max(all_vals_for_ymax) if all_vals_for_ymax else 1.0
-        y_max = max(1.2, max_v * 1.15)
+        y_max = 2.0  # fixed cap for both subplots
 
         overflow_annotations = {}  # bi -> list of (x_pos, value)
         for i, config_name in enumerate(all_labels):
@@ -746,25 +735,26 @@ def plot_graph_d():
             bars = ax.bar(x + offset, vals, width, label=display_name(config_name),
                           color=CONFIG_COLORS.get(config_name, "#333333"),
                           edgecolor='black', linewidth=1.5)
-            # Small per-bar value labels above each bar
-            for bi, v in enumerate(vals):
-                if v > 0 and v <= y_max:
-                    ax.annotate(f'{v:.2f}', xy=(x[bi] + offset, v),
-                                xytext=(0, 2), textcoords="offset points",
-                                ha='center', va='bottom', fontsize=10, rotation=90)
-            # Collect bars that exceed y_max
+            # Collect bars that exceed y_max (overflow values still annotated)
             for bi, v in enumerate(vals):
                 if v > y_max:
                     overflow_annotations.setdefault(bi, []).append((x[bi] + offset, v))
 
         # Spread overflow annotations horizontally so they don't overlap
         for bi, annots in overflow_annotations.items():
-            n = len(annots)
-            for rank, (x_pos, v) in enumerate(annots):
-                y_offset = 4
-                x_nudge = (rank - (n - 1) / 2) * 12 if n > 1 else 0
+            annots_sorted = sorted(annots, key=lambda a: a[0])
+            n = len(annots_sorted)
+            for rank, (x_pos, v) in enumerate(annots_sorted):
+                if n == 3:
+                    # 2.6 (leftmost) and 2.3 (middle) shift slightly right; 2.1 (rightmost) shifts left
+                    nudges = [-12, 8, 14]
+                    x_nudge = nudges[rank]
+                elif n > 1:
+                    x_nudge = (rank - (n - 1) / 2) * 28
+                else:
+                    x_nudge = 0
                 ax.annotate(f'{v:.1f}', xy=(x_pos, y_max),
-                            xytext=(x_nudge, y_offset), textcoords="offset points",
+                            xytext=(x_nudge, 4), textcoords="offset points",
                             ha='center', va='bottom', fontsize=21, fontweight='bold')
 
 
@@ -784,10 +774,10 @@ def plot_graph_d():
 
     # Shared legend at top - single row
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.12),
+    fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.07),
                ncol=len(labels), frameon=False, fontsize=26)
     plt.tight_layout()
-    plt.subplots_adjust(top=0.85)
+    plt.subplots_adjust(top=0.88)
     plt.savefig(OUTPUT_FILES["graph_d"], dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {OUTPUT_FILES['graph_d']}")
@@ -1257,13 +1247,151 @@ def plot_graph_j():
     ax_c.legend(handles=[
         Patch(facecolor='#E0E0E0', edgecolor='black', label='Buffer-tier'),
         Patch(facecolor='#E0E0E0', edgecolor='black', hatch='xx', label='Capacity-tier'),
-    ], loc='upper right', ncol=2, fontsize=23,
+    ], loc='upper right', bbox_to_anchor=(1.0, 1.05), ncol=2, fontsize=23,
        frameon=True, edgecolor='black', fancybox=False, handlelength=0.8)
 
     plt.tight_layout()
     plt.savefig(OUTPUT_FILES["graph_j"], dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {OUTPUT_FILES['graph_j']}")
+
+
+def plot_graph_j2():
+    """Graph J2: single-column variant of J — narrow bars, compact figsize.
+    Same 3 subplots (Buffer-Tier WA / Capacity-Tier writes / Normalized TEC)."""
+    configs = ["OpenCAS", "CSAL", "Greedy", "REFlash"]
+    workload = "Alibaba1"
+    r = QLC_COST_MULTIPLIERS[0]  # 8.64
+
+    # Single-column: narrow bars + tall enough to keep original font sizes legible.
+    fig, (ax_a, ax_b, ax_c) = plt.subplots(1, 3, figsize=(22, 7.5))
+
+    n_configs = len(configs)
+    # Tighten bar spacing so bars cluster toward subplot center
+    x_spacing = 0.78
+    x = np.arange(n_configs) * x_spacing
+    bar_w = 0.32
+    x_pad = 0.55
+    BAR_EDGE_LW = 0.5
+    SPINE_LW = 0.7
+    LBL_FS = 50
+    TICK_FS = 43
+    ANNOT_FS = 40
+    LEG_FS = 42
+
+    # --- (a) Buffer-Tier Device WA ---
+    for i, config_name in enumerate(configs):
+        val = 0
+        if has_workload(config_name, workload):
+            data = load_csv_data(config_name, workload)
+            fdp_host_start = 0
+            fdp_media_start = 0
+            for si in range(len(data["host_write_gb"])):
+                if data["host_write_gb"][si] >= COST_START_HOST_WRITE_GB:
+                    fdp_host_start = data["fdp_host_write_gb"][si]
+                    fdp_media_start = data["fdp_media_write_gb"][si]
+                    break
+            fdp_host = data["fdp_host_write_gb"][-1] - fdp_host_start
+            fdp_media = data["fdp_media_write_gb"][-1] - fdp_media_start
+            val = fdp_media / fdp_host if fdp_host > 0 else 0
+        ax_a.bar(x[i], val, bar_w,
+                 color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=BAR_EDGE_LW)
+        if val > 0:
+            ax_a.annotate(f'{val:.2f}',
+                          xy=(x[i], val),
+                          xytext=(0, 2), textcoords="offset points",
+                          ha='center', va='bottom', fontsize=ANNOT_FS)
+
+    ax_a.set_ylabel("WA", fontsize=LBL_FS)
+    ax_a.set_xlabel("(a) Device-level WA", fontsize=LBL_FS)
+    ax_a.set_xticks(x)
+    ax_a.set_xticklabels([display_name(c) for c in configs], fontsize=TICK_FS, rotation=35, ha='right')
+    ax_a.tick_params(axis='y', labelsize=TICK_FS)
+    ax_a.grid(True, axis='y')
+    ax_a.set_ylim(bottom=0, top=4.5)
+    ax_a.set_xlim(x[0] - x_pad, x[-1] + x_pad)
+
+    # --- (b) Capacity-Tier Writes ---
+    for i, config_name in enumerate(configs):
+        val = 0
+        if has_workload(config_name, workload):
+            final = get_final_values(config_name, workload, run_index=0)
+            val = final["qlc_write_gb"] / 1000
+        ax_b.bar(x[i], val, bar_w, label=display_name(config_name),
+                 color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=BAR_EDGE_LW)
+        if val > 0:
+            ax_b.annotate(f'{val:.2f}',
+                          xy=(x[i], val),
+                          xytext=(0, 2), textcoords="offset points",
+                          ha='center', va='bottom', fontsize=ANNOT_FS)
+
+    ax_b.set_ylabel("TB", fontsize=LBL_FS)
+    ax_b.set_xlabel("(b) Capacity-tier Writes", fontsize=LBL_FS)
+    ax_b.set_xticks(x)
+    ax_b.set_xticklabels([display_name(c) for c in configs], fontsize=TICK_FS, rotation=35, ha='right')
+    ax_b.tick_params(axis='y', labelsize=TICK_FS)
+    ax_b.grid(True, axis='y')
+    ax_b.set_ylim(bottom=0, top=4.5)
+    ax_b.set_xlim(x[0] - x_pad, x[-1] + x_pad)
+
+    # --- (c) Normalized TEC (stacked) ---
+    raw_tlc = {}
+    raw_qlc = {}
+    raw_total = {}
+    for config_name in configs:
+        if has_workload(config_name, workload):
+            fv = get_final_values(config_name, workload, run_index=0)
+            raw_tlc[config_name] = fv["tlc_write_gb"]
+            raw_qlc[config_name] = r * fv["qlc_write_gb"]
+            raw_total[config_name] = raw_tlc[config_name] + raw_qlc[config_name]
+
+    base_cost = raw_total.get("OpenCAS", 1.0)
+
+    for i, config_name in enumerate(configs):
+        tlc_val = raw_tlc.get(config_name, 0) / base_cost if base_cost > 0 else 0
+        qlc_val = raw_qlc.get(config_name, 0) / base_cost if base_cost > 0 else 0
+        ax_c.bar(x[i], tlc_val, bar_w,
+                 color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=BAR_EDGE_LW)
+        ax_c.bar(x[i], qlc_val, bar_w, bottom=tlc_val,
+                 color=CONFIG_COLORS[config_name], edgecolor='black', linewidth=BAR_EDGE_LW,
+                 hatch='xx')
+        total_val = tlc_val + qlc_val
+        if total_val > 0:
+            ax_c.annotate(f'{total_val:.2f}',
+                          xy=(x[i], total_val),
+                          xytext=(0, 2), textcoords="offset points",
+                          ha='center', va='bottom', fontsize=ANNOT_FS)
+    ax_c.set_ylabel("Normalized TEC", fontsize=LBL_FS)
+    ax_c.set_xlabel("(c) TEC", fontsize=LBL_FS)
+    ax_c.set_xticks(x)
+    ax_c.set_xticklabels([display_name(c) for c in configs], fontsize=TICK_FS, rotation=35, ha='right')
+    ax_c.tick_params(axis='y', labelsize=TICK_FS)
+    ax_c.grid(True, axis='y')
+    ax_c.set_ylim(bottom=0, top=1.95)
+    ax_c.set_xlim(x[0] - x_pad, x[-1] + x_pad)
+    from matplotlib.patches import Patch
+    ax_c.legend(handles=[
+        Patch(facecolor='#E0E0E0', edgecolor='black', label='Buffer'),
+        Patch(facecolor='#E0E0E0', edgecolor='black', hatch='xx', label='Capacity'),
+    ], loc='upper right', bbox_to_anchor=(1.0, 1.02), ncol=1, fontsize=LEG_FS,
+       frameon=True, edgecolor='black', fancybox=False, handlelength=0.8,
+       handletextpad=0.3, labelspacing=0.25, borderpad=0.3)
+
+    # Lighten axes spines on all subplots
+    for ax in (ax_a, ax_b, ax_c):
+        for spine in ax.spines.values():
+            spine.set_linewidth(SPINE_LW)
+
+    plt.tight_layout()
+    plt.subplots_adjust(right=0.90, left=0.05, bottom=0.30, top=0.95, wspace=0.50)
+    # Asymmetric padding: tight on top/bottom/left, generous on right so (c) xlabel fits
+    fig.canvas.draw()
+    from matplotlib.transforms import Bbox
+    tb = fig.get_tightbbox(fig.canvas.get_renderer())
+    bbox = Bbox.from_extents(tb.xmin + 0.0, tb.ymin - 0.05, tb.xmax + 0.05, tb.ymax + 0.05)
+    plt.savefig(OUTPUT_FILES["graph_j2"], dpi=150, bbox_inches=bbox)
+    plt.close()
+    print(f"Saved: {OUTPUT_FILES['graph_j2']}")
 
 
 GRAPH_FUNCTIONS = {
@@ -1280,6 +1408,7 @@ GRAPH_FUNCTIONS = {
     "g": plot_graph_g,
     "i": plot_graph_i,
     "j": plot_graph_j,
+    "j2": plot_graph_j2,
 }
 
 
