@@ -638,7 +638,6 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
         //   → GC (RAISE) iff Gud < invrate_sum·r, else flush (LOWER).
         (void)F_pred;   // kept for logging only
         (void)F_ghost;  // kept for logging only
-        (void)waf_w;    // kept for logging only (no longer in the rule)
         const double vic_target_free =
             util_step_ * static_cast<double>(total_segments);
         EvictPolicy::VictimWtSpanResult vspan;
@@ -649,8 +648,8 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
         }
         const double lambda = lambda_ratio.has_value() ? lambda_ratio.value() : 0.0;
         (void)lambda;   // kept for logging only (no longer in the rule)
-        const double lhs   = Gud;                            // GC copy cost / host page
-        const double rhs   = invrate_sum * periodic_ratio_;  // invrate·r / host page
+        const double lhs   = Gud;                                    // GC copy cost / host page
+        const double rhs   = invrate_sum * periodic_ratio_ * waf_w;  // invrate·r·waf / host page
         const bool   raise = (lhs < rhs);
         // (anti-stuck cap removed per request: decision is purely Gud < invrate_sum·r,
         //  no forced flush after N consecutive RAISEs.)
