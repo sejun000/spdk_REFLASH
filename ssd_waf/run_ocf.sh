@@ -41,6 +41,7 @@ SKIP_PRE_FORMAT=${SKIP_PRE_FORMAT:-0}
 
 # Prefill: Sequential write to cache device (skipping first CACHE_SPLIT_GB)
 PREFILL=${PREFILL:-0}
+BACKEND_PREFILL=${BACKEND_PREFILL:-${PREFILL}}
 
 log() {
     echo "[run_ocf] $*"
@@ -191,6 +192,56 @@ prefill_cache() {
 
     echo ""
     log "Prefill completed!"
+    echo ""
+}
+
+prefill_backend() {
+    if [[ "${BACKEND_PREFILL}" != "1" ]]; then
+        return 0
+    fi
+
+    local backend_ctrl=$(ls -d /sys/bus/pci/devices/${BACKEND_BDF}/nvme/nvme* 2>/dev/null | head -1 | xargs basename 2>/dev/null || true)
+    local backend_dev=""
+    if [[ -n "$backend_ctrl" ]]; then
+        backend_dev=$(find_nvme_ns "$backend_ctrl" || true)
+    fi
+
+    if [[ -z "$backend_dev" ]] || [[ ! -e "/dev/${backend_dev}" ]]; then
+        log "Backend device not found at ${BACKEND_BDF}, skipping backend prefill"
+        return 0
+    fi
+
+    local device="/dev/${backend_dev}"
+    local device_size=$(sudo blockdev --getsize64 "$device")
+    local device_size_gb=$((device_size / 1024 / 1024 / 1024))
+
+    echo ""
+    echo "=========================================="
+    echo "  Prefill: Sequential write to backend"
+    echo "  Device: ${device} (${BACKEND_BDF})"
+    echo "  Size: ${device_size_gb} GB"
+    echo "=========================================="
+    echo "예상 시간: ~$((device_size_gb / 1500))-$((device_size_gb / 1000))분 (1-1.5 GB/s 기준, QLC)"
+    echo ""
+
+    sudo fio --name=prefill_backend \
+        --filename="${device}" \
+        --ioengine=libaio \
+        --direct=1 \
+        --bs=1M \
+        --rw=write \
+        --iodepth=32 \
+        --numjobs=1 \
+        --group_reporting \
+        --status-interval=10
+
+    if [[ $? -ne 0 ]]; then
+        log "Backend prefill failed!"
+        exit 1
+    fi
+
+    echo ""
+    log "Backend prefill completed!"
     echo ""
 }
 
@@ -479,6 +530,7 @@ sudo "${ROOT_DIR}/scripts/setup.sh" reset
 
 pre_format_devices
 prefill_cache
+prefill_backend
 
 log "Compacting memory for hugepage allocation..."
 sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
