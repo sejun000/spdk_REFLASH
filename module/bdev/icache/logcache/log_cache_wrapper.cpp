@@ -87,8 +87,8 @@ static double score_warm_first(Segment *seg) {
         return -static_cast<double>(seg->create_timestamp);
     }
     if (u < 0.0001) u = 0.0001;
-    return std::min(g_threshold - (g_timestamp - seg->create_timestamp),
-                    g_timestamp - seg->create_timestamp) * (1 - u) / u;
+    return sqrt(std::min(g_threshold - (g_timestamp - seg->create_timestamp),
+                    g_timestamp - seg->create_timestamp)) * (1 - u) / u;
 }
 
 // Score function: prefer HOT segments (recently created) for compaction
@@ -129,7 +129,7 @@ static double score_sepbit_age(Segment *seg) {
         return -static_cast<double>(seg->create_timestamp);
     }
     if (u < 0.0001) u = 0.0001;
-    return (g_timestamp - seg->create_timestamp) * (1 - u) / u;
+    return sqrt(g_timestamp - seg->create_timestamp) * (1 - u) / u;
 }
 
 namespace icache {
