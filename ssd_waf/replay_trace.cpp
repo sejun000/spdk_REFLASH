@@ -4,6 +4,9 @@
  * Features:
  * - Default: passthrough LBA (trace LBA used as-is, modulo device size)
  * - Optional: sequential LBA remapping with --remap-lba
+ * - Mixed R/RS and W/WS replay with separate read/write statistics
+ * - Read/write completion latency p90 and p99
+ * - Termination based only on completed write bytes
  * - Auto device detection (ublk > nvmeof > opencas)
  * - Multi-threaded with libaio for maximum performance
  *
@@ -40,6 +43,8 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <algorithm>
+#include <array>
+#include <limits>
 #include <signal.h>
 
 // Configuration
@@ -49,38 +54,145 @@ constexpr int IO_BLOCK_SIZE = 4096;
 constexpr int MAX_IO_SIZE = 1024 * 1024;  // 1MB
 constexpr uint64_t MAX_PENDING_BYTES = 1 * 1024 * 1024;  // 1MB total pending limit
 constexpr int REPORT_INTERVAL = 100000;
+constexpr int STATS_BATCH_SIZE = 256;
+constexpr unsigned LATENCY_SUB_BUCKETS = 64;
+constexpr unsigned LATENCY_BUCKETS = 64 * LATENCY_SUB_BUCKETS;
 constexpr double DEFAULT_MAX_TB = 10.0;
 constexpr const char* DEFAULT_TRACE = "/home/sejun000/alibaba_dwpd1.trace.head30p";
 
 // Global state
 std::atomic<bool> g_stop_flag{false};
+std::atomic<bool> g_write_limit_reached{false};
 std::atomic<uint64_t> g_max_write_bytes{0};
+std::atomic<uint64_t> g_completed_write_bytes{0};
 std::atomic<uint64_t> g_pending_bytes{0};  // Total in-flight bytes across all threads
 
-void signal_handler(int sig) {
+void signal_handler(int) {
     printf("\n[Ctrl+C] Exiting...\n");
     g_stop_flag.store(true);
 }
 
+static void
+account_completed_write(uint64_t bytes)
+{
+    uint64_t completed = g_completed_write_bytes.fetch_add(bytes) + bytes;
+    if (completed >= g_max_write_bytes.load() && !g_write_limit_reached.exchange(true)) {
+        g_stop_flag.store(true);
+        printf("\n[Limit] %.1f TB of completed writes reached; draining in-flight I/O...\n",
+               g_max_write_bytes.load() / (1024.0*1024*1024*1024));
+    }
+}
+
+enum class IoType : uint8_t {
+    READ,
+    WRITE,
+};
+
+static unsigned
+latency_bucket(uint64_t latency_ns)
+{
+    if (latency_ns == 0) {
+        return 0;
+    }
+
+    unsigned exponent = 63U - static_cast<unsigned>(__builtin_clzll(latency_ns));
+    uint64_t base = 1ULL << exponent;
+    uint64_t offset = latency_ns - base;
+    unsigned sub_bucket = static_cast<unsigned>(
+                              (static_cast<__uint128_t>(offset) * LATENCY_SUB_BUCKETS) / base);
+    return std::min(exponent * LATENCY_SUB_BUCKETS + sub_bucket, LATENCY_BUCKETS - 1);
+}
+
+static uint64_t
+latency_bucket_upper_ns(unsigned bucket)
+{
+    unsigned exponent = bucket / LATENCY_SUB_BUCKETS;
+    unsigned sub_bucket = bucket % LATENCY_SUB_BUCKETS;
+    uint64_t base = 1ULL << exponent;
+    __uint128_t upper = static_cast<__uint128_t>(base) +
+                        (static_cast<__uint128_t>(sub_bucket + 1) * base +
+                         LATENCY_SUB_BUCKETS - 1) / LATENCY_SUB_BUCKETS - 1;
+    return upper > std::numeric_limits<uint64_t>::max() ?
+           std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(upper);
+}
+
+struct CompletionBatch {
+    uint64_t read_ios = 0;
+    uint64_t write_ios = 0;
+    uint64_t read_bytes = 0;
+    uint64_t write_bytes = 0;
+    uint64_t errors = 0;
+    std::array<uint64_t, LATENCY_BUCKETS> read_latency{};
+    std::array<uint64_t, LATENCY_BUCKETS> write_latency{};
+    std::vector<unsigned> read_touched;
+    std::vector<unsigned> write_touched;
+
+    CompletionBatch()
+    {
+        read_touched.reserve(128);
+        write_touched.reserve(128);
+    }
+
+    void add(IoType type, uint64_t bytes, uint64_t latency_ns)
+    {
+        unsigned bucket = latency_bucket(latency_ns);
+        auto &histogram = type == IoType::WRITE ? write_latency : read_latency;
+        auto &touched = type == IoType::WRITE ? write_touched : read_touched;
+
+        if (histogram[bucket]++ == 0) {
+            touched.push_back(bucket);
+        }
+
+        if (type == IoType::WRITE) {
+            write_ios++;
+            write_bytes += bytes;
+        } else {
+            read_ios++;
+            read_bytes += bytes;
+        }
+    }
+
+    uint64_t total_ios() const { return read_ios + write_ios + errors; }
+
+    void clear()
+    {
+        for (unsigned bucket : read_touched) {
+            read_latency[bucket] = 0;
+        }
+        for (unsigned bucket : write_touched) {
+            write_latency[bucket] = 0;
+        }
+        read_touched.clear();
+        write_touched.clear();
+        read_ios = write_ios = 0;
+        read_bytes = write_bytes = 0;
+        errors = 0;
+    }
+};
+
 // Thread-safe statistics
 class ReplayStats {
 public:
-    void add(uint64_t ios, uint64_t bytes) {
+    void add(CompletionBatch& batch) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (start_time_ == std::chrono::steady_clock::time_point{}) {
             start_time_ = std::chrono::steady_clock::now();
             last_report_time_ = start_time_;
         }
-        total_ios_ += ios;
-        total_bytes_ += bytes;
+        read_ios_ += batch.read_ios;
+        write_ios_ += batch.write_ios;
+        read_bytes_ += batch.read_bytes;
+        write_bytes_ += batch.write_bytes;
+        errors_ += batch.errors;
 
-        // Check write limit
-        if (total_bytes_ >= g_max_write_bytes.load()) {
-            print_final_unlocked();
-            printf("\n[Limit] %.1f TB reached, exiting...\n",
-                   g_max_write_bytes.load() / (1024.0*1024*1024*1024));
-            exit(0);
+        for (unsigned bucket : batch.read_touched) {
+            read_latency_[bucket] += batch.read_latency[bucket];
         }
+        for (unsigned bucket : batch.write_touched) {
+            write_latency_[bucket] += batch.write_latency[bucket];
+        }
+
+        batch.clear();
     }
 
     void report(bool force = false) {
@@ -91,15 +203,19 @@ public:
         double elapsed = std::chrono::duration<double>(now - start_time_).count();
         if (elapsed < 0.001) return;
 
-        uint64_t ios_since_last = total_ios_ - last_report_ios_;
+        uint64_t total_ios = read_ios_ + write_ios_;
+        uint64_t total_bytes = read_bytes_ + write_bytes_;
+        uint64_t ios_since_last = total_ios - last_report_ios_;
         if (ios_since_last >= REPORT_INTERVAL || force) {
             // All metrics are cumulative averages
-            double avg_iops = total_ios_ / elapsed;
-            double avg_throughput_mb = (total_bytes_ / (1024.0*1024)) / elapsed;
-            double throughput_gb = total_bytes_ / (1024.0*1024*1024);
-            printf("[%7.1fs] IOs: %12lu  IOPS: %8.0f  Throughput: %7.1f MB/s  Total: %7.2f GB\n",
-                   elapsed, total_ios_, avg_iops, avg_throughput_mb, throughput_gb);
-            last_report_ios_ = total_ios_;
+            double avg_iops = total_ios / elapsed;
+            double avg_throughput_mb = (total_bytes / (1024.0*1024)) / elapsed;
+            printf("[%7.1fs] IOs: %12lu  IOPS: %8.0f  BW: %7.1f MB/s  "
+                   "Read: %7.2f GB  Write: %7.2f GB\n",
+                   elapsed, total_ios, avg_iops, avg_throughput_mb,
+                   read_bytes_ / (1024.0*1024*1024),
+                   write_bytes_ / (1024.0*1024*1024));
+            last_report_ios_ = total_ios;
             last_report_time_ = now;
         }
     }
@@ -110,6 +226,42 @@ public:
     }
 
 private:
+    uint64_t percentile_ns(const std::array<uint64_t, LATENCY_BUCKETS>& histogram,
+                           uint64_t count, unsigned percentile) const
+    {
+        if (count == 0) {
+            return 0;
+        }
+
+        uint64_t target = (count * percentile + 99) / 100;
+        uint64_t cumulative = 0;
+        for (unsigned bucket = 0; bucket < LATENCY_BUCKETS; bucket++) {
+            cumulative += histogram[bucket];
+            if (cumulative >= target) {
+                return latency_bucket_upper_ns(bucket);
+            }
+        }
+        return latency_bucket_upper_ns(LATENCY_BUCKETS - 1);
+    }
+
+    void print_op_stats_unlocked(const char* name, uint64_t ios, uint64_t bytes,
+                                 const std::array<uint64_t, LATENCY_BUCKETS>& latency,
+                                 double elapsed)
+    {
+        printf("  %-5s IOs:       %lu\n", name, ios);
+        printf("  %-5s Data:      %.2f GB (%.4f TB)\n", name,
+               bytes / (1024.0*1024*1024), bytes / (1024.0*1024*1024*1024));
+        printf("  %-5s IOPS:      %.0f\n", name, ios / elapsed);
+        printf("  %-5s BW:        %.1f MB/s\n", name, (bytes / (1024.0*1024)) / elapsed);
+        if (ios > 0) {
+            printf("  %-5s Latency:   p90 %.2f us, p99 %.2f us\n", name,
+                   percentile_ns(latency, ios, 90) / 1000.0,
+                   percentile_ns(latency, ios, 99) / 1000.0);
+        } else {
+            printf("  %-5s Latency:   n/a\n", name);
+        }
+    }
+
     void print_final_unlocked() {
         if (start_time_ == std::chrono::steady_clock::time_point{}) {
             printf("No IOs completed\n");
@@ -119,29 +271,38 @@ private:
         double elapsed = std::chrono::duration<double>(now - start_time_).count();
         if (elapsed < 0.001) elapsed = 0.001;
 
-        double iops = total_ios_ / elapsed;
-        double throughput_mb = (total_bytes_ / (1024.0*1024)) / elapsed;
-        double throughput_gb = total_bytes_ / (1024.0*1024*1024);
-        double throughput_tb = total_bytes_ / (1024.0*1024*1024*1024);
+        uint64_t total_ios = read_ios_ + write_ios_;
+        uint64_t total_bytes = read_bytes_ + write_bytes_;
 
         printf("\n============================================================\n");
-        printf("  Final Results (Saturated Replay)\n");
+        printf("  Final Results (Mixed Read/Write Saturated Replay)\n");
         printf("============================================================\n");
-        printf("  Total IOs:       %lu\n", total_ios_);
-        printf("  Total Data:      %.2f GB (%.4f TB)\n", throughput_gb, throughput_tb);
         printf("  Elapsed Time:    %.2f seconds\n", elapsed);
-        printf("  Average IOPS:    %.0f\n", iops);
-        printf("  Average BW:      %.1f MB/s\n", throughput_mb);
+        printf("  Total IOs:       %lu\n", total_ios);
+        printf("  Total Data:      %.2f GB (%.4f TB)\n",
+               total_bytes / (1024.0*1024*1024),
+               total_bytes / (1024.0*1024*1024*1024));
+        printf("  Average IOPS:    %.0f\n", total_ios / elapsed);
+        printf("  Average BW:      %.1f MB/s\n", (total_bytes / (1024.0*1024)) / elapsed);
+        print_op_stats_unlocked("Read", read_ios_, read_bytes_, read_latency_, elapsed);
+        print_op_stats_unlocked("Write", write_ios_, write_bytes_, write_latency_, elapsed);
+        printf("  I/O Errors:      %lu\n", errors_);
+        printf("  Stop reason:     %s\n",
+               g_write_limit_reached.load() ? "completed write limit reached" : "trace ended or interrupted");
         printf("============================================================\n");
     }
 
     std::mutex mutex_;
     std::chrono::steady_clock::time_point start_time_{};
     std::chrono::steady_clock::time_point last_report_time_{};
-    uint64_t total_ios_ = 0;
-    uint64_t total_bytes_ = 0;
+    std::array<uint64_t, LATENCY_BUCKETS> read_latency_{};
+    std::array<uint64_t, LATENCY_BUCKETS> write_latency_{};
+    uint64_t read_ios_ = 0;
+    uint64_t write_ios_ = 0;
+    uint64_t read_bytes_ = 0;
+    uint64_t write_bytes_ = 0;
+    uint64_t errors_ = 0;
     uint64_t last_report_ios_ = 0;
-    uint64_t last_report_bytes_ = 0;
 };
 
 // LBA Mapper: maps trace LBAs to device LBAs
@@ -222,8 +383,9 @@ private:
 
 // Work item
 struct WorkItem {
-    int64_t offset;  // -1 means end
+    int64_t offset;
     uint32_t size;
+    IoType type;
 };
 
 // Thread-safe work queue
@@ -231,17 +393,22 @@ class WorkQueue {
 public:
     WorkQueue(size_t max_size) : max_size_(max_size) {}
 
-    void push(const WorkItem& item) {
+    bool push(const WorkItem& item) {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_not_full_.wait(lock, [this] { return queue_.size() < max_size_ || done_; });
-        if (done_) return;
+        while (queue_.size() >= max_size_ && !done_ && !g_stop_flag.load()) {
+            cv_not_full_.wait_for(lock, std::chrono::milliseconds(100));
+        }
+        if (done_ || g_stop_flag.load()) return false;
         queue_.push(item);
         cv_not_empty_.notify_one();
+        return true;
     }
 
     bool pop(WorkItem& item) {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_not_empty_.wait(lock, [this] { return !queue_.empty() || done_; });
+        while (queue_.empty() && !done_ && !g_stop_flag.load()) {
+            cv_not_empty_.wait_for(lock, std::chrono::milliseconds(100));
+        }
         if (queue_.empty()) return false;
         item = queue_.front();
         queue_.pop();
@@ -338,9 +505,10 @@ uint64_t get_device_size(const std::string& device) {
 
 // Worker thread using libaio
 void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, ReplayStats& stats) {
-    int fd = open(device.c_str(), O_WRONLY | O_DIRECT);
+    int fd = open(device.c_str(), O_RDWR | O_DIRECT);
     if (fd < 0) {
         printf("Thread %d: Failed to open device: %s\n", thread_id, strerror(errno));
+        g_stop_flag.store(true);
         return;
     }
 
@@ -348,6 +516,7 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
     io_context_t ctx = 0;
     if (io_setup(QUEUE_DEPTH, &ctx) < 0) {
         printf("Thread %d: io_setup failed\n", thread_id);
+        g_stop_flag.store(true);
         close(fd);
         return;
     }
@@ -357,6 +526,8 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
     std::vector<struct iocb> iocbs(QUEUE_DEPTH);
     std::vector<struct iocb*> iocb_ptrs(QUEUE_DEPTH);
     std::vector<uint32_t> io_sizes(QUEUE_DEPTH);
+    std::vector<IoType> io_types(QUEUE_DEPTH);
+    std::vector<std::chrono::steady_clock::time_point> submit_times(QUEUE_DEPTH);
 
     // Free slot management
     std::vector<int> free_slots;
@@ -368,6 +539,7 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
     for (int i = 0; i < QUEUE_DEPTH; i++) {
         if (posix_memalign(&buffers[i], IO_BLOCK_SIZE, MAX_IO_SIZE) != 0) {
             printf("Thread %d: Failed to allocate buffer\n", thread_id);
+            g_stop_flag.store(true);
             io_destroy(ctx);
             close(fd);
             return;
@@ -375,10 +547,9 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
         memset(buffers[i], 0, MAX_IO_SIZE);
     }
 
-    uint64_t completed_ios = 0;
-    uint64_t completed_bytes = 0;
-    uint64_t batch_ios = 0;
-    uint64_t batch_bytes = 0;
+    uint64_t completed_reads = 0;
+    uint64_t completed_writes = 0;
+    CompletionBatch batch;
     int in_flight = 0;
 
     // Event buffer for io_getevents
@@ -387,9 +558,9 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
     WorkItem item;
     bool reading_done = false;
 
-    while (!g_stop_flag.load()) {
+    while (true) {
         // Submit new IOs if we have free slots, work, and pending limit allows
-        while (!free_slots.empty() && !reading_done) {
+        while (!g_stop_flag.load() && !free_slots.empty() && !reading_done) {
             // Check global pending bytes limit before popping from queue
             uint64_t current_pending = g_pending_bytes.load();
             if (current_pending >= MAX_PENDING_BYTES) {
@@ -398,11 +569,6 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
             }
 
             if (!queue.pop(item)) {
-                reading_done = true;
-                break;
-            }
-
-            if (item.offset < 0) {
                 reading_done = true;
                 break;
             }
@@ -416,9 +582,15 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
             free_slots.pop_back();
 
             io_sizes[slot] = aligned_size;
-            io_prep_pwrite(&iocbs[slot], fd, buffers[slot], aligned_size, item.offset);
+            io_types[slot] = item.type;
+            if (item.type == IoType::WRITE) {
+                io_prep_pwrite(&iocbs[slot], fd, buffers[slot], aligned_size, item.offset);
+            } else {
+                io_prep_pread(&iocbs[slot], fd, buffers[slot], aligned_size, item.offset);
+            }
             iocbs[slot].data = (void*)(intptr_t)slot;
             iocb_ptrs[0] = &iocbs[slot];
+            submit_times[slot] = std::chrono::steady_clock::now();
 
             int ret = io_submit(ctx, 1, iocb_ptrs.data());
             if (ret == 1) {
@@ -427,6 +599,7 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
             } else {
                 // Submit failed, return slot to free list
                 free_slots.push_back(slot);
+                batch.errors++;
             }
         }
 
@@ -434,6 +607,7 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
         if (in_flight > 0) {
             struct timespec timeout = {0, 1000000};  // 1ms
             int n = io_getevents(ctx, 1, in_flight, events.data(), &timeout);
+            auto completion_time = std::chrono::steady_clock::now();
 
             for (int i = 0; i < n; i++) {
                 int slot = (int)(intptr_t)events[i].obj->data;
@@ -444,28 +618,32 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
                 g_pending_bytes.fetch_sub(io_sizes[slot]);
 
                 if (events[i].res > 0) {
-                    completed_ios++;
-                    completed_bytes += io_sizes[slot];
-                    batch_ios++;
-                    batch_bytes += io_sizes[slot];
+                    uint64_t latency_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              completion_time - submit_times[slot]).count();
+                    batch.add(io_types[slot], static_cast<uint64_t>(events[i].res), latency_ns);
+                    if (io_types[slot] == IoType::WRITE) {
+                        completed_writes++;
+                        account_completed_write(static_cast<uint64_t>(events[i].res));
+                    } else {
+                        completed_reads++;
+                    }
+                } else {
+                    batch.errors++;
                 }
             }
 
-            // Batch update stats every 1000 IOs
-            if (batch_ios >= 1000) {
-                stats.add(batch_ios, batch_bytes);
-                batch_ios = 0;
-                batch_bytes = 0;
+            if (batch.total_ios() >= STATS_BATCH_SIZE) {
+                stats.add(batch);
                 stats.report();
             }
         }
 
-        if (reading_done && in_flight == 0) break;
+        if ((reading_done || g_stop_flag.load()) && in_flight == 0) break;
     }
 
     // Final stats
-    if (batch_ios > 0 || batch_bytes > 0) {
-        stats.add(batch_ios, batch_bytes);
+    if (batch.total_ios() > 0) {
+        stats.add(batch);
     }
 
     // Cleanup
@@ -475,7 +653,8 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
     io_destroy(ctx);
     close(fd);
 
-    printf("Thread %d: Completed %lu IOs\n", thread_id, completed_ios);
+    printf("Thread %d: Completed %lu reads, %lu writes\n",
+           thread_id, completed_reads, completed_writes);
 }
 
 // Reader thread
@@ -489,7 +668,8 @@ void reader_thread(const std::string& trace_path, std::vector<WorkQueue*>& queue
     }
 
     uint64_t line_num = 0;
-    uint64_t distributed = 0;
+    uint64_t distributed_reads = 0;
+    uint64_t distributed_writes = 0;
     std::string line;
 
     while (std::getline(file, line) && !g_stop_flag.load()) {
@@ -511,7 +691,9 @@ void reader_thread(const std::string& trace_path, std::vector<WorkQueue*>& queue
 
         if (parts.size() >= 4) {
             const std::string& op = parts[1];
-            if (op == "W" || op == "WS") {
+            bool is_write = op == "W" || op == "WS";
+            bool is_read = op == "R" || op == "RS";
+            if (is_write || is_read) {
                 try {
                     uint64_t offset = std::stoull(parts[2]) * io_scale;
                     uint32_t size = std::stoul(parts[3]) * io_scale;
@@ -520,13 +702,24 @@ void reader_thread(const std::string& trace_path, std::vector<WorkQueue*>& queue
                         // Split IO into 4KB chunks and map each independently
                         uint64_t num_blocks = (size + IO_BLOCK_SIZE - 1) / IO_BLOCK_SIZE;
                         for (uint64_t i = 0; i < num_blocks; i++) {
+                            if (g_stop_flag.load()) {
+                                break;
+                            }
                             uint64_t block_offset = offset + (i * IO_BLOCK_SIZE);
                             int64_t device_offset = mapper.map(block_offset);
                             if (device_offset >= 0) {
-                                WorkItem item{device_offset, IO_BLOCK_SIZE};
+                                uint64_t distributed = distributed_reads + distributed_writes;
+                                WorkItem item{device_offset, IO_BLOCK_SIZE,
+                                              is_write ? IoType::WRITE : IoType::READ};
                                 int thread_id = distributed % num_threads;
-                                queues[thread_id]->push(item);
-                                distributed++;
+                                if (!queues[thread_id]->push(item)) {
+                                    break;
+                                }
+                                if (is_write) {
+                                    distributed_writes++;
+                                } else {
+                                    distributed_reads++;
+                                }
                             }
                         }
                     }
@@ -539,32 +732,31 @@ void reader_thread(const std::string& trace_path, std::vector<WorkQueue*>& queue
         line_num++;
         if (line_num % 1000000 == 0) {
             if (mapper.is_remap()) {
-                printf("[Reader] Parsed %lu lines, distributed %lu writes, unique %.2f GB, skipped %lu\n",
-                       line_num, distributed,
+                printf("[Reader] Parsed %lu lines, distributed %lu reads / %lu writes, "
+                       "unique %.2f GB, skipped %lu\n",
+                       line_num, distributed_reads, distributed_writes,
                        mapper.get_unique_bytes() / (1024.0*1024*1024),
                        mapper.get_skipped_ios());
             } else {
-                printf("[Reader] Parsed %lu lines, distributed %lu writes\n",
-                       line_num, distributed);
+                printf("[Reader] Parsed %lu lines, distributed %lu reads / %lu writes\n",
+                       line_num, distributed_reads, distributed_writes);
             }
         }
     }
 
     // Signal end to all workers
     for (auto& q : queues) {
-        WorkItem end_item{-1, 0};
-        q->push(end_item);
         q->set_done();
     }
 
     if (mapper.is_remap()) {
-        printf("[Reader] Done: %lu lines, %lu writes, unique %.2f GB, skipped %lu\n",
-               line_num, distributed,
+        printf("[Reader] Done: %lu lines, %lu reads / %lu writes, unique %.2f GB, skipped %lu\n",
+               line_num, distributed_reads, distributed_writes,
                mapper.get_unique_bytes() / (1024.0*1024*1024),
                mapper.get_skipped_ios());
     } else {
-        printf("[Reader] Done: %lu lines, %lu writes\n",
-               line_num, distributed);
+        printf("[Reader] Done: %lu lines, %lu reads / %lu writes\n",
+               line_num, distributed_reads, distributed_writes);
     }
 }
 
@@ -574,7 +766,7 @@ void print_usage(const char* prog) {
     printf("  --device PATH    Target device (auto-detect if not specified)\n");
     printf("  --trace PATH     Trace file path (default: %s)\n", DEFAULT_TRACE);
     printf("  --threads N      Number of threads (default: %d)\n", NUM_THREADS);
-    printf("  --max-tb N       Max write amount in TB (default: %.1f)\n", DEFAULT_MAX_TB);
+    printf("  --max-tb N       Stop after N TB of completed writes (default: %.1f)\n", DEFAULT_MAX_TB);
     printf("  --remap-lba      Remap LBAs sequentially (default: passthrough)\n");
     printf("  --io-scale N     Multiply offset and size by N (default: 1)\n");
     printf("  --help           Show this help\n");
@@ -649,7 +841,7 @@ int main(int argc, char* argv[]) {
     printf("  Trace:       %s\n", trace.c_str());
     printf("  Threads:     %d\n", num_threads);
     printf("  QD/thread:   %d\n", QUEUE_DEPTH);
-    printf("  Max write:   %.1f TB\n", max_tb);
+    printf("  Max writes:  %.1f TB (completed write bytes only)\n", max_tb);
     printf("  IO scale:   %u\n", io_scale);
     printf("  LBA mode:   %s\n", remap_lba ? "Remap (sequential)" : "Passthrough");
     printf("============================================================\n\n");

@@ -13,7 +13,7 @@
 #     3) alibaba_dwpd1to2_4x.trace   (default)
 #     4) alibaba_dwpd2_5x.trace
 #     5) ssdtrace_scaled_4x.trace
-#     6) varmail_2tb_6x_16t.csv
+#     7) fio_zipf_1.0 (50% read / 50% write)
 
 set -e
 
@@ -29,11 +29,10 @@ declare -a TRACE_FILES=(
     [3]="alibaba_dwpd1to2_4x.trace"
     [4]="alibaba_dwpd2_5x.trace"
     [5]="ssdtrace_scaled_4x.trace"
-    [6]="varmail_2tb_6x_16t.csv"
     [7]="fio_zipf_1.0"
 )
 # Default trace file (used when TRACE_NUMS is not set)
-TRACE_FILE="${TRACE_FILE:-${TRACE_BASE}varmail_2tb_6x_16t.csv}"
+TRACE_FILE="${TRACE_FILE:-${TRACE_BASE}alibaba_dwpd1to2_4x.trace}"
 
 # fio zipf parameters
 FIO_ZIPF_THETA="0.9"
@@ -246,9 +245,13 @@ run_fio_zipf() {
     cd "$SCRIPT_DIR"
 
     local fio_numjobs=4
-    local per_job_io_gib=$(( MAX_TB * 1024 / fio_numjobs ))
+    # randrw is 50:50, so issue 2x total I/O to reach MAX_TB expected writes.
+    # With billions of 4K I/Os, the random mix converges extremely closely to 50:50.
+    local total_io_gib=$(( MAX_TB * 2 * 1024 ))
+    local per_job_io_gib=$(( total_io_gib / fio_numjobs ))
 
-    log_info "  Working set: ${FIO_ZIPF_SIZE}, io_size/job: ${per_job_io_gib}g (total ${MAX_TB}TB), seeds: ${FIO_ZIPF_RANDSEED}..$(( FIO_ZIPF_RANDSEED + fio_numjobs - 1 ))"
+    log_info "  Working set: ${FIO_ZIPF_SIZE}, mix: 50% read / 50% write"
+    log_info "  io_size/job: ${per_job_io_gib}g (total I/O $((MAX_TB * 2))TB, expected writes ${MAX_TB}TB), seeds: ${FIO_ZIPF_RANDSEED}..$(( FIO_ZIPF_RANDSEED + fio_numjobs - 1 ))"
 
     # Generate temporary jobfile with per-job seeds
     local jobfile=$(mktemp /tmp/fio_zipf_XXXXXX.fio)
@@ -256,7 +259,8 @@ run_fio_zipf() {
 [global]
 ioengine=libaio
 direct=1
-rw=randwrite
+rw=randrw
+rwmixread=50
 bs=4k
 iodepth=64
 random_distribution=zipf:${FIO_ZIPF_THETA}
@@ -266,6 +270,8 @@ io_size=${per_job_io_gib}g
 filename=${device}
 group_reporting
 cpus_allowed=14-18
+clat_percentiles=1
+percentile_list=90:99
 
 FIOEOF
     for i in $(seq 0 $((fio_numjobs - 1))); do
@@ -402,8 +408,8 @@ main() {
             CURRENT_TRACE_NUM="$tnum"
             TRACE_FILE="${TRACE_BASE}${TRACE_FILES[$tnum]}"
 
-            # Trace 6 (varmail) and 7 (fio zipf) don't need --io-scale
-            if [ "$tnum" -eq 6 ] || [ "$tnum" -eq 7 ]; then
+            # Trace 7 (fio zipf) doesn't need --io-scale
+            if [ "$tnum" -eq 7 ]; then
                 IO_SCALE=""
             else
                 IO_SCALE="$io_scale_orig"
