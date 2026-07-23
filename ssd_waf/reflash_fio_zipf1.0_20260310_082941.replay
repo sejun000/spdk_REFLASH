@@ -1,0 +1,2 @@
+fio: zipf theta must different than 1.0
+fio: failed parsing random_distribution=zipf:1.0

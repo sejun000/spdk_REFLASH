@@ -1,0 +1,2 @@
+nohup: ignoring input
+taskset: failed to execute ./replay_trace: No such file or directory

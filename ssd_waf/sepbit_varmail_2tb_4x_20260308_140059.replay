@@ -1,0 +1,56 @@
+Auto-detect: NVMe-oF device found
+============================================================
+  High-Performance Trace Replay (C++ / libaio)
+============================================================
+  Device:      /dev/nvme2n1
+  Device size: 14307.90 GB (3750730326 LBAs)
+  Trace:       ../../varmail_2tb_4x.csv
+  Threads:     4
+  QD/thread:   64
+  Max write:   14.0 TB
+  IO scale:   2
+  LBA mode:   Remap (sequential)
+============================================================
+
+Replay started...
+
+[    0.3s] IOs:       100237  IOPS:   332238  Throughput:  1297.8 MB/s  Total:    0.38 GB
+[    0.6s] IOs:       200419  IOPS:   320570  Throughput:  1252.2 MB/s  Total:    0.76 GB
+[    0.9s] IOs:       301406  IOPS:   319702  Throughput:  1248.8 MB/s  Total:    1.15 GB
+[    1.2s] IOs:       402000  IOPS:   322954  Throughput:  1261.5 MB/s  Total:    1.53 GB
+[    1.6s] IOs:       502639  IOPS:   323083  Throughput:  1262.0 MB/s  Total:    1.92 GB
+[    1.9s] IOs:       602801  IOPS:   324194  Throughput:  1266.4 MB/s  Total:    2.30 GB
+[    2.2s] IOs:       702801  IOPS:   324686  Throughput:  1268.3 MB/s  Total:    2.68 GB
+[    2.5s] IOs:       803747  IOPS:   324502  Throughput:  1267.6 MB/s  Total:    3.07 GB
+[    2.8s] IOs:       904088  IOPS:   325453  Throughput:  1271.3 MB/s  Total:    3.45 GB
+[    3.1s] IOs:      1004704  IOPS:   326247  Throughput:  1274.4 MB/s  Total:    3.83 GB
+[    3.4s] IOs:      1105341  IOPS:   327241  Throughput:  1278.3 MB/s  Total:    4.22 GB
+[    3.7s] IOs:      1206015  IOPS:   326302  Throughput:  1274.6 MB/s  Total:    4.60 GB
+[    4.0s] IOs:      1306182  IOPS:   325182  Throughput:  1270.2 MB/s  Total:    4.98 GB
+[    4.3s] IOs:      1406536  IOPS:   325777  Throughput:  1272.6 MB/s  Total:    5.37 GB
+[    4.6s] IOs:      1506570  IOPS:   325881  Throughput:  1273.0 MB/s  Total:    5.75 GB
+[    4.9s] IOs:      1606716  IOPS:   325949  Throughput:  1273.2 MB/s  Total:    6.13 GB
+[    5.2s] IOs:      1706970  IOPS:   325944  Throughput:  1273.2 MB/s  Total:    6.51 GB
+[    5.5s] IOs:      1807168  IOPS:   325620  Throughput:  1272.0 MB/s  Total:    6.89 GB
+[    5.9s] IOs:      1907363  IOPS:   325538  Throughput:  1271.6 MB/s  Total:    7.28 GB
+[Reader] Parsed 1000000 lines, distributed 2000000 writes, unique 5.21 GB, skipped 0
+[    6.2s] IOs:      2007459  IOPS:   325028  Throughput:  1269.6 MB/s  Total:    7.66 GB
+[    6.5s] IOs:      2107571  IOPS:   325205  Throughput:  1270.3 MB/s  Total:    8.04 GB
+[    6.8s] IOs:      2207767  IOPS:   324890  Throughput:  1269.1 MB/s  Total:    8.42 GB
+[    7.1s] IOs:      2307995  IOPS:   324744  Throughput:  1268.5 MB/s  Total:    8.80 GB
+[    7.4s] IOs:      2408301  IOPS:   325061  Throughput:  1269.8 MB/s  Total:    9.19 GB
+[    7.7s] IOs:      2509289  IOPS:   325547  Throughput:  1271.7 MB/s  Total:    9.57 GB
+[    8.0s] IOs:      2609318  IOPS:   325697  Throughput:  1272.3 MB/s  Total:    9.95 GB
+[    8.3s] IOs:      2709705  IOPS:   325944  Throughput:  1273.2 MB/s  Total:   10.34 GB
+[    8.6s] IOs:      2810325  IOPS:   325857  Throughput:  1272.9 MB/s  Total:   10.72 GB
+[    8.9s] IOs:      2910456  IOPS:   326275  Throughput:  1274.5 MB/s  Total:   11.10 GB
+[    9.2s] IOs:      3010468  IOPS:   326622  Throughput:  1275.9 MB/s  Total:   11.48 GB
+[    9.5s] IOs:      3111297  IOPS:   326759  Throughput:  1276.4 MB/s  Total:   11.87 GB
+[    9.8s] IOs:      3211639  IOPS:   326753  Throughput:  1276.4 MB/s  Total:   12.25 GB
+[   10.1s] IOs:      3311739  IOPS:   326979  Throughput:  1277.3 MB/s  Total:   12.63 GB
+[   10.5s] IOs:      3412142  IOPS:   325631  Throughput:  1272.0 MB/s  Total:   13.02 GB
+[   10.8s] IOs:      3513075  IOPS:   325770  Throughput:  1272.5 MB/s  Total:   13.40 GB
+[   11.1s] IOs:      3614034  IOPS:   325842  Throughput:  1272.8 MB/s  Total:   13.79 GB
+[   11.4s] IOs:      3714616  IOPS:   326488  Throughput:  1275.3 MB/s  Total:   14.17 GB
+[   11.7s] IOs:      3815273  IOPS:   326913  Throughput:  1277.0 MB/s  Total:   14.55 GB
+[   12.0s] IOs:      3915461  IOPS:   327047  Throughput:  1277.5 MB/s  Total:   14.94 

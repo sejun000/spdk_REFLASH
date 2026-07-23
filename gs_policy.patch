@@ -1,0 +1,248 @@
+From: GhostDelta_GC_SUM (a.k.a. "GS") policy — SPDK port reference
+Purpose: cumulative CB-scan estimate of G(u+θ) for hill-climb on target_valid_blk_rate.
+
+Apply hint: SPDK baseline differs from cache_sim baseline. This patch is REFERENCE-ONLY;
+adapt names/types to SPDK conventions. The 6 hunks below are *additions* you need to
+graft into corresponding files in your SPDK tree.
+
+-----------------------------------------------------------------------------
+1) evict_policy.h  — add GhostSumResult struct + virtual scan API
+-----------------------------------------------------------------------------
+diff --git a/evict_policy.h b/evict_policy.h
+@@ near other virtual scan APIs in the eviction-policy base class @@
++    /* Cumulative version: scan score-order until reclaimed free space (in
++     * segment-equivalent units) reaches `target_free_segments`. Returns the
++     * cumulative valid pages and invalid pages over the visited segments and
++     * the number of segments visited (m). Used by periodic_ghost_delta_gc_sum
++     * to estimate G(u+θ) ≈ Σ valid_i / Σ (seg-v_i) over cleaned-set instead
++     * of a single boundary segment. */
++    struct GhostSumResult {
++        double cum_valid   = 0.0;
++        double cum_invalid = 0.0;
++        double m           = 0.0;
++    };
++    virtual GhostSumResult get_ghost_sum_for_free_segments(double target_free_segments) const {
++        return {};
++    }
+
+-----------------------------------------------------------------------------
+2) evict_policy_cost_benefit.h  — override declaration in CB policy
+-----------------------------------------------------------------------------
+diff --git a/evict_policy_cost_benefit.h b/evict_policy_cost_benefit.h
+@@ inside CbEvictPolicy class @@
++    GhostSumResult get_ghost_sum_for_free_segments(double target_free_segments) const override;
+
+-----------------------------------------------------------------------------
+3) evict_policy_cost_benefit.cpp  — implementation (fractional last segment)
+-----------------------------------------------------------------------------
+diff --git a/evict_policy_cost_benefit.cpp b/evict_policy_cost_benefit.cpp
+@@ append to CbEvictPolicy method definitions @@
++EvictPolicy::GhostSumResult
++CbEvictPolicy::get_ghost_sum_for_free_segments(double target_free_segments) const
++{
++    GhostSumResult r;
++    if (target_free_segments <= 0.0 || heap_.empty()) return r;
++
++    double free_sum = 0.0;
++    for (auto it = heap_.ordered_begin(); it != heap_.ordered_end(); ++it) {
++        const uint64_t v   = it->seg->valid_cnt;
++        const uint64_t inv = (pages_in_segment > v) ? (pages_in_segment - v) : 0;
++        const double inv_frac = static_cast<double>(inv) / static_cast<double>(pages_in_segment);
++        if (free_sum + inv_frac >= target_free_segments) {
++            const double need = target_free_segments - free_sum;
++            const double frac = (inv > 0)
++                              ? (need * static_cast<double>(pages_in_segment) / static_cast<double>(inv))
++                              : 0.0;
++            r.cum_valid   += static_cast<double>(v)   * frac;
++            r.cum_invalid += static_cast<double>(inv) * frac;
++            r.m           += frac;
++            break;
++        }
++        free_sum      += inv_frac;
++        r.cum_valid   += static_cast<double>(v);
++        r.cum_invalid += static_cast<double>(inv);
++        r.m           += 1.0;
++    }
++    return r;
++}
+
+-----------------------------------------------------------------------------
+4) log_cache.h  — enum value + method decl + state members
+-----------------------------------------------------------------------------
+diff --git a/log_cache.h b/log_cache.h
+@@ enum class PeriodicMode { ... } @@
++    GhostDelta_GC_SUM,  // G(u+θ) via cumulative CB-sorted scan: m s.t. Σ(seg-v_i)=θ·N·seg
+
+@@ private periodic-policy method declarations @@
++    void periodic_ghost_delta_gc_sum();
+
+@@ private state members @@
++    // GhostDelta_GC_SUM state: synthetic cumulative counter advanced at each
++    // real-compaction event by (dt × u_avg/(1-u_avg)) where u_avg comes from
++    // the cumulative CB scan up to θ·N·seg invalid pages.
++    double   ghost_compacted_blocks_sum_ = 0.0;
++    uint64_t last_ghost_sum_ts_          = 0;
++    bool     ghost_sum_initialized_      = false;  // first comp event: skip dt accum, just anchor ts
++    uint64_t last_invalidate_at_comp_    = 0;      // invalidate_blocks snapshot at prev real comp
+
+-----------------------------------------------------------------------------
+5a) log_cache.cpp  — dispatch in periodic-tick driver
+-----------------------------------------------------------------------------
+diff --git a/log_cache.cpp b/log_cache.cpp
+@@ inside the function that picks a periodic policy by `periodic_mode_` @@
++    } else if (periodic_mode_ == PeriodicMode::GhostDelta_GC_SUM) {
++        periodic_ghost_delta_gc_sum();
+
+-----------------------------------------------------------------------------
+5b) log_cache.cpp  — periodic_ghost_delta_gc_sum() method (feeds MA ratios + hill-climb)
+-----------------------------------------------------------------------------
+diff --git a/log_cache.cpp b/log_cache.cpp
+@@ append a new method definition @@
++void LogCache::periodic_ghost_delta_gc_sum() {
++    // GhostDelta_GC variant: estimate G(u+θ) via cumulative CB-sorted scan.
++    //   m = min { k : Σ_{i<k} (seg - v_i) ≥ θ · N · seg }
++    //   G(u+θ) cost rate per host write ≈ Σ v_i / Σ (seg-v_i) = u_avg/(1-u_avg)
++    // Advance a synthetic ghost_compacted_blocks_sum_ counter at that rate
++    // (done in check_and_evict_if_needed on real compactions); here we just
++    // feed cumulative counters into MovingAverageRatio for rate extraction.
++    if (!is_ghost_cache) return;
++
++    if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
++        compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
++        compaction_ratio_in_ghost_cache.updateFromCumulative(
++            log_cache_timestamp,
++            static_cast<uint64_t>(ghost_compacted_blocks_sum_));
++        eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
++        uint64_t evicted_in_ghost = ghost_cache.evictCount();
++        eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
++    }
++    if (log_cache_timestamp % (segment_size_blocks * 8) == 0) {
++        if (compaction_ratio.has_value() &&
++            compaction_ratio_in_ghost_cache.has_value() &&
++            eviction_ratio.has_value() &&
++            eviction_ratio_in_ghost_cache.has_value()) {
++            // Δflush · r  vs  Δcomp  (G(u+θ) − G(u))
++            if (periodic_ratio_ * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value())
++                    > compaction_ratio_in_ghost_cache.value() - compaction_ratio.value()) {
++                target_valid_blk_rate = std::min(
++                    valid_blk_rate_hard_limit,
++                    (double)global_valid_blocks / total_cache_block_count + util_step_);
++            } else {
++                target_valid_blk_rate = std::max(
++                    0.0,
++                    (double)global_valid_blocks / total_cache_block_count - util_step_);
++            }
++        }
++    }
++}
+
+-----------------------------------------------------------------------------
+5c) log_cache.cpp  — inside check_and_evict_if_needed(): GS-variant ghost-cost block.
+    Insert AFTER the boundary (per-segment) ghost_compacted_blocks update for
+    PeriodicMode::GhostDelta_GC, gated by `if (periodic_mode_ == GhostDelta_GC_SUM)`.
+-----------------------------------------------------------------------------
+diff --git a/log_cache.cpp b/log_cache.cpp
+@@ inside the compaction branch of check_and_evict_if_needed @@
++                // GS variant: ghost_compacted_blocks_sum_ advances at the
++                // θ-regime rate u_avg/(1-u_avg), but ONLY at real compaction
++                // events (dt = elapsed timestamp since last real comp). This
++                // keeps ghost and real synchronized: no real comp ⇒ no ghost
++                // tick ⇒ Δcomp = 0 when target is too low to trigger comp.
++                // Invalidation-aware target: to reach u+θ regime, valid count
++                // must grow by θ·N·seg. Host writes invalidate at rate i, but
++                // only the fraction that lands in the freshly freed region
++                // (≈ θ under uniform distribution) reduces net free fill,
++                // so required free-space target = θ·N·seg / (1 - θ·i).
++                double inv_corr = 1.0;
++                if (ghost_sum_initialized_ && log_cache_timestamp > last_ghost_sum_ts_) {
++                    const uint64_t win_writes = log_cache_timestamp - last_ghost_sum_ts_;
++                    const uint64_t win_inv    = (invalidate_blocks > last_invalidate_at_comp_)
++                                              ? (invalidate_blocks - last_invalidate_at_comp_)
++                                              : 0;
++                    const double i_rate = std::min(0.95,
++                        static_cast<double>(win_inv) / static_cast<double>(win_writes));
++                    const double theta_i = util_step_ * i_rate;
++                    inv_corr = 1.0 / (1.0 - std::min(0.95, theta_i));
++                }
++                const double target_free_segs = util_step_ *
++                    static_cast<double>(total_segments) * inv_corr;
++                auto s = compactor->get_ghost_sum_for_free_segments(target_free_segs);
++                if (s.cum_invalid > 0.0) {
++                    if (ghost_sum_initialized_) {
++                        const double rate = s.cum_valid / s.cum_invalid;
++                        const uint64_t dt = (log_cache_timestamp > last_ghost_sum_ts_)
++                                          ? (log_cache_timestamp - last_ghost_sum_ts_)
++                                          : 0;
++                        ghost_compacted_blocks_sum_ += static_cast<double>(dt) * rate;
++                    } else {
++                        // First real comp: anchor ts only, dt=0 to avoid spike.
++                        ghost_sum_initialized_ = true;
++                    }
++                    last_ghost_sum_ts_       = log_cache_timestamp;
++                    last_invalidate_at_comp_ = invalidate_blocks;
++                }
+
+-----------------------------------------------------------------------------
+6) icache.cpp  — cache_type factory branch (only for cache_sim wiring; in SPDK
+   adapt to your own policy-selection mechanism)
+-----------------------------------------------------------------------------
+diff --git a/icache.cpp b/icache.cpp
+@@ inside createCache() factory @@
++    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GS") {
++        // GhostDelta_GC_SUM: G(u+θ) via cumulative CB-sorted scan.
++        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
++        auto* lc = new LogCache(/*…ctor args…*/);
++        lc->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM);
++        lc->setMovingAverage(moving_avg_type, moving_avg_window);
++        return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
++    }
+
+=============================================================================
+SPDK porting checklist
+=============================================================================
+1. CB-sorted compactor queue: SPDK side must expose an ordered iterator
+   (max→min by CB score) over candidate segments — equivalent to
+   heap_.ordered_begin()..ordered_end() in cache_sim. The scan is read-only.
+
+2. EWMA (or MovingAverage) ratios for {compaction_ratio,
+   compaction_ratio_in_ghost_cache, eviction_ratio, eviction_ratio_in_ghost_cache}.
+   GS best with half-life ≈ DEFAULT × 0.25 (= 1.57M blocks in our tests,
+   = ~1.5 segments worth of host writes). EWMA must accept cumulative-counter
+   updates ("updateFromCumulative(ts, cum_count)") to allow rate extraction
+   from monotonic counters.
+
+3. util_step_ (θ): hill-climb increment for target_valid_blk_rate. 0.02 in
+   our experiments; smaller = finer control, larger = faster reaction.
+
+4. periodic_ratio_ (r): flush-vs-compact weight in the trade-off; r·Δflush
+   > Δcomp ⇒ raise target. Pick per workload/QoS target.
+
+5. State plumbing: 4 new fields (ghost_compacted_blocks_sum_,
+   last_ghost_sum_ts_, ghost_sum_initialized_, last_invalidate_at_comp_)
+   live on the cache instance; reset on cache init.
+
+6. invalidate_blocks counter: monotonic count of host pages invalidated
+   inside the log cache (overwrite/discard). SPDK side typically already
+   tracks this; just expose it for the per-comp window i estimate.
+
+7. timestamp: monotonic host-page-write counter (1 per page). Used for
+   dt in ghost_compacted_blocks_sum_ accumulation and for periodic-tick
+   modular gating (segment_size_blocks/4, segment_size_blocks*8).
+
+=============================================================================
+Notes on correctness
+=============================================================================
+- First real compaction: dt is undefined ⇒ skip rate accumulation, just
+  anchor last_ghost_sum_ts_ + last_invalidate_at_comp_. Without this guard
+  the first tick spikes ghost_compacted_blocks_sum_ by a huge dt × rate.
+
+- inv_corr factor 1/(1 - θ·i): θ·i is bounded to 0.95 to avoid blowup
+  when both util_step and i are pathologically large. In practice θ=0.02,
+  i ≤ 1.0 ⇒ correction ≤ 1.02, i.e. negligible. The factor is kept for
+  derivation honesty (free-space target accounts for in-flight overwrite).
+
+- u_avg/(1-u_avg) is the classical Greedy-WAF cost per host page. The
+  cumulative form (Σ v / Σ inv) is the natural generalization across the
+  m segments needed to reclaim θ·N·seg free space — equivalent to the
+  per-epoch view that one θ-epoch reclaims θ·N·seg pages and consumes
+  Σ v_i compaction work.
