@@ -18,6 +18,9 @@ OCF_CACHE_LINE_SIZE=${OCF_CACHE_LINE_SIZE:-4}  # 4, 8, 16, 32, 64 KiB
 CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-256}  # Split cache device to 256GB
 BACKEND_SPLIT_GB=${BACKEND_SPLIT_GB:-0}  # Split backend device (0 = full capacity)
 OCF_STAT_LOG=${OCF_STAT_LOG:-$ROOT_DIR/ssd_waf/logging}  # Directory for stats CSV log
+# A full 1.88 TB cache with 4 KiB cache lines needs about 35.5 GB for OCF
+# metadata. Leave additional room for DPDK buffers and SPDK bookkeeping.
+OCF_HUGEMEM_MB=${OCF_HUGEMEM_MB:-45056}
 
 # Export mode: nvmeof (default, stable) or ublk
 EXPORT_MODE=${EXPORT_MODE:-nvmeof}
@@ -58,6 +61,23 @@ rpc_call() {
         log "RPC FAILED: ${desc}"
         return 1
     fi
+}
+
+wait_for_bdev() {
+    local bdev_name=$1
+    local timeout=${2:-300}
+    local waited=0
+
+    log "Waiting for bdev ${bdev_name} to become ready..."
+    while ! sudo "${RPC[@]}" bdev_get_bdevs -b "${bdev_name}" >/dev/null 2>&1; do
+        if (( waited >= timeout )); then
+            log "ERROR: bdev ${bdev_name} was not registered after ${timeout}s"
+            return 1
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    log "bdev ${bdev_name} is ready"
 }
 
 find_nvme_ns() {
@@ -352,7 +372,10 @@ create_ocf() {
         --cache-line-size "${OCF_CACHE_LINE_SIZE}" \
         --stat-log-path "${OCF_STAT_LOG}"
 
-    log "OCF bdev created: ${OCF_NAME}"
+    # The create RPC may return before an asynchronous cache attach failure is
+    # visible. Do not continue until the exported bdev is actually registered.
+    wait_for_bdev "${OCF_NAME}" 300
+    log "OCF bdev created and ready: ${OCF_NAME}"
 
     # Disable sequential cutoff to prevent hot sequential LBAs from bypassing cache
     # (Zipf distribution accesses low LBAs sequentially, which triggers seq cutoff)
@@ -537,8 +560,8 @@ sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
 sudo sh -c 'echo 1 > /proc/sys/vm/compact_memory'
 sleep 2
 
-log "Binding devices to SPDK with uio_pci_generic..."
-sudo HUGEMEM=30720 SHRINK_HUGE=yes "${ROOT_DIR}/scripts/setup.sh"
+log "Binding devices to SPDK with HUGEMEM=${OCF_HUGEMEM_MB} MB and uio_pci_generic..."
+sudo HUGEMEM="${OCF_HUGEMEM_MB}" SHRINK_HUGE=yes "${ROOT_DIR}/scripts/setup.sh"
 
 start_spdk_tgt
 create_ocf
