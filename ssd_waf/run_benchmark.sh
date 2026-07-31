@@ -152,6 +152,12 @@ exit_all_tgt() {
     ./exit_tgt.sh || true
     ./exit_ocf.sh || true
     ./exit_ftl.sh || true
+    # FTL keeps large L2P/metadata files in hugetlbfs. If they survive into the
+    # next configuration, they consume every remaining hugepage and DPDK fails
+    # with "No free hugepages" even though no SPDK process is running.
+    sudo rm -f /dev/hugepages/ftl_* /dev/hugepages/spdk_*
+    sudo rm -f /dev/shm/spdk_tgt_trace.*
+    log_info "Cleaned up per-config hugepage and SHM files"
     log_success "All tgt processes exited"
 }
 
