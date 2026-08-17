@@ -76,9 +76,6 @@ ftl_band_rq_write(struct ftl_band *band, struct ftl_rq *rq)
 	band->queue_depth++;
 	dev->stats.io_activity_total += rq->num_blocks;
 
-	/* Track backend write bytes */
-	ftl_stats_logger_add_backend_write(dev->stats_logger, rq->num_blocks * FTL_BLOCK_SIZE);
-
 	ftl_band_iter_advance(band, rq->num_blocks);
 	if (ftl_band_filled(band, band->md->iter.offset)) {
 		ftl_band_set_state(band, FTL_BAND_STATE_FULL);

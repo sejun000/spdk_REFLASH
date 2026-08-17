@@ -9,6 +9,11 @@ include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 SO_VER := 10
 SO_MINOR := 0
 
+# Keep the complete FTL L2P table resident in DRAM for the CSAL experiments.
+# Callers can still opt back into the paged L2P cache with
+# `SPDK_FTL_L2P_FLAT=` when building.
+SPDK_FTL_L2P_FLAT ?= 1
+
 ifdef SPDK_FTL_RETRY_ON_ERROR
 CFLAGS += -DSPDK_FTL_RETRY_ON_ERROR
 endif

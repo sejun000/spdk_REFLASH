@@ -83,6 +83,52 @@ ocf_stats_logger_read_log_page(struct ocf_stats_logger *logger)
 }
 
 static void
+ocf_stats_logger_backend_log_page_done(void *cb_arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct ocf_stats_logger *logger = cb_arg;
+	uint64_t nand_units = 0;
+	uint64_t new_value;
+
+	logger->backend_log_page_pending = false;
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		SPDK_WARNLOG("OCF StatsLogger: backend vendor log page 0xC0 read failed, sct=%d sc=%d\n",
+			     cpl->status.sct, cpl->status.sc);
+		return;
+	}
+
+	memcpy(&nand_units, &logger->backend_log_page_buf->data[24], sizeof(nand_units));
+	new_value = nand_units * 512000ULL;
+	if (logger->backend_nand_written == 0 && new_value != 0) {
+		logger->prev_backend_nand_written = new_value;
+	}
+	logger->backend_nand_written = new_value;
+}
+
+static void
+ocf_stats_logger_read_backend_log_page(struct ocf_stats_logger *logger)
+{
+	int rc;
+
+	if (!logger->backend_nvme_ctrlr || !logger->backend_log_page_buf ||
+	    logger->backend_log_page_pending) {
+		return;
+	}
+
+	rc = spdk_nvme_ctrlr_cmd_get_log_page(
+		logger->backend_nvme_ctrlr,
+		0xC0,
+		SPDK_NVME_GLOBAL_NS_TAG,
+		logger->backend_log_page_buf,
+		sizeof(struct ocf_backend_vendor_log),
+		0,
+		ocf_stats_logger_backend_log_page_done,
+		logger);
+	if (rc == 0) {
+		logger->backend_log_page_pending = true;
+	}
+}
+
+static void
 ocf_stats_logger_write_stats(struct ocf_stats_logger *logger)
 {
 	struct vbdev_ocf_stats stats;
@@ -121,6 +167,7 @@ ocf_stats_logger_write_stats(struct ocf_stats_logger *logger)
 	/* NVMe FDP deltas (already in bytes from FDP Statistics Log) */
 	uint64_t nvme_host_delta = logger->nvme_host_written - logger->prev_nvme_host_written;
 	uint64_t nvme_media_delta = logger->nvme_media_written - logger->prev_nvme_media_written;
+	uint64_t backend_nand_delta = logger->backend_nand_written - logger->prev_backend_nand_written;
 
 	/* Update previous values */
 	logger->prev_cache_wr_blocks = cache_wr_blocks;
@@ -128,6 +175,7 @@ ocf_stats_logger_write_stats(struct ocf_stats_logger *logger)
 	logger->prev_host_wr_blocks = host_wr_blocks;
 	logger->prev_nvme_host_written = logger->nvme_host_written;
 	logger->prev_nvme_media_written = logger->nvme_media_written;
+	logger->prev_backend_nand_written = logger->backend_nand_written;
 
 	/* Write log line:
 	 * time_sec, occupancy_blocks, free_blocks, clean_blocks, dirty_blocks,
@@ -144,7 +192,7 @@ ocf_stats_logger_write_stats(struct ocf_stats_logger *logger)
 		"%lu,%lu,%lu,%lu,%lu,%lu,"
 		"%lu,%lu,%lu,"
 		"%.2f,%.2f,%.2f,"
-		"%.2f,%.2f,%.2f,%.2f\n",
+		"%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
 		elapsed_sec,
 		stats.usage.occupancy.value,
 		stats.usage.free.value,
@@ -171,7 +219,9 @@ ocf_stats_logger_write_stats(struct ocf_stats_logger *logger)
 		logger->nvme_host_written / MB,
 		logger->nvme_media_written / MB,
 		nvme_host_delta / MB,
-		nvme_media_delta / MB);
+		nvme_media_delta / MB,
+		logger->backend_nand_written / MB,
+		backend_nand_delta / MB);
 	fflush(logger->log_fp);
 }
 
@@ -184,9 +234,13 @@ ocf_stats_logger_poller_fn(void *arg)
 	if (logger->nvme_ctrlr) {
 		spdk_nvme_ctrlr_process_admin_completions(logger->nvme_ctrlr);
 	}
+	if (logger->backend_nvme_ctrlr && logger->backend_nvme_ctrlr != logger->nvme_ctrlr) {
+		spdk_nvme_ctrlr_process_admin_completions(logger->backend_nvme_ctrlr);
+	}
 
 	/* Try to read NVMe FDP log page (async) */
 	ocf_stats_logger_read_log_page(logger);
+	ocf_stats_logger_read_backend_log_page(logger);
 
 	/* Log current stats */
 	ocf_stats_logger_write_stats(logger);
@@ -232,6 +286,10 @@ ocf_stats_logger_destroy(struct ocf_stats_logger *logger)
 		spdk_dma_free(logger->log_page_buf);
 		logger->log_page_buf = NULL;
 	}
+	if (logger->backend_log_page_buf) {
+		spdk_dma_free(logger->backend_log_page_buf);
+		logger->backend_log_page_buf = NULL;
+	}
 
 	free(logger->dev_name);
 	free(logger);
@@ -275,6 +333,25 @@ ocf_stats_logger_set_nvme_ctrlr(struct ocf_stats_logger *logger,
 				       sizeof(struct nvme_fdp_stats_log));
 		} else {
 			SPDK_WARNLOG("OCF StatsLogger: failed to allocate log page buffer, NVMe FDP stats disabled\n");
+		}
+	}
+}
+
+void
+ocf_stats_logger_set_backend_nvme_ctrlr(struct ocf_stats_logger *logger,
+					 struct spdk_nvme_ctrlr *ctrlr)
+{
+	if (!logger) {
+		return;
+	}
+
+	logger->backend_nvme_ctrlr = ctrlr;
+	SPDK_NOTICELOG("OCF StatsLogger: set backend NVMe controller %p\n", ctrlr);
+	if (ctrlr && !logger->backend_log_page_buf) {
+		logger->backend_log_page_buf = spdk_dma_zmalloc(
+			sizeof(struct ocf_backend_vendor_log), 4096, NULL);
+		if (!logger->backend_log_page_buf) {
+			SPDK_WARNLOG("OCF StatsLogger: failed to allocate backend log page buffer\n");
 		}
 	}
 }
@@ -329,7 +406,8 @@ ocf_stats_logger_start(struct ocf_stats_logger *logger)
 		"host_rd_blocks,host_wr_blocks,"
 		"cache_wr_delta,core_wr_delta,host_wr_delta,"
 		"cache_wr_MB,core_wr_MB,host_wr_MB,"
-		"nvme_host_MB,nvme_media_MB,nvme_host_delta_MB,nvme_media_delta_MB\n");
+		"nvme_host_MB,nvme_media_MB,nvme_host_delta_MB,nvme_media_delta_MB,"
+		"backend_nand_written_MB,backend_nand_delta_MB\n");
 	fflush(logger->log_fp);
 
 	/* Record start time */

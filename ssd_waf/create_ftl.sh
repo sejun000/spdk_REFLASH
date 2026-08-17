@@ -20,7 +20,8 @@ BACKEND_NS=${BACKEND_NS:-${BACKEND_CTRL}n1}
 FTL_NAME=${FTL_NAME:-ftl0}
 # Cache split size in GB (100GB default)
 CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-200}
-FTL_OVERPROV=${FTL_OVERPROV:-20}
+# Expose 93% of the backend capacity by default (7% FTL overprovisioning).
+FTL_OVERPROV=${FTL_OVERPROV:-7}
 FTL_L2P_DRAM=${FTL_L2P_DRAM:-8192}
 
 # NVMe-oF TCP

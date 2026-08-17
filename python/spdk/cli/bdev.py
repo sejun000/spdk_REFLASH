@@ -818,7 +818,8 @@ def add_parser(subparsers):
                                                    cache_type=args.cache_type,
                                                    waf_log_path=args.waf_log_path,
                                                    stat_log_path=args.stat_log_path,
-                                                   valid_rate_threshold=args.valid_rate_threshold))
+                                                   valid_rate_threshold=args.valid_rate_threshold,
+                                                   backend_dsm_enabled=args.backend_dsm_enabled))
 
     p = subparsers.add_parser('bdev_icache_create',
                               help='Create icache vbdev on top of cache/backend devices')
@@ -830,6 +831,12 @@ def add_parser(subparsers):
     p.add_argument('--waf-log-path', help='Path for WAF log output')
     p.add_argument('--stat-log-path', help='Path for cache stats output')
     p.add_argument('--valid-rate-threshold', help='Target valid block ratio', type=float)
+    dsm_group = p.add_mutually_exclusive_group()
+    dsm_group.add_argument('--enable-backend-dsm', dest='backend_dsm_enabled',
+                           action='store_true', help='Enable asynchronous backend DSM batching')
+    dsm_group.add_argument('--disable-backend-dsm', dest='backend_dsm_enabled',
+                           action='store_false', help='Disable backend DSM batching')
+    p.set_defaults(backend_dsm_enabled=None)
     p.set_defaults(func=bdev_icache_create)
 
     def bdev_icache_delete(args):

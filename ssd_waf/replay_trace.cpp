@@ -45,6 +45,8 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <memory>
+#include <new>
 #include <signal.h>
 
 // Configuration
@@ -54,10 +56,13 @@ constexpr int IO_BLOCK_SIZE = 4096;
 constexpr int MAX_IO_SIZE = 1024 * 1024;  // 1MB
 constexpr uint64_t MAX_PENDING_BYTES = 1 * 1024 * 1024;  // 1MB total pending limit
 constexpr int REPORT_INTERVAL = 100000;
+constexpr uint64_t BITMAP_SCAN_REPORT_INTERVAL = 100000000;
 constexpr int STATS_BATCH_SIZE = 256;
 constexpr unsigned LATENCY_SUB_BUCKETS = 64;
 constexpr unsigned LATENCY_BUCKETS = 64 * LATENCY_SUB_BUCKETS;
 constexpr double DEFAULT_MAX_TB = 10.0;
+constexpr double DEFAULT_SYNTHETIC_SEQ_REGION_TB = 6.5;
+constexpr double DEFAULT_BITMAP_WORKING_SET_TB = 16.0;
 constexpr const char* DEFAULT_TRACE = "/home/sejun000/alibaba_dwpd1.trace.head30p";
 
 // Global state
@@ -65,6 +70,7 @@ std::atomic<bool> g_stop_flag{false};
 std::atomic<bool> g_write_limit_reached{false};
 std::atomic<uint64_t> g_max_write_bytes{0};
 std::atomic<uint64_t> g_completed_write_bytes{0};
+std::atomic<uint64_t> g_enqueued_write_bytes{0};
 std::atomic<uint64_t> g_pending_bytes{0};  // Total in-flight bytes across all threads
 
 void signal_handler(int) {
@@ -121,6 +127,10 @@ struct CompletionBatch {
     uint64_t write_ios = 0;
     uint64_t read_bytes = 0;
     uint64_t write_bytes = 0;
+    uint64_t trace_write_ios = 0;
+    uint64_t trace_write_bytes = 0;
+    uint64_t synthetic_write_ios = 0;
+    uint64_t synthetic_write_bytes = 0;
     uint64_t errors = 0;
     std::array<uint64_t, LATENCY_BUCKETS> read_latency{};
     std::array<uint64_t, LATENCY_BUCKETS> write_latency{};
@@ -133,7 +143,7 @@ struct CompletionBatch {
         write_touched.reserve(128);
     }
 
-    void add(IoType type, uint64_t bytes, uint64_t latency_ns)
+    void add(IoType type, uint64_t bytes, uint64_t latency_ns, bool synthetic)
     {
         unsigned bucket = latency_bucket(latency_ns);
         auto &histogram = type == IoType::WRITE ? write_latency : read_latency;
@@ -146,6 +156,13 @@ struct CompletionBatch {
         if (type == IoType::WRITE) {
             write_ios++;
             write_bytes += bytes;
+            if (synthetic) {
+                synthetic_write_ios++;
+                synthetic_write_bytes += bytes;
+            } else {
+                trace_write_ios++;
+                trace_write_bytes += bytes;
+            }
         } else {
             read_ios++;
             read_bytes += bytes;
@@ -166,6 +183,8 @@ struct CompletionBatch {
         write_touched.clear();
         read_ios = write_ios = 0;
         read_bytes = write_bytes = 0;
+        trace_write_ios = trace_write_bytes = 0;
+        synthetic_write_ios = synthetic_write_bytes = 0;
         errors = 0;
     }
 };
@@ -183,6 +202,10 @@ public:
         write_ios_ += batch.write_ios;
         read_bytes_ += batch.read_bytes;
         write_bytes_ += batch.write_bytes;
+        trace_write_ios_ += batch.trace_write_ios;
+        trace_write_bytes_ += batch.trace_write_bytes;
+        synthetic_write_ios_ += batch.synthetic_write_ios;
+        synthetic_write_bytes_ += batch.synthetic_write_bytes;
         errors_ += batch.errors;
 
         for (unsigned bucket : batch.read_touched) {
@@ -286,6 +309,12 @@ private:
         printf("  Average BW:      %.1f MB/s\n", (total_bytes / (1024.0*1024)) / elapsed);
         print_op_stats_unlocked("Read", read_ios_, read_bytes_, read_latency_, elapsed);
         print_op_stats_unlocked("Write", write_ios_, write_bytes_, write_latency_, elapsed);
+        printf("    Trace writes:     %lu IOs, %.2f GB (%.4f TB)\n",
+               trace_write_ios_, trace_write_bytes_ / (1024.0*1024*1024),
+               trace_write_bytes_ / (1024.0*1024*1024*1024));
+        printf("    Synthetic seq:    %lu IOs, %.2f GB (%.4f TB)\n",
+               synthetic_write_ios_, synthetic_write_bytes_ / (1024.0*1024*1024),
+               synthetic_write_bytes_ / (1024.0*1024*1024*1024));
         printf("  I/O Errors:      %lu\n", errors_);
         printf("  Stop reason:     %s\n",
                g_write_limit_reached.load() ? "completed write limit reached" : "trace ended or interrupted");
@@ -301,6 +330,10 @@ private:
     uint64_t write_ios_ = 0;
     uint64_t read_bytes_ = 0;
     uint64_t write_bytes_ = 0;
+    uint64_t trace_write_ios_ = 0;
+    uint64_t trace_write_bytes_ = 0;
+    uint64_t synthetic_write_ios_ = 0;
+    uint64_t synthetic_write_bytes_ = 0;
     uint64_t errors_ = 0;
     uint64_t last_report_ios_ = 0;
 };
@@ -310,16 +343,24 @@ private:
 // Remap mode (--remap-lba): sequential remapping (new LBA -> 0, 1, 2, ...)
 class LbaMapper {
 public:
-    LbaMapper(uint64_t device_size_bytes, bool remap)
+    LbaMapper(uint64_t device_size_bytes, bool remap, bool strict_passthrough = false)
         : max_lba_(device_size_bytes / IO_BLOCK_SIZE),
           device_size_bytes_(device_size_bytes),
-          remap_(remap) {}
+          remap_(remap),
+          strict_passthrough_(strict_passthrough) {}
 
     // Returns mapped device offset for a single 4KB LBA, or -1 if device is full
     int64_t map(uint64_t trace_offset) {
         if (!remap_) {
-            // Passthrough: use trace offset directly, wrap around device size
-            uint64_t device_offset = trace_offset % device_size_bytes_;
+            // Bitmap mode is true passthrough: the pre-scan has already proved
+            // that every trace LBA fits. Legacy passthrough keeps modulo behavior.
+            if (strict_passthrough_ && trace_offset >= device_size_bytes_) {
+                skipped_ios_++;
+                skipped_bytes_ += IO_BLOCK_SIZE;
+                return -1;
+            }
+            uint64_t device_offset = strict_passthrough_ ? trace_offset :
+                                     trace_offset % device_size_bytes_;
             // Align to IO_BLOCK_SIZE
             device_offset = (device_offset / IO_BLOCK_SIZE) * IO_BLOCK_SIZE;
             total_ios_++;
@@ -375,10 +416,173 @@ private:
     uint64_t max_lba_;
     uint64_t device_size_bytes_;
     bool remap_;
+    bool strict_passthrough_;
     uint64_t next_device_lba_ = 0;
     uint64_t skipped_ios_ = 0;
     uint64_t skipped_bytes_ = 0;
     std::atomic<uint64_t> total_ios_{0};
+};
+
+// Tracks trace-written blocks across the entire passthrough LBA address space.
+// One bit represents one 4 KiB block. After the trace is scanned, the first
+// requested number of clear blocks (in LBA order) form the synthetic region.
+// Those blocks may be discontiguous; their combined size is exact. Synthetic
+// writes deliberately do not set bits, so that fixed region can be revisited.
+class TraceWriteBitmap {
+public:
+    explicit TraceWriteBitmap(uint64_t address_space_bytes)
+        : address_space_bytes_(address_space_bytes / IO_BLOCK_SIZE * IO_BLOCK_SIZE),
+          address_space_blocks_(address_space_bytes_ / IO_BLOCK_SIZE),
+          words_((address_space_blocks_ + 63) / 64, 0) {}
+
+    void mark_written(uint64_t device_offset, uint64_t bytes)
+    {
+        if (device_offset >= address_space_bytes_ || bytes == 0) {
+            return;
+        }
+
+        uint64_t first = device_offset / IO_BLOCK_SIZE;
+        uint64_t blocks = std::min<uint64_t>(
+            bytes / IO_BLOCK_SIZE, address_space_blocks_ - first);
+
+        while (blocks > 0 && first % 64 != 0) {
+            uint64_t mask = 1ULL << (first % 64);
+            uint64_t &word = words_[first / 64];
+            if ((word & mask) == 0) {
+                word |= mask;
+                written_blocks_++;
+            }
+            first++;
+            blocks--;
+        }
+        while (blocks >= 64) {
+            uint64_t &word = words_[first / 64];
+            written_blocks_ += static_cast<uint64_t>(__builtin_popcountll(~word));
+            word = ~0ULL;
+            first += 64;
+            blocks -= 64;
+        }
+        while (blocks > 0) {
+            uint64_t mask = 1ULL << (first % 64);
+            uint64_t &word = words_[first / 64];
+            if ((word & mask) == 0) {
+                word |= mask;
+                written_blocks_++;
+            }
+            first++;
+            blocks--;
+        }
+    }
+
+    bool select_synthetic_region(uint64_t requested_bytes, uint64_t eligible_bytes)
+    {
+        uint64_t requested_blocks = requested_bytes / IO_BLOCK_SIZE;
+        uint64_t eligible_blocks = std::min<uint64_t>(
+            eligible_bytes / IO_BLOCK_SIZE, address_space_blocks_);
+        if (requested_blocks == 0 || requested_blocks > eligible_blocks) {
+            return false;
+        }
+
+        uint64_t remaining = requested_blocks;
+        uint64_t eligible_words = (eligible_blocks + 63) / 64;
+        for (uint64_t word_index = 0; word_index < eligible_words; word_index++) {
+            uint64_t first_block = word_index * 64;
+            uint64_t valid_bits = std::min<uint64_t>(
+                64, eligible_blocks - first_block);
+            uint64_t valid_mask = valid_bits == 64 ? ~0ULL :
+                                  ((1ULL << valid_bits) - 1);
+            uint64_t clear_mask = (~words_[word_index]) & valid_mask;
+            uint64_t clear_bits = static_cast<uint64_t>(__builtin_popcountll(clear_mask));
+            if (remaining > clear_bits) {
+                remaining -= clear_bits;
+                continue;
+            }
+
+            for (uint64_t bit = 0; bit < valid_bits; bit++) {
+                if ((clear_mask & (1ULL << bit)) != 0 && --remaining == 0) {
+                    selected_blocks_ = requested_blocks;
+                    selection_span_blocks_ = first_block + bit + 1;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Find the next trace-unwritten contiguous extent within the selected
+    // discontiguous 6.5 TiB region. Search wraps at the last selected block.
+    bool find_next_unwritten_run(uint64_t cursor, uint64_t max_bytes,
+                                 uint64_t& offset, uint64_t& bytes) const
+    {
+        if (selection_span_blocks_ == 0 || max_bytes < IO_BLOCK_SIZE) {
+            return false;
+        }
+
+        uint64_t max_blocks = std::min<uint64_t>(
+            max_bytes / IO_BLOCK_SIZE, selected_blocks_);
+        uint64_t start_block = (cursor / IO_BLOCK_SIZE) % selection_span_blocks_;
+
+        auto find_clear_in_range = [&](uint64_t begin, uint64_t end,
+                                       uint64_t& found) -> bool {
+            uint64_t block = begin;
+            while (block < end) {
+                uint64_t word_index = block / 64;
+                uint64_t first_bit = block % 64;
+                uint64_t bits_in_word = std::min<uint64_t>(64 - first_bit, end - block);
+                uint64_t range_mask = bits_in_word == 64 ? ~0ULL :
+                                      ((1ULL << bits_in_word) - 1) << first_bit;
+                uint64_t clear_mask = (~words_[word_index]) & range_mask;
+                if (clear_mask != 0) {
+                    found = word_index * 64 +
+                            static_cast<uint64_t>(__builtin_ctzll(clear_mask));
+                    return true;
+                }
+                block += bits_in_word;
+            }
+            return false;
+        };
+
+        uint64_t block;
+        if (!find_clear_in_range(start_block, selection_span_blocks_, block) &&
+            !find_clear_in_range(0, start_block, block)) {
+            return false;
+        }
+
+        uint64_t run_start = block;
+        uint64_t run_blocks = 0;
+        while (run_blocks < max_blocks && block < selection_span_blocks_ &&
+               !is_written(block)) {
+            run_blocks++;
+            block++;
+        }
+
+        offset = run_start * IO_BLOCK_SIZE;
+        bytes = run_blocks * IO_BLOCK_SIZE;
+        return bytes > 0;
+    }
+
+    uint64_t address_space_bytes() const { return address_space_bytes_; }
+    uint64_t address_space_blocks() const { return address_space_blocks_; }
+    uint64_t written_blocks() const { return written_blocks_; }
+    uint64_t selected_bytes() const { return selected_blocks_ * IO_BLOCK_SIZE; }
+    uint64_t selection_span_bytes() const
+    {
+        return selection_span_blocks_ * IO_BLOCK_SIZE;
+    }
+    uint64_t memory_bytes() const { return words_.size() * sizeof(uint64_t); }
+
+private:
+    bool is_written(uint64_t block) const
+    {
+        return (words_[block / 64] & (1ULL << (block % 64))) != 0;
+    }
+
+    uint64_t address_space_bytes_;
+    uint64_t address_space_blocks_;
+    std::vector<uint64_t> words_;
+    uint64_t written_blocks_ = 0;
+    uint64_t selected_blocks_ = 0;
+    uint64_t selection_span_blocks_ = 0;
 };
 
 // Work item
@@ -386,6 +590,7 @@ struct WorkItem {
     int64_t offset;
     uint32_t size;
     IoType type;
+    bool synthetic = false;
 };
 
 // Thread-safe work queue
@@ -527,6 +732,7 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
     std::vector<struct iocb*> iocb_ptrs(QUEUE_DEPTH);
     std::vector<uint32_t> io_sizes(QUEUE_DEPTH);
     std::vector<IoType> io_types(QUEUE_DEPTH);
+    std::vector<bool> io_synthetic(QUEUE_DEPTH);
     std::vector<std::chrono::steady_clock::time_point> submit_times(QUEUE_DEPTH);
 
     // Free slot management
@@ -583,6 +789,7 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
 
             io_sizes[slot] = aligned_size;
             io_types[slot] = item.type;
+            io_synthetic[slot] = item.synthetic;
             if (item.type == IoType::WRITE) {
                 io_prep_pwrite(&iocbs[slot], fd, buffers[slot], aligned_size, item.offset);
             } else {
@@ -620,7 +827,8 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
                 if (events[i].res > 0) {
                     uint64_t latency_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                               completion_time - submit_times[slot]).count();
-                    batch.add(io_types[slot], static_cast<uint64_t>(events[i].res), latency_ns);
+                    batch.add(io_types[slot], static_cast<uint64_t>(events[i].res), latency_ns,
+                              io_synthetic[slot]);
                     if (io_types[slot] == IoType::WRITE) {
                         completed_writes++;
                         account_completed_write(static_cast<uint64_t>(events[i].res));
@@ -657,9 +865,230 @@ void worker_thread(int thread_id, const std::string& device, WorkQueue& queue, R
            thread_id, completed_reads, completed_writes);
 }
 
+struct SyntheticSeqConfig {
+    uint32_t after_trace_writes = 0;
+    uint32_t volume_percent = 0;
+    uint64_t region_bytes = 0;
+    bool avoid_trace_written = false;
+
+    bool enabled() const
+    {
+        return after_trace_writes > 0 && volume_percent > 0 && region_bytes > 0;
+    }
+};
+
+static bool
+is_trace_op(const std::string& token)
+{
+    return token == "W" || token == "WS" || token == "R" || token == "RS";
+}
+
+struct ParsedTraceIo {
+    IoType type;
+    uint64_t offset;
+    uint64_t size;
+};
+
+static bool
+parse_trace_io(const std::vector<std::string>& parts, uint32_t offset_scale,
+               uint32_t size_scale,
+               ParsedTraceIo& parsed)
+{
+    // Support both formats used by the existing traces:
+    //   timestamp,op,offset,size
+    //   op,offset,size,timestamp
+    size_t op_index;
+    size_t offset_index;
+    size_t size_index;
+    if (parts.size() >= 3 && is_trace_op(parts[0])) {
+        op_index = 0;
+        offset_index = 1;
+        size_index = 2;
+    } else if (parts.size() >= 4 && is_trace_op(parts[1])) {
+        op_index = 1;
+        offset_index = 2;
+        size_index = 3;
+    } else {
+        return false;
+    }
+
+    try {
+        uint64_t offset = std::stoull(parts[offset_index]);
+        uint64_t size = std::stoull(parts[size_index]);
+        if (size == 0 ||
+            offset > std::numeric_limits<uint64_t>::max() / offset_scale ||
+            size > std::numeric_limits<uint64_t>::max() / size_scale) {
+            return false;
+        }
+        parsed.type = parts[op_index] == "W" || parts[op_index] == "WS" ?
+                      IoType::WRITE : IoType::READ;
+        parsed.offset = offset * offset_scale;
+        parsed.size = size * size_scale;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool
+parse_uint_csv_field(const char*& cursor, uint64_t& value)
+{
+    while (*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+    if (*cursor < '0' || *cursor > '9') {
+        return false;
+    }
+
+    value = 0;
+    while (*cursor >= '0' && *cursor <= '9') {
+        uint64_t digit = static_cast<uint64_t>(*cursor - '0');
+        if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+            return false;
+        }
+        value = value * 10 + digit;
+        cursor++;
+    }
+    while (*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+    if (*cursor == ',') {
+        cursor++;
+        return true;
+    }
+    return *cursor == '\0';
+}
+
+// Allocation-free parser for the bitmap pre-scan. It accepts the same two CSV
+// layouts as parse_trace_io(), but ignores timestamp and trailing fields.
+static bool
+parse_trace_io_fast(const std::string& line, uint32_t offset_scale,
+                    uint32_t size_scale,
+                    ParsedTraceIo& parsed)
+{
+    const char *cursor = line.c_str();
+    while (*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+
+    if (*cursor != 'W' && *cursor != 'R') {
+        const char *comma = strchr(cursor, ',');
+        if (comma == nullptr) {
+            return false;
+        }
+        cursor = comma + 1;
+        while (*cursor == ' ' || *cursor == '\t') {
+            cursor++;
+        }
+    }
+
+    bool write;
+    if (*cursor == 'W') {
+        write = true;
+    } else if (*cursor == 'R') {
+        write = false;
+    } else {
+        return false;
+    }
+    cursor++;
+    if (*cursor == 'S') {
+        cursor++;
+    }
+    while (*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+    if (*cursor != ',') {
+        return false;
+    }
+    cursor++;
+
+    uint64_t offset;
+    uint64_t size;
+    if (!parse_uint_csv_field(cursor, offset) ||
+        !parse_uint_csv_field(cursor, size) || size == 0 ||
+        offset > std::numeric_limits<uint64_t>::max() / offset_scale ||
+        size > std::numeric_limits<uint64_t>::max() / size_scale) {
+        return false;
+    }
+    parsed.type = write ? IoType::WRITE : IoType::READ;
+    parsed.offset = offset * offset_scale;
+    parsed.size = size * size_scale;
+    return true;
+}
+
+static bool
+prepare_trace_write_bitmap(const std::string& trace_path, uint32_t offset_scale,
+                           uint32_t size_scale,
+                           uint64_t device_size, TraceWriteBitmap& bitmap)
+{
+    std::ifstream file(trace_path);
+    if (!file.is_open()) {
+        printf("ERROR: Cannot open trace for bitmap pre-scan: %s\n", trace_path.c_str());
+        return false;
+    }
+
+    printf("[Bitmap] Pre-scanning trace write LBAs...\n");
+    uint64_t line_num = 0;
+    uint64_t write_records = 0;
+    uint64_t max_trace_end = 0;
+    std::string line;
+    while (std::getline(file, line)) {
+        ParsedTraceIo parsed{};
+        if (parse_trace_io_fast(line, offset_scale, size_scale, parsed)) {
+            uint64_t aligned_size = (parsed.size / IO_BLOCK_SIZE) * IO_BLOCK_SIZE;
+            uint64_t aligned_offset = (parsed.offset / IO_BLOCK_SIZE) * IO_BLOCK_SIZE;
+            if (aligned_size > 0) {
+                if (aligned_offset > std::numeric_limits<uint64_t>::max() - aligned_size) {
+                    printf("ERROR: Scaled trace LBA overflows at line %lu\n", line_num + 1);
+                    return false;
+                }
+                uint64_t trace_end = aligned_offset + aligned_size;
+                max_trace_end = std::max(max_trace_end, trace_end);
+                if (trace_end > bitmap.address_space_bytes()) {
+                    printf("ERROR: Scaled trace range at line %lu ends at %.2f TiB, "
+                           "beyond bitmap working set %.2f TiB\n",
+                           line_num + 1, trace_end / (1024.0*1024*1024*1024),
+                           bitmap.address_space_bytes() /
+                               (1024.0*1024*1024*1024));
+                    return false;
+                }
+                if (trace_end > device_size) {
+                    printf("ERROR: Raw scaled trace range at line %lu ends at %.2f TiB, "
+                           "beyond device %.2f TiB; refusing hidden modulo remap\n",
+                           line_num + 1, trace_end / (1024.0*1024*1024*1024),
+                           device_size / (1024.0*1024*1024*1024));
+                    return false;
+                }
+                if (parsed.type == IoType::WRITE) {
+                    bitmap.mark_written(aligned_offset, aligned_size);
+                    write_records++;
+                }
+            }
+        }
+
+        line_num++;
+        if (line_num % BITMAP_SCAN_REPORT_INTERVAL == 0) {
+            printf("[Bitmap] Scanned %lu lines, %lu write records, %.2f GiB unique\n",
+                   line_num, write_records,
+                   bitmap.written_blocks() * IO_BLOCK_SIZE /
+                       (1024.0 * 1024 * 1024));
+        }
+    }
+
+    printf("[Bitmap] Pre-scan complete: %lu lines, %lu write records, "
+           "%.2f GiB unique trace-written blocks, max LBA end %.2f TiB\n",
+           line_num, write_records,
+           bitmap.written_blocks() * IO_BLOCK_SIZE / (1024.0 * 1024 * 1024),
+           max_trace_end / (1024.0*1024*1024*1024));
+    return true;
+}
+
 // Reader thread
 void reader_thread(const std::string& trace_path, std::vector<WorkQueue*>& queues,
-                   LbaMapper& mapper, int num_threads, uint32_t io_scale) {
+                   LbaMapper& mapper, int num_threads, uint32_t offset_scale,
+                   uint32_t size_scale,
+                   bool loop_trace, SyntheticSeqConfig synthetic_seq,
+                   TraceWriteBitmap *trace_write_bitmap) {
     std::ifstream file(trace_path);
     if (!file.is_open()) {
         printf("ERROR: Cannot open trace file: %s\n", trace_path.c_str());
@@ -670,10 +1099,120 @@ void reader_thread(const std::string& trace_path, std::vector<WorkQueue*>& queue
     uint64_t line_num = 0;
     uint64_t distributed_reads = 0;
     uint64_t distributed_writes = 0;
+    uint64_t distributed_trace_write_bytes = 0;
+    uint64_t distributed_synthetic_write_bytes = 0;
+    uint64_t trace_write_records = 0;
+    uint64_t synthetic_write_records = 0;
+    uint32_t writes_in_group = 0;
+    uint64_t group_trace_write_bytes = 0;
+    __uint128_t synthetic_credit = 0; // byte-percent units; preserves 4 KiB rounding residue
+    uint64_t synthetic_cursor = 0;
+    bool write_budget_full = false;
+    uint64_t pass = 1;
     std::string line;
 
-    while (std::getline(file, line) && !g_stop_flag.load()) {
-        // Parse CSV: timestamp, op, offset, size
+    auto enqueue_work = [&](int64_t offset, uint32_t size, IoType type,
+                            bool synthetic) -> uint32_t {
+        if (write_budget_full || g_stop_flag.load()) {
+            return 0;
+        }
+
+        uint32_t accepted_size = size;
+        if (type == IoType::WRITE) {
+            uint64_t enqueued = g_enqueued_write_bytes.load();
+            uint64_t max_writes = g_max_write_bytes.load();
+            if (enqueued >= max_writes) {
+                write_budget_full = true;
+                return 0;
+            }
+            uint64_t remaining = max_writes - enqueued;
+            if (accepted_size > remaining) {
+                accepted_size = static_cast<uint32_t>(remaining);
+            }
+            accepted_size = (accepted_size / IO_BLOCK_SIZE) * IO_BLOCK_SIZE;
+            if (accepted_size == 0) {
+                write_budget_full = true;
+                return 0;
+            }
+        }
+
+        uint64_t distributed = distributed_reads + distributed_writes;
+        WorkItem item{offset, accepted_size, type, synthetic};
+        int thread_id = distributed % num_threads;
+        if (!queues[thread_id]->push(item)) {
+            return 0;
+        }
+
+        if (type == IoType::WRITE) {
+            g_enqueued_write_bytes.fetch_add(accepted_size);
+            distributed_writes++;
+            if (synthetic) {
+                distributed_synthetic_write_bytes += accepted_size;
+            } else {
+                distributed_trace_write_bytes += accepted_size;
+            }
+            if (g_enqueued_write_bytes.load() >= g_max_write_bytes.load()) {
+                write_budget_full = true;
+            }
+        } else {
+            distributed_reads++;
+        }
+        return accepted_size;
+    };
+
+    auto enqueue_synthetic_write = [&](uint64_t requested_bytes) {
+        uint64_t bytes_left = requested_bytes;
+        while (bytes_left > 0 && !write_budget_full && !g_stop_flag.load()) {
+            uint64_t synthetic_offset;
+            uint64_t chunk;
+            if (trace_write_bitmap) {
+                uint64_t max_chunk = std::min<uint64_t>(bytes_left, MAX_IO_SIZE);
+                if (!trace_write_bitmap->find_next_unwritten_run(
+                        synthetic_cursor, max_chunk, synthetic_offset, chunk)) {
+                    printf("ERROR: No block remains in the selected %.2f TiB "
+                           "synthetic region\n",
+                           trace_write_bitmap->selected_bytes() /
+                               (1024.0*1024*1024*1024));
+                    g_stop_flag.store(true);
+                    break;
+                }
+            } else {
+                uint64_t until_wrap = synthetic_seq.region_bytes - synthetic_cursor;
+                chunk = std::min<uint64_t>(bytes_left, until_wrap);
+                chunk = std::min<uint64_t>(chunk, MAX_IO_SIZE);
+                chunk = (chunk / IO_BLOCK_SIZE) * IO_BLOCK_SIZE;
+                if (chunk == 0) {
+                    synthetic_cursor = 0;
+                    continue;
+                }
+                synthetic_offset = synthetic_cursor;
+            }
+
+            uint64_t accepted = enqueue_work(static_cast<int64_t>(synthetic_offset),
+                                             static_cast<uint32_t>(chunk),
+                                             IoType::WRITE, true);
+            if (accepted == 0) {
+                break;
+            }
+            uint64_t wrap_bytes = trace_write_bitmap ?
+                                  trace_write_bitmap->selection_span_bytes() :
+                                  synthetic_seq.region_bytes;
+            synthetic_cursor = (synthetic_offset + accepted) % wrap_bytes;
+            if (accepted >= bytes_left) {
+                bytes_left = 0;
+            } else {
+                bytes_left -= accepted;
+            }
+        }
+    };
+
+    while (!g_stop_flag.load() && !write_budget_full) {
+        uint64_t pass_lines = 0;
+        uint64_t pass_reads_before = distributed_reads;
+        uint64_t pass_writes_before = distributed_writes;
+
+        while (std::getline(file, line) && !g_stop_flag.load() && !write_budget_full) {
+        // Parse CSV.
         std::istringstream iss(line);
         std::string token;
         std::vector<std::string> parts;
@@ -689,59 +1228,97 @@ void reader_thread(const std::string& trace_path, std::vector<WorkQueue*>& queue
             }
         }
 
-        if (parts.size() >= 4) {
-            const std::string& op = parts[1];
-            bool is_write = op == "W" || op == "WS";
-            bool is_read = op == "R" || op == "RS";
-            if (is_write || is_read) {
-                try {
-                    uint64_t offset = std::stoull(parts[2]) * io_scale;
-                    uint32_t size = std::stoul(parts[3]) * io_scale;
-
-                    if (size > 0) {
-                        // Split IO into 4KB chunks and map each independently
-                        uint64_t num_blocks = (size + IO_BLOCK_SIZE - 1) / IO_BLOCK_SIZE;
-                        for (uint64_t i = 0; i < num_blocks; i++) {
-                            if (g_stop_flag.load()) {
-                                break;
-                            }
-                            uint64_t block_offset = offset + (i * IO_BLOCK_SIZE);
-                            int64_t device_offset = mapper.map(block_offset);
-                            if (device_offset >= 0) {
-                                uint64_t distributed = distributed_reads + distributed_writes;
-                                WorkItem item{device_offset, IO_BLOCK_SIZE,
-                                              is_write ? IoType::WRITE : IoType::READ};
-                                int thread_id = distributed % num_threads;
-                                if (!queues[thread_id]->push(item)) {
-                                    break;
-                                }
-                                if (is_write) {
-                                    distributed_writes++;
-                                } else {
-                                    distributed_reads++;
-                                }
-                            }
+        ParsedTraceIo parsed{};
+        if (parse_trace_io(parts, offset_scale, size_scale, parsed)) {
+            uint64_t aligned_size = (parsed.size / IO_BLOCK_SIZE) * IO_BLOCK_SIZE;
+            if (aligned_size > 0) {
+                if (parsed.type == IoType::WRITE) {
+                    trace_write_records++;
+                }
+                // Split trace IO into 4KB chunks and map each independently.
+                uint64_t num_blocks = aligned_size / IO_BLOCK_SIZE;
+                for (uint64_t i = 0; i < num_blocks; i++) {
+                    if (g_stop_flag.load() || write_budget_full) {
+                        break;
+                    }
+                    uint64_t block_offset = parsed.offset + (i * IO_BLOCK_SIZE);
+                    int64_t device_offset = mapper.map(block_offset);
+                    if (device_offset >= 0) {
+                        uint32_t accepted = enqueue_work(device_offset, IO_BLOCK_SIZE,
+                                                         parsed.type, false);
+                        if (accepted == 0) {
+                            break;
                         }
                     }
-                } catch (...) {
-                    // Skip invalid lines
+                }
+
+                if (parsed.type == IoType::WRITE && !write_budget_full) {
+                    writes_in_group++;
+                    group_trace_write_bytes += aligned_size;
+
+                    if (synthetic_seq.enabled() &&
+                        writes_in_group == synthetic_seq.after_trace_writes) {
+                        // Keep the cumulative synthetic volume at exactly the requested
+                        // percentage. Any sub-4KiB residue carries into the next group.
+                        synthetic_credit += static_cast<__uint128_t>(group_trace_write_bytes) *
+                                            synthetic_seq.volume_percent;
+                        const __uint128_t aligned_unit =
+                            static_cast<__uint128_t>(100) * IO_BLOCK_SIZE;
+                        uint64_t synthetic_bytes = static_cast<uint64_t>(
+                            (synthetic_credit / aligned_unit) * IO_BLOCK_SIZE);
+                        synthetic_credit -= static_cast<__uint128_t>(synthetic_bytes) * 100;
+                        if (synthetic_bytes > 0) {
+                            synthetic_write_records++;
+                            enqueue_synthetic_write(synthetic_bytes);
+                        }
+                        writes_in_group = 0;
+                        group_trace_write_bytes = 0;
+                    }
                 }
             }
         }
 
-        line_num++;
-        if (line_num % 1000000 == 0) {
-            if (mapper.is_remap()) {
-                printf("[Reader] Parsed %lu lines, distributed %lu reads / %lu writes, "
-                       "unique %.2f GB, skipped %lu\n",
-                       line_num, distributed_reads, distributed_writes,
-                       mapper.get_unique_bytes() / (1024.0*1024*1024),
-                       mapper.get_skipped_ios());
-            } else {
-                printf("[Reader] Parsed %lu lines, distributed %lu reads / %lu writes\n",
-                       line_num, distributed_reads, distributed_writes);
+            line_num++;
+            pass_lines++;
+            if (line_num % 1000000 == 0) {
+                if (mapper.is_remap()) {
+                    printf("[Reader] Parsed %lu lines, distributed %lu reads / %lu writes, "
+                           "unique %.2f GB, skipped %lu\n",
+                           line_num, distributed_reads, distributed_writes,
+                           mapper.get_unique_bytes() / (1024.0*1024*1024),
+                           mapper.get_skipped_ios());
+                } else {
+                    printf("[Reader] Parsed %lu lines, distributed %lu reads / %lu writes\n",
+                           line_num, distributed_reads, distributed_writes);
+                }
             }
         }
+
+        if (g_stop_flag.load() || write_budget_full || !loop_trace) {
+            break;
+        }
+
+        uint64_t pass_reads = distributed_reads - pass_reads_before;
+        uint64_t pass_writes = distributed_writes - pass_writes_before;
+        printf("[Reader] Pass %lu complete: %lu lines, %lu reads / %lu writes; rewinding trace\n",
+               pass, pass_lines, pass_reads, pass_writes);
+
+        // A write-based limit can never be reached if a pass has no writes.
+        // Stop instead of spinning forever on an empty or read-only trace.
+        if (pass_lines == 0 || pass_writes == 0) {
+            printf("ERROR: Cannot loop a trace pass with no writable I/O\n");
+            g_stop_flag.store(true);
+            break;
+        }
+
+        file.clear();
+        file.seekg(0, std::ios::beg);
+        if (!file.good()) {
+            printf("ERROR: Cannot rewind trace file: %s\n", trace_path.c_str());
+            g_stop_flag.store(true);
+            break;
+        }
+        pass++;
     }
 
     // Signal end to all workers
@@ -758,6 +1335,24 @@ void reader_thread(const std::string& trace_path, std::vector<WorkQueue*>& queue
         printf("[Reader] Done: %lu lines, %lu reads / %lu writes\n",
                line_num, distributed_reads, distributed_writes);
     }
+    printf("[Reader] Write mix: %lu trace records / %lu synthetic records, "
+           "trace %.4f TB + synthetic %.4f TB = %.4f TB enqueued\n",
+           trace_write_records, synthetic_write_records,
+           distributed_trace_write_bytes / (1024.0*1024*1024*1024),
+           distributed_synthetic_write_bytes / (1024.0*1024*1024*1024),
+           g_enqueued_write_bytes.load() / (1024.0*1024*1024*1024));
+    if (trace_write_bitmap) {
+        printf("[Reader] Trace-write bitmap: %.2f GiB / %.2f TiB blocks marked "
+               "(%.2f%%), memory %.2f MB\n",
+               trace_write_bitmap->written_blocks() * IO_BLOCK_SIZE /
+                   (1024.0*1024*1024),
+               trace_write_bitmap->address_space_bytes() /
+                   (1024.0*1024*1024*1024),
+               trace_write_bitmap->address_space_blocks() == 0 ? 0.0 :
+                   100.0 * trace_write_bitmap->written_blocks() /
+                   trace_write_bitmap->address_space_blocks(),
+               trace_write_bitmap->memory_bytes() / (1024.0*1024));
+    }
 }
 
 void print_usage(const char* prog) {
@@ -768,7 +1363,25 @@ void print_usage(const char* prog) {
     printf("  --threads N      Number of threads (default: %d)\n", NUM_THREADS);
     printf("  --max-tb N       Stop after N TB of completed writes (default: %.1f)\n", DEFAULT_MAX_TB);
     printf("  --remap-lba      Remap LBAs sequentially (default: passthrough)\n");
-    printf("  --io-scale N     Multiply offset and size by N (default: 1)\n");
+    printf("  --trace-write-bitmap\n");
+    printf("                   Pre-scan trace writes with a full-working-set 1-bit/4KiB bitmap;\n");
+    printf("                   place synthetic writes in interleaved unwritten blocks\n");
+    printf("  --bitmap-working-set-tb N\n");
+    printf("                   Bitmap LBA space in TiB (default: %.1f)\n",
+           DEFAULT_BITMAP_WORKING_SET_TB);
+    printf("  --bitmap-preflight-only\n");
+    printf("                   Build/validate bitmap and region, then exit without I/O\n");
+    printf("  --loop-trace     Rewind trace at EOF until the write limit is reached\n");
+    printf("  --io-scale N     Multiply offset and size by N (legacy shorthand)\n");
+    printf("  --offset-scale N Multiply trace offsets by N (default: 1)\n");
+    printf("  --size-scale N   Multiply trace I/O sizes by N (default: 1)\n");
+    printf("  --synthetic-seq-after-writes N\n");
+    printf("                   Insert one synthetic sequential write after N trace writes\n");
+    printf("  --synthetic-seq-percent N\n");
+    printf("                   Synthetic volume as N%% of each trace-write group\n");
+    printf("  --synthetic-seq-region-tb N\n");
+    printf("                   Sequential synthetic-write region size (default: %.1f TB)\n",
+           DEFAULT_SYNTHETIC_SEQ_REGION_TB);
     printf("  --help           Show this help\n");
 }
 
@@ -779,7 +1392,14 @@ int main(int argc, char* argv[]) {
     int num_threads = NUM_THREADS;
     double max_tb = DEFAULT_MAX_TB;
     bool remap_lba = false;
-    uint32_t io_scale = 1;
+    bool trace_write_bitmap_enabled = false;
+    bool bitmap_preflight_only = false;
+    bool loop_trace = false;
+    uint32_t offset_scale = 1;
+    uint32_t size_scale = 1;
+    SyntheticSeqConfig synthetic_seq;
+    double synthetic_seq_region_tb = DEFAULT_SYNTHETIC_SEQ_REGION_TB;
+    double bitmap_working_set_tb = DEFAULT_BITMAP_WORKING_SET_TB;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
@@ -792,11 +1412,80 @@ int main(int argc, char* argv[]) {
             max_tb = atof(argv[++i]);
         } else if (strcmp(argv[i], "--remap-lba") == 0) {
             remap_lba = true;
+        } else if (strcmp(argv[i], "--trace-write-bitmap") == 0) {
+            trace_write_bitmap_enabled = true;
+        } else if (strcmp(argv[i], "--bitmap-working-set-tb") == 0 && i + 1 < argc) {
+            bitmap_working_set_tb = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--bitmap-preflight-only") == 0) {
+            bitmap_preflight_only = true;
+        } else if (strcmp(argv[i], "--loop-trace") == 0) {
+            loop_trace = true;
         } else if (strcmp(argv[i], "--io-scale") == 0 && i + 1 < argc) {
-            io_scale = atoi(argv[++i]);
+            uint32_t scale = atoi(argv[++i]);
+            offset_scale = scale;
+            size_scale = scale;
+        } else if (strcmp(argv[i], "--offset-scale") == 0 && i + 1 < argc) {
+            offset_scale = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--size-scale") == 0 && i + 1 < argc) {
+            size_scale = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--synthetic-seq-after-writes") == 0 && i + 1 < argc) {
+            synthetic_seq.after_trace_writes = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--synthetic-seq-percent") == 0 && i + 1 < argc) {
+            synthetic_seq.volume_percent = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--synthetic-seq-region-tb") == 0 && i + 1 < argc) {
+            synthetic_seq_region_tb = atof(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
+        }
+    }
+
+    if (offset_scale == 0 || size_scale == 0 || num_threads <= 0) {
+        printf("ERROR: scales and --threads must be greater than zero\n");
+        return 1;
+    }
+    bool has_synthetic_option = synthetic_seq.after_trace_writes > 0 ||
+                                synthetic_seq.volume_percent > 0;
+    if (has_synthetic_option &&
+        (synthetic_seq.after_trace_writes == 0 || synthetic_seq.volume_percent == 0 ||
+         synthetic_seq_region_tb <= 0.0)) {
+        printf("ERROR: synthetic sequential writes require positive after-writes, percent, "
+               "and region values\n");
+        return 1;
+    }
+    if (trace_write_bitmap_enabled && remap_lba) {
+        printf("ERROR: --trace-write-bitmap and --remap-lba are mutually exclusive\n");
+        return 1;
+    }
+    if (trace_write_bitmap_enabled && !has_synthetic_option) {
+        printf("ERROR: --trace-write-bitmap requires synthetic sequential-write options\n");
+        return 1;
+    }
+    if (trace_write_bitmap_enabled && bitmap_working_set_tb <= 0.0) {
+        printf("ERROR: --bitmap-working-set-tb must be positive\n");
+        return 1;
+    }
+    if (bitmap_preflight_only && !trace_write_bitmap_enabled) {
+        printf("ERROR: --bitmap-preflight-only requires --trace-write-bitmap\n");
+        return 1;
+    }
+    if (has_synthetic_option) {
+        long double region_bytes = synthetic_seq_region_tb * 1024.0L * 1024 * 1024 * 1024;
+        synthetic_seq.region_bytes = static_cast<uint64_t>(region_bytes) / IO_BLOCK_SIZE *
+                                     IO_BLOCK_SIZE;
+        synthetic_seq.avoid_trace_written = trace_write_bitmap_enabled;
+    }
+    uint64_t bitmap_working_set_bytes = 0;
+    if (trace_write_bitmap_enabled) {
+        long double bytes = bitmap_working_set_tb * 1024.0L * 1024 * 1024 * 1024;
+        bitmap_working_set_bytes = static_cast<uint64_t>(bytes) / IO_BLOCK_SIZE *
+                                   IO_BLOCK_SIZE;
+        if (bitmap_working_set_bytes < synthetic_seq.region_bytes) {
+            printf("ERROR: Bitmap working set %.2f TiB is smaller than synthetic "
+                   "region %.2f TiB\n",
+                   bitmap_working_set_bytes / (1024.0*1024*1024*1024),
+                   synthetic_seq.region_bytes / (1024.0*1024*1024*1024));
+            return 1;
         }
     }
 
@@ -824,6 +1513,12 @@ int main(int argc, char* argv[]) {
         printf("ERROR: Cannot get device size\n");
         return 1;
     }
+    if (synthetic_seq.enabled() && synthetic_seq.region_bytes > device_size) {
+        printf("ERROR: Synthetic sequential region %.2f TB exceeds device size %.2f TB\n",
+               synthetic_seq.region_bytes / (1024.0*1024*1024*1024),
+               device_size / (1024.0*1024*1024*1024));
+        return 1;
+    }
 
     // Check trace exists
     struct stat st;
@@ -842,12 +1537,69 @@ int main(int argc, char* argv[]) {
     printf("  Threads:     %d\n", num_threads);
     printf("  QD/thread:   %d\n", QUEUE_DEPTH);
     printf("  Max writes:  %.1f TB (completed write bytes only)\n", max_tb);
-    printf("  IO scale:   %u\n", io_scale);
+    printf("  LBA scale:  offset x%u, size x%u\n", offset_scale, size_scale);
     printf("  LBA mode:   %s\n", remap_lba ? "Remap (sequential)" : "Passthrough");
+    printf("  Trace loop: %s\n", loop_trace ? "Enabled" : "Disabled");
+    if (synthetic_seq.enabled()) {
+        printf("  Synthetic:  one sequential write after every %u trace writes, %u%% volume\n",
+               synthetic_seq.after_trace_writes, synthetic_seq.volume_percent);
+        printf("  Seq region: %.2f TiB total\n",
+               synthetic_seq.region_bytes / (1024.0*1024*1024*1024));
+        printf("  Seq avoid:  %s\n", trace_write_bitmap_enabled ?
+               "All trace-written 4 KiB blocks (pre-scanned 1-bit bitmap)" : "Disabled");
+        if (trace_write_bitmap_enabled) {
+            printf("  Bitmap WS: %.2f TiB\n",
+                   bitmap_working_set_bytes / (1024.0*1024*1024*1024));
+        }
+    } else {
+        printf("  Synthetic:  Disabled\n");
+    }
     printf("============================================================\n\n");
 
     // Create LBA mapper
-    LbaMapper mapper(device_size, remap_lba);
+    LbaMapper mapper(device_size, remap_lba, trace_write_bitmap_enabled);
+
+    std::unique_ptr<TraceWriteBitmap> trace_write_bitmap;
+    if (trace_write_bitmap_enabled) {
+        try {
+            trace_write_bitmap = std::make_unique<TraceWriteBitmap>(
+                bitmap_working_set_bytes);
+        } catch (const std::bad_alloc&) {
+            printf("ERROR: Cannot allocate %.2f MB trace-write bitmap\n",
+                   (bitmap_working_set_bytes / IO_BLOCK_SIZE / 8) /
+                       (1024.0*1024));
+            return 1;
+        }
+        printf("  Bitmap:     %.2f MiB for %.2f TiB (%lu blocks)\n",
+               trace_write_bitmap->memory_bytes() / (1024.0*1024),
+               trace_write_bitmap->address_space_bytes() /
+                   (1024.0*1024*1024*1024),
+               trace_write_bitmap->address_space_blocks());
+        if (!prepare_trace_write_bitmap(trace, offset_scale, size_scale, device_size,
+                                        *trace_write_bitmap)) {
+            return 1;
+        }
+        if (!trace_write_bitmap->select_synthetic_region(synthetic_seq.region_bytes,
+                                                         device_size)) {
+            uint64_t free_blocks = device_size / IO_BLOCK_SIZE -
+                                   trace_write_bitmap->written_blocks();
+            printf("ERROR: Need %.2f TiB of trace-unwritten blocks, but only %.2f TiB "
+                   "is available\n",
+                   synthetic_seq.region_bytes / (1024.0*1024*1024*1024),
+                   free_blocks * IO_BLOCK_SIZE / (1024.0*1024*1024*1024));
+            return 1;
+        }
+        printf("[Bitmap] Synthetic region selected: %.2f TiB total, interleaved "
+               "within LBA span [0, %.2f TiB)\n",
+               trace_write_bitmap->selected_bytes() /
+                   (1024.0*1024*1024*1024),
+               trace_write_bitmap->selection_span_bytes() /
+                   (1024.0*1024*1024*1024));
+        if (bitmap_preflight_only) {
+            printf("[Bitmap] Preflight passed; exiting before worker creation or device I/O\n");
+            return 0;
+        }
+    }
 
     // Create work queues
     std::vector<WorkQueue*> queues;
@@ -865,7 +1617,9 @@ int main(int argc, char* argv[]) {
     }
 
     // Start reader thread
-    std::thread reader(reader_thread, trace, std::ref(queues), std::ref(mapper), num_threads, io_scale);
+    std::thread reader(reader_thread, trace, std::ref(queues), std::ref(mapper), num_threads,
+                       offset_scale, size_scale, loop_trace, synthetic_seq,
+                       trace_write_bitmap.get());
 
     printf("Replay started...\n\n");
 

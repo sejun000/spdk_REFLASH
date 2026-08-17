@@ -89,15 +89,65 @@ ftl_stats_logger_read_nvme_log_page(struct ftl_stats_logger *logger)
 }
 
 static void
+ftl_stats_logger_backend_log_page_done(void *cb_arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct ftl_stats_logger *logger = cb_arg;
+	uint64_t nand_units = 0;
+	uint64_t new_value;
+
+	logger->backend_log_page_pending = false;
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		SPDK_WARNLOG("FTL StatsLogger: backend vendor log page 0xC0 read failed, sct=%d sc=%d\n",
+			     cpl->status.sct, cpl->status.sc);
+		return;
+	}
+
+	memcpy(&nand_units, &logger->backend_log_page_buf->data[24], sizeof(nand_units));
+	new_value = nand_units * 512000ULL;
+	if (logger->backend_nand_written == 0 && new_value != 0) {
+		logger->prev_backend_nand_written = new_value;
+	}
+	logger->backend_nand_written = new_value;
+}
+
+static void
+ftl_stats_logger_read_backend_log_page(struct ftl_stats_logger *logger)
+{
+	int rc;
+
+	if (!logger->backend_nvme_ctrlr || !logger->backend_log_page_buf ||
+	    logger->backend_log_page_pending) {
+		return;
+	}
+
+	rc = spdk_nvme_ctrlr_cmd_get_log_page(
+		logger->backend_nvme_ctrlr,
+		0xC0,
+		SPDK_NVME_GLOBAL_NS_TAG,
+		logger->backend_log_page_buf,
+		sizeof(struct ftl_backend_vendor_log),
+		0,
+		ftl_stats_logger_backend_log_page_done,
+		logger);
+	if (rc == 0) {
+		logger->backend_log_page_pending = true;
+	}
+}
+
+static void
 ftl_stats_logger_write_stats(struct ftl_stats_logger *logger)
 {
 	uint64_t host_write, cache_write, backend_write;
+	uint64_t compaction_write, gc_write, backend_md_write;
 	uint64_t host_delta, cache_delta, backend_delta;
+	uint64_t compaction_delta, gc_delta, backend_md_delta;
 	uint64_t l2p_write, md_write;
 	uint64_t l2p_delta, md_delta;
 	uint64_t nvme_host_delta, nvme_media_delta;
+	uint64_t backend_nand_delta;
 	uint64_t now_us;
 	double elapsed_sec;
+	double ftl_host_waf;
 	const double MB = 1024.0 * 1024.0;
 
 	if (!logger->log_fp) {
@@ -108,6 +158,9 @@ ftl_stats_logger_write_stats(struct ftl_stats_logger *logger)
 	host_write = logger->host_write_bytes;
 	cache_write = logger->cache_write_bytes;
 	backend_write = logger->backend_write_bytes;
+	compaction_write = logger->compaction_write_bytes;
+	gc_write = logger->gc_write_bytes;
+	backend_md_write = logger->backend_md_write_bytes;
 	l2p_write = logger->l2p_write_bytes;
 	md_write = logger->md_write_bytes;
 
@@ -115,28 +168,40 @@ ftl_stats_logger_write_stats(struct ftl_stats_logger *logger)
 	host_delta = host_write - logger->prev_host_write;
 	cache_delta = cache_write - logger->prev_cache_write;
 	backend_delta = backend_write - logger->prev_backend_write;
+	compaction_delta = compaction_write - logger->prev_compaction_write;
+	gc_delta = gc_write - logger->prev_gc_write;
+	backend_md_delta = backend_md_write - logger->prev_backend_md_write;
 	l2p_delta = l2p_write - logger->prev_l2p_write;
 	md_delta = md_write - logger->prev_md_write;
 
 	/* NVMe FDP deltas (already in bytes from FDP Statistics Log) */
 	nvme_host_delta = logger->nvme_host_written - logger->prev_nvme_host_written;
 	nvme_media_delta = logger->nvme_media_written - logger->prev_nvme_media_written;
+	backend_nand_delta = logger->backend_nand_written - logger->prev_backend_nand_written;
 
 	/* Update previous values */
 	logger->prev_host_write = host_write;
 	logger->prev_cache_write = cache_write;
 	logger->prev_backend_write = backend_write;
+	logger->prev_compaction_write = compaction_write;
+	logger->prev_gc_write = gc_write;
+	logger->prev_backend_md_write = backend_md_write;
 	logger->prev_l2p_write = l2p_write;
 	logger->prev_md_write = md_write;
 	logger->prev_nvme_host_written = logger->nvme_host_written;
 	logger->prev_nvme_media_written = logger->nvme_media_written;
+	logger->prev_backend_nand_written = logger->backend_nand_written;
 
 	/* Calculate elapsed time */
 	now_us = spdk_get_ticks() * 1000000 / spdk_get_ticks_hz();
 	elapsed_sec = (now_us - logger->start_time_us) / 1000000.0;
+	ftl_host_waf = compaction_write > 0 ?
+		(double)(compaction_write + gc_write + backend_md_write) /
+		(double)compaction_write : 1.0;
 
 	fprintf(logger->log_fp,
-		"%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f,%.2f\n",
+		"%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lu,%lu,%lu,%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,"
+		"%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.6f\n",
 		elapsed_sec,
 		host_write / MB,
 		cache_write / MB,
@@ -155,7 +220,16 @@ ftl_stats_logger_write_stats(struct ftl_stats_logger *logger)
 		l2p_write / MB,
 		md_write / MB,
 		l2p_delta / MB,
-		md_delta / MB);
+		md_delta / MB,
+		logger->backend_nand_written / MB,
+		backend_nand_delta / MB,
+		compaction_write / MB,
+		gc_write / MB,
+		backend_md_write / MB,
+		compaction_delta / MB,
+		gc_delta / MB,
+		backend_md_delta / MB,
+		ftl_host_waf);
 	fflush(logger->log_fp);
 }
 
@@ -168,9 +242,13 @@ ftl_stats_logger_poller_fn(void *arg)
 	if (logger->nvme_ctrlr) {
 		spdk_nvme_ctrlr_process_admin_completions(logger->nvme_ctrlr);
 	}
+	if (logger->backend_nvme_ctrlr && logger->backend_nvme_ctrlr != logger->nvme_ctrlr) {
+		spdk_nvme_ctrlr_process_admin_completions(logger->backend_nvme_ctrlr);
+	}
 
 	/* Try to read NVMe log page (async) */
 	ftl_stats_logger_read_nvme_log_page(logger);
+	ftl_stats_logger_read_backend_log_page(logger);
 
 	/* Log current stats */
 	ftl_stats_logger_write_stats(logger);
@@ -215,6 +293,9 @@ ftl_stats_logger_destroy(struct ftl_stats_logger *logger)
 	if (logger->log_page_buf) {
 		spdk_dma_free(logger->log_page_buf);
 	}
+	if (logger->backend_log_page_buf) {
+		spdk_dma_free(logger->backend_log_page_buf);
+	}
 
 	free(logger->dev_name);
 	free(logger);
@@ -243,6 +324,25 @@ ftl_stats_logger_set_nvme_ctrlr(struct ftl_stats_logger *logger,
 
 	logger->nvme_ctrlr = ctrlr;
 	SPDK_NOTICELOG("FTL StatsLogger: set NVMe controller %p\n", ctrlr);
+}
+
+void
+ftl_stats_logger_set_backend_nvme_ctrlr(struct ftl_stats_logger *logger,
+					 struct spdk_nvme_ctrlr *ctrlr)
+{
+	if (!logger) {
+		return;
+	}
+
+	logger->backend_nvme_ctrlr = ctrlr;
+	SPDK_NOTICELOG("FTL StatsLogger: set backend NVMe controller %p\n", ctrlr);
+	if (ctrlr && !logger->backend_log_page_buf) {
+		logger->backend_log_page_buf = spdk_dma_zmalloc(
+			sizeof(struct ftl_backend_vendor_log), 4096, NULL);
+		if (!logger->backend_log_page_buf) {
+			SPDK_WARNLOG("FTL StatsLogger: failed to allocate backend log page buffer\n");
+		}
+	}
 }
 
 int
@@ -298,7 +398,10 @@ ftl_stats_logger_start(struct ftl_stats_logger *logger)
 		"nvme_host_written_MB,nvme_media_written_MB,"
 		"nvme_host_delta_MB,nvme_media_delta_MB,"
 		"valid_blocks,write_hit_count,gc_victim_blocks,evict_victim_blocks,"
-		"l2p_write_MB,md_write_MB,l2p_delta_MB,md_delta_MB\n");
+		"l2p_write_MB,md_write_MB,l2p_delta_MB,md_delta_MB,"
+		"backend_nand_written_MB,backend_nand_delta_MB,"
+		"compaction_write_MB,gc_write_MB,backend_md_write_MB,"
+		"compaction_delta_MB,gc_delta_MB,backend_md_delta_MB,ftl_host_waf\n");
 	fflush(logger->log_fp);
 
 	/* Record start time */

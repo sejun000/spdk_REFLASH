@@ -19,6 +19,7 @@
 #include <string>
 #include <strings.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 extern "C" {
@@ -638,15 +639,21 @@ class SpdkCacheDevice : public CacheDeviceInterface {
 public:
 	SpdkCacheDevice(struct spdk_bdev_desc *cache_desc,
 			struct spdk_bdev_desc *backend_desc,
-			uint32_t block_size)
+			uint32_t block_size,
+			bool backend_dsm_enabled)
 		: m_cache_desc(cache_desc),
 		  m_backend_desc(backend_desc),
 		  m_block_size(block_size)
 	{
+		m_backend_trim_disabled = !backend_dsm_enabled;
 		m_cache_bdev = spdk_bdev_desc_get_bdev(m_cache_desc);
 		m_backend_bdev = spdk_bdev_desc_get_bdev(m_backend_desc);
 		m_cache_max_rw = 0;
 		m_backend_max_rw = 0;
+		m_backend_trim_keys.reserve(BACKEND_DSM_KEYS_PER_BATCH);
+		SPDK_NOTICELOG("Backend DSM batching: %s (batch=%zu keys, max_outstanding=%u)\n",
+			       backend_dsm_enabled ? "enabled" : "disabled",
+			       BACKEND_DSM_KEYS_PER_BATCH, BACKEND_DSM_MAX_OUTSTANDING);
 
 		// Detect ZNS from bdev, fallback to hardcoded if not detected
 		m_cache_zoned = spdk_bdev_is_zoned(m_cache_bdev);
@@ -703,11 +710,271 @@ public:
 
 	int trim_backend(uint64_t offset, size_t len) override
 	{
-		// Disabled: synchronous trim causes reentrant spdk_thread_poll crash
+		// Synchronous backend trim stays disabled.  Host overwrites are batched
+		// through queue_backend_trim_key() and submitted as asynchronous NVMe DSM.
+		(void)offset;
+		(void)len;
 		return 0;
 	}
 
+	void queue_backend_trim_key(uint64_t key)
+	{
+		if (m_backend_trim_disabled) {
+			return;
+		}
+
+		// A hot key can be overwritten several times before the batch fills.
+		// DSM is idempotent, so retain only one entry per batch.
+		if (!m_backend_trim_key_set.insert(key).second) {
+			return;
+		}
+		m_backend_trim_keys.push_back(key);
+
+		if (m_backend_trim_keys.size() >= BACKEND_DSM_KEYS_PER_BATCH) {
+			m_backend_trim_pending.emplace_back();
+			m_backend_trim_pending.back().swap(m_backend_trim_keys);
+			m_backend_trim_key_set.clear();
+			m_backend_trim_keys.reserve(BACKEND_DSM_KEYS_PER_BATCH);
+		}
+
+		// Also retry a batch whose DMA allocation previously failed.  The bdev
+		// io_wait mechanism is reserved for -ENOMEM returned by I/O submission.
+		if (!m_backend_trim_pending.empty()) {
+			pump_backend_trim();
+		}
+	}
+
+	void queue_backend_trim_keys(const std::vector<long>& keys)
+	{
+		for (long key : keys) {
+			if (key >= 0) {
+				queue_backend_trim_key(static_cast<uint64_t>(key));
+			}
+		}
+	}
+
+	uint64_t backend_trim_completed_bytes() const { return m_backend_trim_completed_bytes; }
+	uint64_t backend_trim_completed_commands() const { return m_backend_trim_completed_commands; }
+	uint64_t backend_trim_completed_ranges() const { return m_backend_trim_completed_ranges; }
+	uint64_t backend_trim_errors() const { return m_backend_trim_errors; }
+	bool backend_trim_enabled() const { return !m_backend_trim_disabled; }
+	uint32_t backend_trim_outstanding() const { return m_backend_trim_outstanding; }
+	size_t backend_trim_pending_batches() const { return m_backend_trim_pending.size(); }
+
 private:
+	static constexpr size_t BACKEND_DSM_KEYS_PER_BATCH =
+		SPDK_NVME_DATASET_MANAGEMENT_MAX_RANGES;
+	static constexpr uint32_t BACKEND_DSM_MAX_OUTSTANDING = 32;
+
+	struct BackendDsmCtx {
+		SpdkCacheDevice *device;
+		struct spdk_nvme_dsm_range *ranges;
+		uint16_t num_ranges;
+		uint64_t bytes;
+	};
+
+	static void backend_trim_completion(struct spdk_bdev_io *bdev_io, bool success,
+					    void *cb_arg)
+	{
+		auto *ctx = static_cast<BackendDsmCtx *>(cb_arg);
+		SpdkCacheDevice *device = ctx->device;
+
+		spdk_bdev_free_io(bdev_io);
+		if (success) {
+			device->m_backend_trim_completed_bytes += ctx->bytes;
+			device->m_backend_trim_completed_commands++;
+			device->m_backend_trim_completed_ranges += ctx->num_ranges;
+		} else {
+			device->m_backend_trim_errors++;
+			SPDK_ERRLOG("Backend DSM completion failed: ranges=%u, bytes=%lu\n",
+				    ctx->num_ranges, ctx->bytes);
+		}
+
+		spdk_dma_free(ctx->ranges);
+		delete ctx;
+		assert(device->m_backend_trim_outstanding > 0);
+		device->m_backend_trim_outstanding--;
+		device->pump_backend_trim();
+	}
+
+	static void backend_trim_io_wait_cb(void *arg)
+	{
+		auto *device = static_cast<SpdkCacheDevice *>(arg);
+		device->m_backend_trim_waiting = false;
+		device->pump_backend_trim();
+	}
+
+	void queue_backend_trim_io_wait()
+	{
+		if (m_backend_trim_waiting || !m_backend_bdev || !m_backend_ch) {
+			return;
+		}
+
+		m_backend_trim_wait_entry = {};
+		m_backend_trim_wait_entry.bdev = m_backend_bdev;
+		m_backend_trim_wait_entry.cb_fn = backend_trim_io_wait_cb;
+		m_backend_trim_wait_entry.cb_arg = this;
+		int rc = spdk_bdev_queue_io_wait(m_backend_bdev, m_backend_ch,
+						 &m_backend_trim_wait_entry);
+		if (rc == 0) {
+			m_backend_trim_waiting = true;
+		} else {
+			m_backend_trim_errors++;
+			SPDK_ERRLOG("Backend DSM io_wait registration failed: rc=%d\n", rc);
+		}
+	}
+
+	BackendDsmCtx *build_backend_dsm_ctx(std::vector<uint64_t> keys, int *build_status)
+	{
+		*build_status = 0;
+		if (!m_backend_bdev || m_block_size == 0) {
+			*build_status = -EINVAL;
+			return nullptr;
+		}
+
+		const uint32_t backend_block_size = spdk_bdev_get_block_size(m_backend_bdev);
+		if (backend_block_size == 0 || (m_block_size % backend_block_size) != 0) {
+			SPDK_ERRLOG("Backend DSM block-size mismatch: cache=%u backend=%u\n",
+				    m_block_size, backend_block_size);
+			*build_status = -EINVAL;
+			return nullptr;
+		}
+
+		std::sort(keys.begin(), keys.end());
+		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+		if (keys.empty()) {
+			*build_status = -EINVAL;
+			return nullptr;
+		}
+
+		auto *ranges = static_cast<struct spdk_nvme_dsm_range *>(
+			spdk_dma_zmalloc(SPDK_NVME_DATASET_MANAGEMENT_MAX_RANGES *
+					   sizeof(struct spdk_nvme_dsm_range), 4096, nullptr));
+		if (!ranges) {
+			*build_status = -ENOMEM;
+			return nullptr;
+		}
+
+		const uint64_t blocks_per_key = m_block_size / backend_block_size;
+		const uint64_t backend_blocks = spdk_bdev_get_num_blocks(m_backend_bdev);
+		uint16_t nr = 0;
+		uint64_t bytes = 0;
+
+		for (uint64_t key : keys) {
+			if (key > UINT64_MAX / blocks_per_key) {
+				continue;
+			}
+			uint64_t slba = key * blocks_per_key;
+			if (slba >= backend_blocks || blocks_per_key > backend_blocks - slba) {
+				SPDK_WARNLOG("Backend DSM key out of range: key=%lu slba=%lu\n", key, slba);
+				continue;
+			}
+
+			if (nr > 0 && ranges[nr - 1].starting_lba + ranges[nr - 1].length == slba &&
+			    static_cast<uint64_t>(ranges[nr - 1].length) + blocks_per_key <= UINT32_MAX) {
+				ranges[nr - 1].length += static_cast<uint32_t>(blocks_per_key);
+			} else {
+				if (nr >= SPDK_NVME_DATASET_MANAGEMENT_MAX_RANGES) {
+					break;
+				}
+				ranges[nr].starting_lba = slba;
+				ranges[nr].length = static_cast<uint32_t>(blocks_per_key);
+				ranges[nr].attributes.raw = 0;
+				nr++;
+			}
+			bytes += m_block_size;
+		}
+
+		if (nr == 0) {
+			spdk_dma_free(ranges);
+			*build_status = -ERANGE;
+			return nullptr;
+		}
+
+		auto *ctx = new (std::nothrow) BackendDsmCtx{this, ranges, nr, bytes};
+		if (!ctx) {
+			spdk_dma_free(ranges);
+			*build_status = -ENOMEM;
+			return nullptr;
+		}
+		return ctx;
+	}
+
+	void pump_backend_trim()
+	{
+		if (m_backend_trim_disabled || m_backend_trim_waiting || !m_backend_ch) {
+			return;
+		}
+
+		if (!spdk_bdev_io_type_supported(m_backend_bdev, SPDK_BDEV_IO_TYPE_NVME_IO)) {
+			m_backend_trim_disabled = true;
+			m_backend_trim_errors++;
+			m_backend_trim_pending.clear();
+			SPDK_ERRLOG("Backend bdev %s does not support NVMe I/O passthrough; DSM disabled\n",
+				    spdk_bdev_get_name(m_backend_bdev));
+			return;
+		}
+
+		while (m_backend_trim_outstanding < BACKEND_DSM_MAX_OUTSTANDING &&
+		       !m_backend_trim_pending.empty()) {
+			int build_status = 0;
+			BackendDsmCtx *ctx = build_backend_dsm_ctx(m_backend_trim_pending.front(),
+								       &build_status);
+			if (!ctx) {
+				if (build_status == -ENOMEM) {
+					// spdk_dma_zmalloc/new exhaustion is not a bdev I/O-pool
+					// event, so an io_wait callback is not guaranteed to fire.
+					return;
+				}
+				m_backend_trim_errors++;
+				SPDK_ERRLOG("Backend DSM batch rejected: rc=%d keys=%zu\n",
+					    build_status, m_backend_trim_pending.front().size());
+				m_backend_trim_pending.pop_front();
+				continue;
+			}
+
+			struct spdk_nvme_cmd cmd = {};
+			cmd.opc = SPDK_NVME_OPC_DATASET_MANAGEMENT;
+			cmd.cdw10 = ctx->num_ranges - 1;
+			cmd.cdw11 = SPDK_NVME_DSM_ATTR_DEALLOCATE;
+
+			int rc = spdk_bdev_nvme_io_passthru(m_backend_desc, m_backend_ch, &cmd,
+							 ctx->ranges,
+							 ctx->num_ranges * sizeof(*ctx->ranges),
+							 backend_trim_completion, ctx);
+			if (rc == -ENOMEM) {
+				spdk_dma_free(ctx->ranges);
+				delete ctx;
+				queue_backend_trim_io_wait();
+				return;
+			}
+			if (rc != 0) {
+				m_backend_trim_errors++;
+				SPDK_ERRLOG("Backend DSM submission failed: rc=%d ranges=%u\n",
+					    rc, ctx->num_ranges);
+				spdk_dma_free(ctx->ranges);
+				delete ctx;
+				m_backend_trim_pending.pop_front();
+				continue;
+			}
+
+			m_backend_trim_pending.pop_front();
+			m_backend_trim_outstanding++;
+		}
+	}
+
+	std::vector<uint64_t> m_backend_trim_keys;
+	std::unordered_set<uint64_t> m_backend_trim_key_set;
+	std::deque<std::vector<uint64_t>> m_backend_trim_pending;
+	struct spdk_bdev_io_wait_entry m_backend_trim_wait_entry = {};
+	bool m_backend_trim_waiting = false;
+	bool m_backend_trim_disabled = false;
+	uint32_t m_backend_trim_outstanding = 0;
+	uint64_t m_backend_trim_completed_bytes = 0;
+	uint64_t m_backend_trim_completed_commands = 0;
+	uint64_t m_backend_trim_completed_ranges = 0;
+	uint64_t m_backend_trim_errors = 0;
+
 	// Zone queue management
 	std::unordered_map<uint64_t, ZoneQueue> zone_queues_;  // zone_id -> ZoneQueue
 
@@ -2720,6 +2987,21 @@ public:
 		}
 	}
 
+	// The backend still contains the old version after a host overwrite lands
+	// durably in cache.  Accumulate those LBAs and notify the backend SSD with
+	// asynchronous, 256-range DSM batches.
+	void queue_backend_trim_key(uint64_t key) {
+		if (device_) {
+			device_->queue_backend_trim_key(key);
+		}
+	}
+
+	void queue_backend_trim_keys(const std::vector<long>& keys) {
+		if (device_) {
+			device_->queue_backend_trim_keys(keys);
+		}
+	}
+
 	// Read tracking
 	void add_cache_read_bytes(uint64_t bytes) {
 		if (stats_logger_) {
@@ -2756,6 +3038,9 @@ public:
 					cache_->print_histograms(false);  // print without reset (cumulative)
 				});
 			}
+			// Record the configured/active DSM state from the first CSV row,
+			// including the idle interval before replay starts.
+			update_stats_logger();
 			stats_logger_->start();
 		}
 	}
@@ -2777,6 +3062,14 @@ public:
 			stats_logger_->stats().gc_victim_blocks.store(cache_->get_compacted_blocks(), std::memory_order_relaxed);
 			stats_logger_->stats().evict_victim_blocks.store(cache_->get_evicted_blocks(), std::memory_order_relaxed);
 			stats_logger_->set_gc_segments_allocated(cache_->get_gc_segments_allocated());
+			stats_logger_->set_backend_trim_stats(
+				device_->backend_trim_enabled(),
+				device_->backend_trim_completed_bytes(),
+				device_->backend_trim_completed_commands(),
+				device_->backend_trim_completed_ranges(),
+				device_->backend_trim_errors(),
+				device_->backend_trim_outstanding(),
+				device_->backend_trim_pending_batches());
 			// Push WAF values from StatsLogger to LogCache for periodic decisions
 			cache_->setFdpWaf(stats_logger_->fdp_waf());
 			cache_->setBackendWaf(stats_logger_->backend_waf());
@@ -3019,6 +3312,7 @@ struct WriteBufferFlushCtx {
 	std::vector<int> stream_ids;  // For FDP placement handle
 	std::vector<long> keys;       // Keys for pending write completion
 	LogCache *cache = nullptr;    // For complete_block_writes
+	LogCacheAsync *owner = nullptr; // For backend DSM batching after cache durability
 	// Track IOs and their block counts in this flush
 	std::unordered_map<CacheIo*, size_t> io_block_counts;
 	// For split writes: track outstanding write count
@@ -3149,6 +3443,7 @@ void LogCacheAsync::flush_write_buffer()
 
 	// Store cache pointer for completion
 	flush_ctx->cache = cache_.get();
+	flush_ctx->owner = this;
 
 	// // Log if we were blocked and now succeeded (full success only)
 	// if (flush_block_count > 0 && !partial_failure) {
@@ -3305,6 +3600,13 @@ void LogCacheAsync::flush_write_buffer()
 static void write_buffer_flush_done(void *cb_arg, int status)
 {
 	auto *flush_ctx = static_cast<WriteBufferFlushCtx*>(cb_arg);
+
+	// Only deallocate the stale backend copies after every cache write in this
+	// flush has completed successfully.  This preserves the cache as the newest
+	// durable copy before DSM is issued.
+	if (status == 0 && flush_ctx->owner && !flush_ctx->keys.empty()) {
+		flush_ctx->owner->queue_backend_trim_keys(flush_ctx->keys);
+	}
 
 	// Mark all blocks as write complete (clear pending)
 	if (flush_ctx->cache && !flush_ctx->keys.empty()) {
@@ -3814,6 +4116,10 @@ static void host_write_next_block(CacheIo *io)
 								     // Mark block write complete (clear pending)
 								     long completed_key = static_cast<long>(io->lba + io->current_block_idx);
 								     io->ctx->cache->cache()->complete_block_write(completed_key);
+								     if (status == 0) {
+									     io->ctx->cache->queue_backend_trim_key(
+										     static_cast<uint64_t>(completed_key));
+								     }
 #if OFFSET_DEBUG
 								     SPDK_NOTICELOG("WRITE_DONE: key=%ld status=%d\n", completed_key, status);
 #endif
@@ -6147,7 +6453,8 @@ log_cache_ctx_create(struct spdk_bdev_desc *cache_desc,
 		     const char *cache_type,
 		     const char *waf_log_path,
 		     const char *stat_log_path,
-		     double valid_rate_threshold)
+		     double valid_rate_threshold,
+		     bool backend_dsm_enabled)
 {
 	if (!cache_desc || !backend_desc || cache_block_count == 0 || backend_block_count == 0 || block_size == 0) {
 		return nullptr;
@@ -6159,7 +6466,8 @@ log_cache_ctx_create(struct spdk_bdev_desc *cache_desc,
 
 	auto ctx = std::make_unique<log_cache_ctx>();
 	ctx->block_size = block_size;
-	ctx->device = std::make_unique<icache::SpdkCacheDevice>(cache_desc, backend_desc, block_size);
+	ctx->device = std::make_unique<icache::SpdkCacheDevice>(cache_desc, backend_desc, block_size,
+							 backend_dsm_enabled);
 
 	std::string waf_path = (waf_log_path && waf_log_path[0] != '\0') ? waf_log_path : "icache_waf.log";
 	std::string stat_path = stat_log_path ? stat_log_path : "";

@@ -19,6 +19,7 @@ struct rpc_icache_create {
 	char *waf_log_path;
 	char *stat_log_path;
 	double valid_rate_threshold;
+	bool backend_dsm_enabled;
 };
 
 static void
@@ -84,6 +85,7 @@ static const struct spdk_json_object_decoder rpc_icache_create_decoders[] = {
 	{"waf_log_path", offsetof(struct rpc_icache_create, waf_log_path), spdk_json_decode_string, true},
 	{"stat_log_path", offsetof(struct rpc_icache_create, stat_log_path), spdk_json_decode_string, true},
 	{"valid_rate_threshold", offsetof(struct rpc_icache_create, valid_rate_threshold), decode_double, true},
+	{"backend_dsm_enabled", offsetof(struct rpc_icache_create, backend_dsm_enabled), spdk_json_decode_bool, true},
 };
 
 static void
@@ -96,6 +98,7 @@ rpc_bdev_icache_create(struct spdk_jsonrpc_request *request,
 
 	req.max_pending_io = 64;
 	req.valid_rate_threshold = 0.0;
+	req.backend_dsm_enabled = true;
 
 	if (spdk_json_decode_object(params, rpc_icache_create_decoders,
 		SPDK_COUNTOF(rpc_icache_create_decoders), &req)) {
@@ -108,7 +111,7 @@ rpc_bdev_icache_create(struct spdk_jsonrpc_request *request,
 	rc = vbdev_icache_create(req.name, req.cache_bdev_name,
 		req.backend_bdev_name, req.max_pending_io,
 		req.cache_type, req.waf_log_path, req.stat_log_path,
-		req.valid_rate_threshold);
+		req.valid_rate_threshold, req.backend_dsm_enabled);
 	free_rpc_icache_create(&req);
 	if (rc) {
 		spdk_jsonrpc_send_error_response_fmt(request, rc,

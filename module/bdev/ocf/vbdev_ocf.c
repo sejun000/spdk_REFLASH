@@ -1005,6 +1005,28 @@ finish_register(struct vbdev_ocf *vbdev)
 					ocf_stats_logger_set_nvme_ctrlr(vbdev->stats_logger, nvme_ctrlr);
 				}
 			}
+			/* Set backend QLC controller for physical NAND write stats. */
+			if (vbdev->core.bdev) {
+				struct spdk_nvme_ctrlr *backend_ctrlr = bdev_nvme_get_ctrlr(vbdev->core.bdev);
+				if (!backend_ctrlr) {
+					const char *bdev_name = spdk_bdev_get_name(vbdev->core.bdev);
+					if (bdev_name) {
+						char parent_name[256];
+						snprintf(parent_name, sizeof(parent_name), "%s", bdev_name);
+						char *p_pos = strrchr(parent_name, 'p');
+						if (p_pos && p_pos > parent_name) {
+							*p_pos = '\0';
+							struct spdk_bdev *parent_bdev = spdk_bdev_get_by_name(parent_name);
+							if (parent_bdev) {
+								backend_ctrlr = bdev_nvme_get_ctrlr(parent_bdev);
+							}
+						}
+					}
+				}
+				if (backend_ctrlr) {
+					ocf_stats_logger_set_backend_nvme_ctrlr(vbdev->stats_logger, backend_ctrlr);
+				}
+			}
 			ocf_stats_logger_start(vbdev->stats_logger);
 		}
 	}

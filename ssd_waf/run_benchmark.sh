@@ -13,6 +13,7 @@
 #     3) alibaba_dwpd1to2_4x.trace   (default)
 #     4) alibaba_dwpd2_5x.trace
 #     5) ssdtrace_scaled_4x.trace
+#     6) varmail_2tb_6x_16t.csv (write-only)
 #     7) fio_zipf_1.0 (50% read / 50% write)
 
 set -e
@@ -29,6 +30,7 @@ declare -a TRACE_FILES=(
     [3]="alibaba_dwpd1to2_4x.trace"
     [4]="alibaba_dwpd2_5x.trace"
     [5]="ssdtrace_scaled_4x.trace"
+    [6]="varmail_2tb_6x_16t.csv"
     [7]="fio_zipf_1.0"
 )
 # Default trace file (used when TRACE_NUMS is not set)
@@ -47,7 +49,16 @@ BACKEND_SPLIT_GB="${BACKEND_SPLIT_GB:-14400}"
 MAX_TB="${MAX_TB:-14}"
 IO_SCALE="${IO_SCALE:-2}"
 REPLAY_EXTRA_ARGS="${REPLAY_EXTRA_ARGS:-}"
+REPLAY_LBA_ARGS="${REPLAY_LBA_ARGS:---remap-lba}"
+TRACE_LOOP="${TRACE_LOOP:-0}"
 PREFILL="${PREFILL:-1}"
+FTL_OVERPROV="${FTL_OVERPROV:-7}"
+ICACHE_BACKEND_DSM="${ICACHE_BACKEND_DSM:-1}"
+
+if [ "$ICACHE_BACKEND_DSM" != "0" ] && [ "$ICACHE_BACKEND_DSM" != "1" ]; then
+    echo "ERROR: ICACHE_BACKEND_DSM must be 0 or 1 (got: $ICACHE_BACKEND_DSM)" >&2
+    exit 1
+fi
 
 # Initialize log file with timestamp
 echo "========================================" > "$LOG_FILE"
@@ -62,15 +73,9 @@ log_to_file() {
 # Config definitions: "name|command|replay_file"
 declare -a CONFIGS=(
     "LOG_SEPBIT_FIFO|sudo ICACHE_CACHE_TYPE=LOG_SEPBIT_FIFO ./run_tier_fdp.sh|sepbit.replay"
-    "LOG_GREEDY_COST_BENEFIT_10|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_10 ./run_tier_fdp.sh|reflash.replay"
-    "LOG_GREEDY_COST_BENEFIT_10_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_10_WARM ./run_tier_fdp.sh|reflash_fixed.replay"
-    "LOG_GREEDY_COST_BENEFIT_COLD|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_COST_BENEFIT_COLD ./run_tier_fdp.sh|reflash_fixed.replay"
-    "FTL|sudo ./run_ftl.sh|ftl.replay"
+    "FTL|sudo FTL_OVERPROV=$FTL_OVERPROV ./run_ftl.sh|ftl.replay"
     "OCF|sudo ./run_ocf.sh|ocf.replay"
     "LOG_GREEDY_80_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_80_WARM ./run_tier_fdp.sh|reflash_80_warm.replay"
-    "LOG_GREEDY_60_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_60_WARM ./run_tier_fdp.sh|reflash_60_warm.replay"
-    "LOG_GREEDY_40_WARM|sudo ICACHE_CACHE_TYPE=LOG_GREEDY_40_WARM ./run_tier_fdp.sh|reflash_40_warm.replay"
-    "REFLASH|sudo ICACHE_CACHE_TYPE=REFLASH ./run_tier_fdp.sh|reflash.replay"
     "REFLASH_80|sudo ICACHE_CACHE_TYPE=REFLASH_80 ./run_tier_fdp.sh|reflash.replay"
     "REFLASH_R864|sudo ICACHE_CACHE_TYPE=REFLASH_R864 ./run_tier_fdp.sh|reflash.replay"
     "REFLASH_R288|sudo ICACHE_CACHE_TYPE=REFLASH_R288 ./run_tier_fdp.sh|reflash.replay"
@@ -164,6 +169,8 @@ exit_all_tgt() {
 # Step 3: Run tgt with specific config
 run_tgt() {
     local cmd="$1"
+    # Preserve the per-run backend DSM toggle across sudo.
+    cmd="${cmd/sudo /sudo ICACHE_BACKEND_DSM=$ICACHE_BACKEND_DSM }"
     # Inject PREFILL if enabled
     if [ "$PREFILL" = "1" ]; then
         cmd="${cmd/sudo /sudo PREFILL=1 }"
@@ -189,19 +196,37 @@ run_replay_trace() {
     # Build io-scale argument (empty when IO_SCALE is unset/empty)
     local io_scale_arg=""
     [ -n "$IO_SCALE" ] && io_scale_arg="--io-scale $IO_SCALE"
+    local trace_loop_arg=""
+    [ "$TRACE_LOOP" = "1" ] && trace_loop_arg="--loop-trace"
 
     # Run replay_trace in background with nohup
-    nohup bash -c "sudo taskset -c 14-18 ./replay_trace --remap-lba --trace $TRACE_FILE --max-tb $MAX_TB $io_scale_arg $REPLAY_EXTRA_ARGS" > "$replay_file" 2>&1 &
+    nohup bash -c "sudo taskset -c 14-18 ./replay_trace $REPLAY_LBA_ARGS --trace $TRACE_FILE --max-tb $MAX_TB $io_scale_arg $trace_loop_arg $REPLAY_EXTRA_ARGS" > "$replay_file" 2>&1 &
     local pid=$!
 
     log_info "replay_trace started with PID: $pid"
     log_info "Waiting for completion (or kill the process to skip)..."
 
-    # Wait for process to complete
-    # If killed externally, this will return and we continue
-    wait $pid 2>/dev/null || log_warn "replay_trace process terminated (PID: $pid)"
+    # A non-zero exit or a missing final summary is a failed benchmark.
+    # Do not advance to the next config with a truncated result file.
+    local replay_status=0
+    if wait $pid 2>/dev/null; then
+        :
+    else
+        replay_status=$?
+    fi
 
-    log_success "replay_trace completed -> $replay_file"
+    if [ "$replay_status" -ne 0 ]; then
+        log_error "replay_trace failed (PID: $pid, status: $replay_status)"
+        return "$replay_status"
+    fi
+
+    if ! grep -q "Stop reason:.*completed write limit reached" "$replay_file" ||
+       ! grep -q "I/O Errors:.*0" "$replay_file"; then
+        log_error "replay_trace result is incomplete or contains errors -> $replay_file"
+        return 1
+    fi
+
+    log_success "replay_trace completed and validated -> $replay_file"
 }
 
 # Device detection (mirrors replay_trace.cpp find_device())
@@ -294,10 +319,26 @@ FIOEOF
     log_info "fio started with PID: $pid"
     log_info "Waiting for completion (or kill the process to skip)..."
 
-    wait $pid 2>/dev/null || log_warn "fio process terminated (PID: $pid)"
+    local fio_status=0
+    if wait $pid 2>/dev/null; then
+        :
+    else
+        fio_status=$?
+    fi
 
     rm -f "$jobfile"
-    log_success "fio completed -> $replay_file"
+
+    if [ "$fio_status" -ne 0 ]; then
+        log_error "fio failed (PID: $pid, status: $fio_status)"
+        return "$fio_status"
+    fi
+
+    if ! grep -q "err= 0:" "$replay_file"; then
+        log_error "fio result is incomplete or contains errors -> $replay_file"
+        return 1
+    fi
+
+    log_success "fio completed and validated -> $replay_file"
 }
 
 # Step 5: Exit all tgt after replay
@@ -414,8 +455,8 @@ main() {
             CURRENT_TRACE_NUM="$tnum"
             TRACE_FILE="${TRACE_BASE}${TRACE_FILES[$tnum]}"
 
-            # Trace 7 (fio zipf) doesn't need --io-scale
-            if [ "$tnum" -eq 7 ]; then
+            # Trace 6 (varmail) and 7 (fio zipf) are already scaled.
+            if [ "$tnum" -eq 6 ] || [ "$tnum" -eq 7 ]; then
                 IO_SCALE=""
             else
                 IO_SCALE="$io_scale_orig"

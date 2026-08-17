@@ -854,6 +854,24 @@ ftl_stats_bdev_io_completed(struct spdk_ftl_dev *dev, enum ftl_stats_type type,
 	if (sct == SPDK_NVME_SCT_GENERIC && sc == SPDK_NVME_SC_SUCCESS) {
 		stats_group->ios++;
 		stats_group->blocks += bdev_io->u.bdev.num_blocks;
+
+		if (stats_group == &stats_entry->write) {
+			uint64_t bytes = bdev_io->u.bdev.num_blocks * FTL_BLOCK_SIZE;
+
+			switch (type) {
+			case FTL_STATS_TYPE_CMP:
+				ftl_stats_logger_add_compaction_write(dev->stats_logger, bytes);
+				break;
+			case FTL_STATS_TYPE_GC:
+				ftl_stats_logger_add_gc_write(dev->stats_logger, bytes);
+				break;
+			case FTL_STATS_TYPE_MD_BASE:
+				ftl_stats_logger_add_backend_md_write(dev->stats_logger, bytes);
+				break;
+			default:
+				break;
+			}
+		}
 	} else if (sct == SPDK_NVME_SCT_MEDIA_ERROR) {
 		stats_group->errors.media++;
 	} else {

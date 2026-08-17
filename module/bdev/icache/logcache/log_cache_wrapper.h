@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <sys/uio.h>
 
@@ -22,7 +23,8 @@ struct log_cache_ctx *log_cache_ctx_create(struct spdk_bdev_desc *cache_desc,
 					   const char *cache_type,
 					   const char *waf_log_path,
 					   const char *stat_log_path,
-					   double valid_rate_threshold);
+					   double valid_rate_threshold,
+					   bool backend_dsm_enabled);
 
 void log_cache_ctx_destroy(struct log_cache_ctx *ctx);
 

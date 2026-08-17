@@ -19,6 +19,11 @@ struct nvme_fdp_stats_log {
 	uint8_t reserved[480];
 };
 
+/* Backend vendor log page 0xC0. Bytes 24-31 contain NAND write units. */
+struct ocf_backend_vendor_log {
+	uint8_t data[256];
+};
+
 /**
  * OCF Stats Logger
  *
@@ -69,6 +74,13 @@ struct ocf_stats_logger {
 	uint64_t nvme_media_written;
 	uint64_t prev_nvme_host_written;
 	uint64_t prev_nvme_media_written;
+
+	/* Backend QLC physical NAND writes (vendor log page 0xC0). */
+	struct spdk_nvme_ctrlr *backend_nvme_ctrlr;
+	struct ocf_backend_vendor_log *backend_log_page_buf;
+	bool backend_log_page_pending;
+	uint64_t backend_nand_written;
+	uint64_t prev_backend_nand_written;
 };
 
 /**
@@ -111,6 +123,10 @@ void ocf_stats_logger_set_cache(struct ocf_stats_logger *logger,
  */
 void ocf_stats_logger_set_nvme_ctrlr(struct ocf_stats_logger *logger,
 				      struct spdk_nvme_ctrlr *ctrlr);
+
+/** Set backend QLC NVMe controller for physical NAND write collection. */
+void ocf_stats_logger_set_backend_nvme_ctrlr(struct ocf_stats_logger *logger,
+					      struct spdk_nvme_ctrlr *ctrlr);
 
 /**
  * Start the stats logger (call from SPDK thread)

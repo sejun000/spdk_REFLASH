@@ -29,6 +29,7 @@ SKIP_PRE_FORMAT=${SKIP_PRE_FORMAT:-0}
 export CACHE_SPLIT_GB=${CACHE_SPLIT_GB:-256}
 # Backend split size (0 = use full capacity)
 export BACKEND_SPLIT_GB=${BACKEND_SPLIT_GB:-0}
+export ICACHE_BACKEND_DSM=${ICACHE_BACKEND_DSM:-1}
 
 log() {
     echo "[run_tier_fdp] $*"

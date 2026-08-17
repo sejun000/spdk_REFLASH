@@ -84,8 +84,8 @@ public:
         long key;
         size_t src_idx;           // Source index in victim segment
         size_t dst_idx;           // Destination index in target segment (for striping)
-        uint32_t create_timestamp;
-        uint32_t gc_copied_timestamp; // GC 최초 복사 시각 (0이면 이번이 첫 GC copy)
+        uint64_t create_timestamp;
+        uint64_t gc_copied_timestamp; // GC 최초 복사 시각 (0이면 이번이 첫 GC copy)
         LogCacheSegment *dst_seg; // Target segment for this block (may differ from result.target_seg when segment fills)
     };
 

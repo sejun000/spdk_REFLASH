@@ -327,13 +327,7 @@ void LogCache::evict_policy_update(LogCacheSegment *s) {
 }
 
 void LogCache::periodic() {
-    // Block timestamps are uint32_t — assert we haven't overflowed (~16TB of 4K writes)
     if (!is_ghost_cache) return;
-    if (log_cache_timestamp >= UINT32_MAX) {
-        fprintf(stderr, "FATAL: log_cache_timestamp (%lu) exceeded uint32_t range. "
-                "Block timestamps will be corrupted.\n", log_cache_timestamp);
-        abort();
-    }
 
     switch (periodic_mode_) {
     case PeriodicMode::GhostDelta_GC:
@@ -540,8 +534,9 @@ double LogCache::sum_invalidate_rate_in_wt_range(uint64_t wt_hi) const
     return sum;
 }
 
-// porting_final_final.md §5 — PrGh decision:
-//   LHS = r · waf · (F_pred − F_ghost), RHS = G(u+δ)
+// REFLASH_R* decision (physical-write cost on both tiers):
+//   LHS = G(u+δ) · buffer_waf
+//   RHS = invrate_sum · r · backend_waf
 // F_pred  = EWMA(cum evictor->get_mth_score_valid_pages(D))
 // F_ghost = EWMA(cum age_ghost_cache.totalValidCount())
 void LogCache::periodic_ghost_delta_gc_sum_final() {
@@ -620,7 +615,8 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
             !compaction_ratio_in_ghost_cache.has_value() ||
             !eviction_ratio.has_value()) return;
 
-        const double waf_w   = (backend_waf_ > 0.0) ? backend_waf_ : 1.0;
+        const double buffer_waf  = (fdp_waf_ > 0.0) ? fdp_waf_ : 1.0;
+        const double backend_waf = (backend_waf_ > 0.0) ? backend_waf_ : 1.0;
         const double Gud     = compaction_ratio_in_ghost_cache.value();
         const double F_pred  = flush_pred_ratio.has_value()
                              ? flush_pred_ratio.value()  : 0.0;
@@ -648,11 +644,11 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
         }
         const double lambda = lambda_ratio.has_value() ? lambda_ratio.value() : 0.0;
         (void)lambda;   // kept for logging only (no longer in the rule)
-        const double lhs   = Gud;                                    // GC copy cost / host page
-        const double rhs   = invrate_sum * periodic_ratio_ * waf_w;  // invrate·r·waf / host page
+        const double lhs   = Gud * buffer_waf;  // buffer physical GC-copy cost / host page
+        const double rhs   = invrate_sum * periodic_ratio_ * backend_waf;
         const bool   raise = (lhs < rhs);
-        // (anti-stuck cap removed per request: decision is purely Gud < invrate_sum·r,
-        //  no forced flush after N consecutive RAISEs.)
+        // No forced flush after N consecutive RAISEs; the decision is purely
+        // Gud·buffer_waf < invrate_sum·r·backend_waf.
 
         const double cur_util = (total_cache_block_count > 0)
                               ? (double)global_valid_blocks / total_cache_block_count : 0.0;
@@ -661,13 +657,14 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
         if (raise) target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, raw_target);
         else       target_valid_blk_rate = std::max(0.0, raw_target);
 
-        SPDK_NOTICELOG("periodic_gs_invrate: %s target=%.4f, lhs(Gud)=%.6f, rhs=%.6f, "
+        SPDK_NOTICELOG("periodic_gs_invrate: %s target=%.4f, lhs(Gud*buffer_waf)=%.6f, rhs=%.6f, "
                        "invrate_sum=%.6f, r=%.3f, lambda=%.6f, vic_v_wt=%lu, "
-                       "F_pred=%.6f, F_ghost=%.6f, backend_waf=%.3f, age_ghost_valid=%lu\n",
+                       "F_pred=%.6f, F_ghost=%.6f, buffer_waf=%.3f, backend_waf=%.3f, "
+                       "age_ghost_valid=%lu\n",
                        raise ? "RAISE" : "LOWER",
                        target_valid_blk_rate, lhs, rhs,
                        invrate_sum, periodic_ratio_, lambda, vspan.max_wt,
-                       F_pred, F_ghost, backend_waf_,
+                       F_pred, F_ghost, buffer_waf, backend_waf,
                        age_ghost_cache.totalValidCount());
     }
 }
@@ -714,7 +711,7 @@ void LogCache::append_block(int stream_id, long key, int lba_sz, const void *pay
     uint64_t dst_offset = block_offset(seg, seg->write_ptr);
     blk.key = key;
     blk.valid = true;
-    blk.create_timestamp = static_cast<uint32_t>(log_cache_timestamp);
+    blk.create_timestamp = log_cache_timestamp;
     mapping[key] = { seg, seg->write_ptr };
 
     ++seg->write_ptr;
@@ -773,7 +770,7 @@ bool LogCache::append_block_metadata(int stream_id, long key, int lba_sz, uint64
     uint64_t dst_offset = block_offset(seg, seg->write_ptr);
     blk.key = key;
     blk.valid = true;
-    blk.create_timestamp = static_cast<uint32_t>(log_cache_timestamp);
+    blk.create_timestamp = log_cache_timestamp;
     mapping[key] = { seg, seg->write_ptr };
     pending_writes_.insert(key);  // Mark as write in progress
 
@@ -1253,7 +1250,7 @@ void LogCache::dummy_fill_segment(LogCacheSegment* s)
         for (std::size_t i = s->write_ptr; i < s->blocks.size(); ++i) {
             s->blocks[i].key = 0;
             s->blocks[i].valid = false;
-            s->blocks[i].create_timestamp = UINT32_MAX;
+            s->blocks[i].create_timestamp = UINT64_MAX;
         }
         s->write_ptr = s->blocks.size();
         evict_policy_add(s);
@@ -1945,7 +1942,7 @@ void LogCache::finalize_gc(GcPrepareResult &result)
         dst_blk.key = info.key;
         dst_blk.valid = true;
         dst_blk.create_timestamp = info.create_timestamp;
-        dst_blk.gc_copied_timestamp = info.gc_copied_timestamp ? info.gc_copied_timestamp : static_cast<uint32_t>(log_cache_timestamp);
+        dst_blk.gc_copied_timestamp = info.gc_copied_timestamp ? info.gc_copied_timestamp : log_cache_timestamp;
 
         // Update mapping to point to CORRECT target segment
         mapping[info.key] = {dst_seg, dst_idx};
@@ -2108,7 +2105,7 @@ void LogCache::finalize_gc_async(GcPrepareResult &result, cache_device_io_cb cb,
         dst_blk.key = info.key;
         dst_blk.valid = true;
         dst_blk.create_timestamp = info.create_timestamp;
-        dst_blk.gc_copied_timestamp = info.gc_copied_timestamp ? info.gc_copied_timestamp : static_cast<uint32_t>(log_cache_timestamp);
+        dst_blk.gc_copied_timestamp = info.gc_copied_timestamp ? info.gc_copied_timestamp : log_cache_timestamp;
 
         // Update mapping to point to CORRECT target segment
         mapping[info.key] = {dst_seg, dst_idx};

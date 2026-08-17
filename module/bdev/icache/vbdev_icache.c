@@ -33,6 +33,7 @@ struct vbdev_icache {
 	char			*waf_log_path;
 	char			*stat_log_path;
 	double			valid_rate_threshold;
+	bool			backend_dsm_enabled;
 };
 
 struct icache_io_channel {
@@ -698,6 +699,7 @@ vbdev_icache_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
 		spdk_json_write_named_string(w, "stat_log_path", icache->stat_log_path);
 	}
 	spdk_json_write_named_double(w, "valid_rate_threshold", icache->valid_rate_threshold);
+	spdk_json_write_named_bool(w, "backend_dsm_enabled", icache->backend_dsm_enabled);
 	spdk_json_write_object_end(w);
 
 	return 0;
@@ -725,6 +727,7 @@ vbdev_icache_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ct
 		spdk_json_write_named_string(w, "stat_log_path", icache->stat_log_path);
 	}
 	spdk_json_write_named_double(w, "valid_rate_threshold", icache->valid_rate_threshold);
+	spdk_json_write_named_bool(w, "backend_dsm_enabled", icache->backend_dsm_enabled);
 	spdk_json_write_object_end(w);
 	spdk_json_write_object_end(w);
 }
@@ -774,7 +777,8 @@ int
 vbdev_icache_create(const char *name, const char *cache_bdev_name,
 	const char *backend_bdev_name, uint32_t max_pending_io,
 	const char *cache_type, const char *waf_log_path,
-	const char *stat_log_path, double valid_rate_threshold)
+	const char *stat_log_path, double valid_rate_threshold,
+	bool backend_dsm_enabled)
 {
 	struct vbdev_icache *icache;
 	int rc;
@@ -795,6 +799,7 @@ vbdev_icache_create(const char *name, const char *cache_bdev_name,
 	icache->thread = spdk_get_thread();
 	icache->max_pending_io = max_pending_io;
 	icache->valid_rate_threshold = valid_rate_threshold;
+	icache->backend_dsm_enabled = backend_dsm_enabled;
 
 	const char *type = (cache_type && cache_type[0] != '\0') ? cache_type : "LOG_GREEDY";
 	const char *waf_path = (waf_log_path && waf_log_path[0] != '\0') ? waf_log_path : "/tmp/icache_waf.log";
@@ -882,7 +887,8 @@ vbdev_icache_create(const char *name, const char *cache_bdev_name,
 					       icache->cache_type,
 					       icache->waf_log_path,
 					       icache->stat_log_path,
-					       icache->valid_rate_threshold);
+					       icache->valid_rate_threshold,
+					       icache->backend_dsm_enabled);
 	if (!icache->log_ctx) {
 		rc = -ENOMEM;
 		goto err_open;

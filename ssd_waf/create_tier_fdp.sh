@@ -37,6 +37,12 @@ ICACHE_CACHE_TYPE=${ICACHE_CACHE_TYPE:-LOG_GREEDY}
 ICACHE_WAF_LOG=${ICACHE_WAF_LOG:-$ROOT_DIR/ssd_waf/icache_waf.log}
 ICACHE_STAT_LOG=${ICACHE_STAT_LOG:-}
 ICACHE_VALID_RATE_THRESHOLD=${ICACHE_VALID_RATE_THRESHOLD:-0.9}
+ICACHE_BACKEND_DSM=${ICACHE_BACKEND_DSM:-1}
+
+if [[ "${ICACHE_BACKEND_DSM}" != "0" && "${ICACHE_BACKEND_DSM}" != "1" ]]; then
+    echo "ICACHE_BACKEND_DSM must be 0 or 1 (got: ${ICACHE_BACKEND_DSM})" >&2
+    exit 1
+fi
 
 if [[ -n "$ICACHE_WAF_LOG" ]]; then
     mkdir -p "$(dirname "$ICACHE_WAF_LOG")"
@@ -126,6 +132,7 @@ cat <<MSG
  Backend bdev     : ${BACKEND_DEVICE}
  Max pending IO   : ${MAX_PENDING_IO}
  Cache policy     : ${ICACHE_CACHE_TYPE}
+ Backend DSM      : $([[ "${ICACHE_BACKEND_DSM}" == "1" ]] && echo enabled || echo disabled)
  WAF log path     : ${ICACHE_WAF_LOG}
 Creating icache bdev "${ICACHE_NAME}" (cache=${CACHE_DEVICE}, backend=${BACKEND_DEVICE})
 MSG
@@ -140,6 +147,12 @@ ICACHE_RPC_ARGS=(
 	--waf-log-path "${ICACHE_WAF_LOG}"
 	--valid-rate-threshold "${ICACHE_VALID_RATE_THRESHOLD}"
 )
+
+if [[ "${ICACHE_BACKEND_DSM}" == "1" ]]; then
+	ICACHE_RPC_ARGS+=(--enable-backend-dsm)
+else
+	ICACHE_RPC_ARGS+=(--disable-backend-dsm)
+fi
 
 if [[ -n "${ICACHE_STAT_LOG}" ]]; then
 	ICACHE_RPC_ARGS+=(--stat-log-path "${ICACHE_STAT_LOG}")

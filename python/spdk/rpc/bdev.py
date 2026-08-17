@@ -1411,7 +1411,8 @@ def bdev_split_delete(client, base_bdev):
 
 @deprecated_method
 def bdev_icache_create(client, name, cache_bdev_name, backend_bdev_name, max_pending_io,
-                       cache_type=None, waf_log_path=None, stat_log_path=None, valid_rate_threshold=None):
+                       cache_type=None, waf_log_path=None, stat_log_path=None,
+                       valid_rate_threshold=None, backend_dsm_enabled=None):
     """Create an icache vbdev composed of cache/backing bdevs.
     Args:
         name: icache vbdev name
@@ -1422,6 +1423,7 @@ def bdev_icache_create(client, name, cache_bdev_name, backend_bdev_name, max_pen
         waf_log_path: output path for WAF statistics
         stat_log_path: output path for cache statistics (optional)
         valid_rate_threshold: target valid block ratio for cache GC heuristics
+        backend_dsm_enabled: asynchronously deallocate stale backend LBAs in 256-key DSM batches
     """
     params = dict()
     params['name'] = name
@@ -1436,6 +1438,8 @@ def bdev_icache_create(client, name, cache_bdev_name, backend_bdev_name, max_pen
         params['stat_log_path'] = stat_log_path
     if valid_rate_threshold is not None:
         params['valid_rate_threshold'] = str(valid_rate_threshold)
+    if backend_dsm_enabled is not None:
+        params['backend_dsm_enabled'] = backend_dsm_enabled
     return client.call('bdev_icache_create', params)
 
 

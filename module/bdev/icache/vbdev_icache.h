@@ -15,7 +15,8 @@ int vbdev_icache_create(const char *name,
 	const char *cache_type,
 	const char *waf_log_path,
 	const char *stat_log_path,
-	double valid_rate_threshold);
+	double valid_rate_threshold,
+	bool backend_dsm_enabled);
 int vbdev_icache_delete(const char *name,
 	spdk_bdev_unregister_cb cb_fn,
 	void *cb_arg);

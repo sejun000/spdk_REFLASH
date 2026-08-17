@@ -30,6 +30,10 @@ struct ftl_nvme_fdp_stats_log {
 };  /* Total: 64 bytes (matches nvme-cli/libnvme) */
 #pragma pack(pop)
 
+struct ftl_backend_vendor_log {
+	uint8_t data[256];
+};
+
 /**
  * FTL Stats Logger
  *
@@ -63,7 +67,10 @@ struct ftl_stats_logger {
 	/* Stats counters */
 	uint64_t host_write_bytes;
 	uint64_t cache_write_bytes;
-	uint64_t backend_write_bytes;
+	uint64_t backend_write_bytes;  /* Compaction + host-level GC data writes */
+	uint64_t compaction_write_bytes;
+	uint64_t gc_write_bytes;
+	uint64_t backend_md_write_bytes;
 	uint64_t valid_blocks;         /* Valid 4K blocks in nv_cache */
 	uint64_t write_hit_count;      /* Write cache hits (L2P overwrite) */
 	uint64_t gc_victim_blocks;     /* Blocks compacted by GC */
@@ -77,6 +84,9 @@ struct ftl_stats_logger {
 	uint64_t prev_host_write;
 	uint64_t prev_cache_write;
 	uint64_t prev_backend_write;
+	uint64_t prev_compaction_write;
+	uint64_t prev_gc_write;
+	uint64_t prev_backend_md_write;
 	uint64_t prev_l2p_write;
 	uint64_t prev_md_write;
 
@@ -95,6 +105,13 @@ struct ftl_stats_logger {
 	uint64_t nvme_media_written;  /* MBMW: Media Bytes with Metadata Written */
 	uint64_t prev_nvme_host_written;
 	uint64_t prev_nvme_media_written;
+
+	/* Backend QLC physical NAND writes (vendor log page 0xC0). */
+	struct spdk_nvme_ctrlr *backend_nvme_ctrlr;
+	struct ftl_backend_vendor_log *backend_log_page_buf;
+	bool backend_log_page_pending;
+	uint64_t backend_nand_written;
+	uint64_t prev_backend_nand_written;
 };
 
 /**
@@ -135,6 +152,9 @@ void ftl_stats_logger_set_cache_bdev(struct ftl_stats_logger *logger,
  */
 void ftl_stats_logger_set_nvme_ctrlr(struct ftl_stats_logger *logger,
 				      struct spdk_nvme_ctrlr *ctrlr);
+
+void ftl_stats_logger_set_backend_nvme_ctrlr(struct ftl_stats_logger *logger,
+					      struct spdk_nvme_ctrlr *ctrlr);
 
 /**
  * Start the stats logger (call from SPDK thread)
@@ -181,6 +201,35 @@ ftl_stats_logger_add_backend_write(struct ftl_stats_logger *logger, uint64_t byt
 {
 	if (logger) {
 		logger->backend_write_bytes += bytes;
+	}
+}
+
+/** Add completed compaction data writes to the backend. */
+static inline void
+ftl_stats_logger_add_compaction_write(struct ftl_stats_logger *logger, uint64_t bytes)
+{
+	if (logger) {
+		logger->compaction_write_bytes += bytes;
+		logger->backend_write_bytes += bytes;
+	}
+}
+
+/** Add completed host-level GC relocation writes to the backend. */
+static inline void
+ftl_stats_logger_add_gc_write(struct ftl_stats_logger *logger, uint64_t bytes)
+{
+	if (logger) {
+		logger->gc_write_bytes += bytes;
+		logger->backend_write_bytes += bytes;
+	}
+}
+
+/** Add completed metadata writes to the backend base device. */
+static inline void
+ftl_stats_logger_add_backend_md_write(struct ftl_stats_logger *logger, uint64_t bytes)
+{
+	if (logger) {
+		logger->backend_md_write_bytes += bytes;
 	}
 }
 

@@ -69,6 +69,13 @@ public:
         std::atomic<uint64_t> evict_count{0};         // Number of completed evict operations
         std::atomic<uint64_t> flush_count{0};         // Number of flush_write_buffer calls
         std::atomic<uint64_t> gc_segments_allocated{0}; // Cumulative GC segment allocations
+		std::atomic<uint64_t> backend_trim_bytes{0};  // Successfully deallocated backend bytes
+		std::atomic<uint64_t> backend_trim_enabled{0}; // 1 while DSM batching is active
+		std::atomic<uint64_t> backend_trim_commands{0}; // Successfully completed DSM commands
+		std::atomic<uint64_t> backend_trim_ranges{0}; // Successfully completed DSM ranges
+		std::atomic<uint64_t> backend_trim_errors{0}; // Build, submit, and completion errors
+		std::atomic<uint64_t> backend_trim_outstanding{0}; // DSM commands currently in flight
+		std::atomic<uint64_t> backend_trim_pending_batches{0}; // Full 256-key batches waiting
     };
 
     /**
@@ -113,6 +120,16 @@ public:
     void inc_evict_count() { stats_.evict_count.fetch_add(1, std::memory_order_relaxed); }
     void inc_flush_count() { stats_.flush_count.fetch_add(1, std::memory_order_relaxed); }
     void set_gc_segments_allocated(uint64_t count) { stats_.gc_segments_allocated.store(count, std::memory_order_relaxed); }
+	void set_backend_trim_stats(bool enabled, uint64_t bytes, uint64_t commands, uint64_t ranges,
+				    uint64_t errors, uint64_t outstanding, uint64_t pending_batches) {
+		stats_.backend_trim_enabled.store(enabled ? 1 : 0, std::memory_order_relaxed);
+		stats_.backend_trim_bytes.store(bytes, std::memory_order_relaxed);
+		stats_.backend_trim_commands.store(commands, std::memory_order_relaxed);
+		stats_.backend_trim_ranges.store(ranges, std::memory_order_relaxed);
+		stats_.backend_trim_errors.store(errors, std::memory_order_relaxed);
+		stats_.backend_trim_outstanding.store(outstanding, std::memory_order_relaxed);
+		stats_.backend_trim_pending_batches.store(pending_batches, std::memory_order_relaxed);
+	}
 
     // Set histogram print callback (called every ~60 seconds)
     void set_histogram_callback(std::function<void()> cb) { histogram_cb_ = std::move(cb); }

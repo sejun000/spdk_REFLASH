@@ -279,6 +279,27 @@ ftl_mngt_finalize_startup(struct spdk_ftl_dev *dev, struct ftl_mngt_process *mng
 		if (nvme_ctrlr) {
 			ftl_stats_logger_set_nvme_ctrlr(dev->stats_logger, nvme_ctrlr);
 		}
+
+		struct spdk_bdev *backend_bdev = spdk_bdev_desc_get_bdev(dev->base_bdev_desc);
+		struct spdk_nvme_ctrlr *backend_ctrlr = bdev_nvme_get_ctrlr(backend_bdev);
+		if (!backend_ctrlr && backend_bdev) {
+			const char *bdev_name = spdk_bdev_get_name(backend_bdev);
+			if (bdev_name) {
+				char parent_name[256];
+				snprintf(parent_name, sizeof(parent_name), "%s", bdev_name);
+				char *p_pos = strrchr(parent_name, 'p');
+				if (p_pos && p_pos > parent_name) {
+					*p_pos = '\0';
+					struct spdk_bdev *parent_bdev = spdk_bdev_get_by_name(parent_name);
+					if (parent_bdev) {
+						backend_ctrlr = bdev_nvme_get_ctrlr(parent_bdev);
+					}
+				}
+			}
+		}
+		if (backend_ctrlr) {
+			ftl_stats_logger_set_backend_nvme_ctrlr(dev->stats_logger, backend_ctrlr);
+		}
 		ftl_stats_logger_start(dev->stats_logger);
 	}
 

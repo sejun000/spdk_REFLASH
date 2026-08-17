@@ -119,7 +119,9 @@ bool StatsLogger::start()
                      "backend_nand_written_MB,backend_nand_delta_MB,"
                      "cache_read_MB,backend_read_MB,fdp_waf,backend_waf,"
                      "valid_blocks,write_hit_count,gc_victim_blocks,evict_victim_blocks,"
-                     "gc_count,evict_count,flush_count,gc_segments_allocated\n");
+                     "gc_count,evict_count,flush_count,gc_segments_allocated,"
+			     "backend_trim_enabled,backend_trim_MB,backend_trim_commands,backend_trim_ranges,"
+			     "backend_trim_errors,backend_trim_outstanding,backend_trim_pending_batches\n");
     fflush(log_fp_);
 
     // Record start time
@@ -319,6 +321,13 @@ void StatsLogger::log_stats()
     uint64_t evict_count = stats_.evict_count.load(std::memory_order_relaxed);
     uint64_t flush_count = stats_.flush_count.load(std::memory_order_relaxed);
     uint64_t gc_segments_allocated = stats_.gc_segments_allocated.load(std::memory_order_relaxed);
+	uint64_t backend_trim_enabled = stats_.backend_trim_enabled.load(std::memory_order_relaxed);
+	uint64_t backend_trim_bytes = stats_.backend_trim_bytes.load(std::memory_order_relaxed);
+	uint64_t backend_trim_commands = stats_.backend_trim_commands.load(std::memory_order_relaxed);
+	uint64_t backend_trim_ranges = stats_.backend_trim_ranges.load(std::memory_order_relaxed);
+	uint64_t backend_trim_errors = stats_.backend_trim_errors.load(std::memory_order_relaxed);
+	uint64_t backend_trim_outstanding = stats_.backend_trim_outstanding.load(std::memory_order_relaxed);
+	uint64_t backend_trim_pending_batches = stats_.backend_trim_pending_batches.load(std::memory_order_relaxed);
 
     // Calculate deltas
     uint64_t host_delta = host_write - prev_host_write_;
@@ -386,7 +395,7 @@ void StatsLogger::log_stats()
 
     // Write log line
     // FDP stats (hbmw, mbmw) are already in bytes, just convert to MB
-    fprintf(log_fp_, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+    fprintf(log_fp_, "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.2f,%lu,%lu,%lu,%lu,%lu\n",
             elapsed_sec,
             host_write / MB,
             cache_write / MB,
@@ -413,6 +422,13 @@ void StatsLogger::log_stats()
             gc_count,
             evict_count,
             flush_count,
-            gc_segments_allocated);
+            gc_segments_allocated,
+		backend_trim_enabled,
+		backend_trim_bytes / MB,
+		backend_trim_commands,
+		backend_trim_ranges,
+		backend_trim_errors,
+		backend_trim_outstanding,
+		backend_trim_pending_batches);
     fflush(log_fp_);
 }
