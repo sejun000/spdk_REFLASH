@@ -11,8 +11,8 @@ The reactor idle value is a separate SPDK poller metric.  It is not OS idle
 time and must not be stacked with the perf categories to make 100%.
 
 With no arguments, this script analyzes the 2026-08-30/31 Alibaba-DWPD2 runs
-for REFlash R864 N_gc={3,4} and CSAL.  Additional runs can be supplied with
-``--run``; see ``--help`` for the field format.
+for REFlash R864 (the N_gc=4 run) and CSAL.  Additional runs can be supplied
+with ``--run``; see ``--help`` for the field format.
 """
 
 from __future__ import annotations
@@ -43,16 +43,7 @@ class RunSpec:
 
 DEFAULT_RUNS = (
     RunSpec(
-        label="N_gc=3",
-        policy="reflash",
-        report=SCRIPT_DIR / "perf/r864_ngc34_dwpd2_nobeprefill/REFLASH_R864_NGC3_20260830T122550Z.report.txt",
-        thread_report=SCRIPT_DIR / "perf/r864_ngc34_dwpd2_nobeprefill/REFLASH_R864_NGC3_20260830T122550Z.threads.report.txt",
-        metadata=SCRIPT_DIR / "perf/r864_ngc34_dwpd2_nobeprefill/REFLASH_R864_NGC3_20260830T122550Z.metadata.json",
-        reactor_csv=SCRIPT_DIR / "logging/spdk_reactor_util_R864_NGC34_dwpd2_nobeprefill_20260830.csv",
-        n_gc=3,
-    ),
-    RunSpec(
-        label="N_gc=4",
+        label="REFlash",
         policy="reflash",
         report=SCRIPT_DIR / "perf/r864_ngc34_dwpd2_nobeprefill/REFLASH_R864_NGC4_20260830T162046Z.report.txt",
         thread_report=SCRIPT_DIR / "perf/r864_ngc34_dwpd2_nobeprefill/REFLASH_R864_NGC4_20260830T162046Z.threads.report.txt",
